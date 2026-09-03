@@ -117,6 +117,15 @@ bash scripts/2_run_eval_ReMemR1.sh
 This project is licensed under the MIT License.
 It includes components from [MemAgent](https://github.com/BytedTsinghua-SIA/MemAgent), licensed under the Apache License 2.0. Thanks for their awesome work!
 
+## V5 Design and Implementation
+
+The complete V5 specification, terminology, module mapping, runtime state
+machine, 2Wiki evaluation protocol, training plan, reproducibility rules, and
+the decisions consolidated from the 208-question design review are documented
+in [`V5_DESIGN_AND_IMPLEMENTATION.md`](V5_DESIGN_AND_IMPLEMENTATION.md).
+The executable Direct/V5/Oracle/no-DEFER evaluation matrix and artifact format
+are documented in [`EXPERIMENTS.md`](EXPERIMENTS.md).
+
 ## AI-Assisted Development
 
 This project includes a `.claude/` directory with structured guidance for AI coding agents (Claude Code, Codex, etc.):

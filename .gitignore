@@ -97,6 +97,7 @@ celerybeat-schedule
 
 # dotenv
 .env
+.env.local
 
 # virtualenv
 venv/
@@ -126,6 +127,10 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 
 # data
 *.parquet
+
+# Keep reproducible experiment configurations under version control.
+!configs/
+!configs/*.json
 
 
 # local logs

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "delaybind-v5"
+version = "0.1.0"
+description = "Delayed-binding graph working memory runtime for long-context QA"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.8,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+graph = ["networkx>=3.3"]
+
+[tool.setuptools.packages.find]
+include = ["delaybind_core*"]
