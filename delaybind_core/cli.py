@@ -130,6 +130,7 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
             defer_unbound=bool(config.get("defer_unbound", True)),
             max_verify_expansions=int(config.get("max_verify_expansions", 1)),
             verify_expansion_limit=int(config.get("verify_expansion_limit", 32)),
+            require_evidence_sources=bool(config.get("require_evidence_sources", True)),
         ),
     )
     run_id = str(config.get("run_id") or f"{sample.sample_id}-{manifest.manifest_id}")

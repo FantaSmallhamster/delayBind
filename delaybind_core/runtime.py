@@ -111,12 +111,14 @@ class EvidenceRuntime:
         store: SQLiteEventStore,
         verify_committed: bool = False,
         defer_unbound: bool = True,
+        execute_operators: bool = True,
     ):
         self.run_id = run_id
         self.archive = archive
         self.store = store
         self.verify_committed = verify_committed
         self.defer_unbound = defer_unbound
+        self.execute_operators = execute_operators
         self._verification_matches: list[Claim] = []
         self._operators_executed = False
         self.state = RuntimeState(plan=plan)
@@ -369,8 +371,25 @@ class EvidenceRuntime:
         The model is instructed to emit this order, but Runtime reorders using
         the source positions supplied by the manifest-derived event metadata.
         """
+        readable: list[TripleEvent] = []
+        rejected: list[RuntimeResult] = []
+        for event in events:
+            try:
+                self.archive.entry(event.source_ref)
+            except FutureSourceAccessError:
+                self._emit(
+                    "SOURCE_ACCESS_REJECTED",
+                    {"reason": "FUTURE_SOURCE", "event": event.model_dump(mode="json")},
+                    source_ref=event.source_ref,
+                    stream_position=event.source_order,
+                )
+                rejected.append(
+                    RuntimeResult(claim=None, applied_action=Action.SKIP, events=self.store.list_runtime_events(self.run_id))
+                )
+                continue
+            readable.append(event)
         ordered = sorted(
-            events,
+            readable,
             key=lambda item: (
                 self.archive.entry(item.source_ref).stream_position,
                 item.span_hint or "",
@@ -385,7 +404,7 @@ class EvidenceRuntime:
                     "applied_order": [event.event_id for event in ordered],
                 },
             )
-        return [self.apply_event(event) for event in ordered]
+        return [*rejected, *(self.apply_event(event) for event in ordered)]
 
     @staticmethod
     def _action_for_claim(claim: Claim | None) -> Action | None:
@@ -519,16 +538,25 @@ class EvidenceRuntime:
                 {"status": self.state.status.value, "reason_codes": reasons},
             )
             return None
-        try:
-            self._execute_plan_operators()
-        except OperatorError as exc:
-            self.state.status = RuntimeStatus.UNSUPPORTED
-            self.state.reason_codes = [f"OPERATOR_ERROR:{exc}"]
+        if self.execute_operators:
+            try:
+                self._execute_plan_operators()
+            except OperatorError as exc:
+                self.state.status = RuntimeStatus.UNSUPPORTED
+                self.state.reason_codes = [f"OPERATOR_ERROR:{exc}"]
+                self._emit(
+                    "RUN_STATUS",
+                    {"status": self.state.status.value, "reason_codes": self.state.reason_codes},
+                )
+                return None
+        elif self.state.plan.operators:
             self._emit(
-                "RUN_STATUS",
-                {"status": self.state.status.value, "reason_codes": self.state.reason_codes},
+                "OPERATOR_EXECUTION_SKIPPED",
+                {
+                    "reason": "EVIDENCE_ANSWER_MODE",
+                    "operator_ids": [operator.id for operator in self.state.plan.operators],
+                },
             )
-            return None
         if contract and contract.target and contract.target not in self.state.bindings:
             self.state.status = RuntimeStatus.INSUFFICIENT
             self.state.reason_codes = ["ANSWER_TARGET_UNBOUND:" + contract.target]

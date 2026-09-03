@@ -73,6 +73,7 @@ class ExperimentConfig:
             defer_unbound=bool(runner_raw.get("defer_unbound", True)),
             max_verify_expansions=int(runner_raw.get("max_verify_expansions", 1)),
             verify_expansion_limit=int(runner_raw.get("verify_expansion_limit", 32)),
+            require_evidence_sources=bool(runner_raw.get("require_evidence_sources", True)),
         )
         methods = tuple(str(item) for item in value.get("methods", cls.methods))
         orders = tuple(str(item) for item in value.get("orders", cls.orders))

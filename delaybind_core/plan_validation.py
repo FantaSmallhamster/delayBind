@@ -50,7 +50,13 @@ class PlanValidationError(ValueError):
         super().__init__("; ".join(issue.message for issue in issues))
 
 
-def validate_plan(plan: QueryPlan, *, question: str | None = None) -> list[PlanIssue]:
+def validate_plan(
+    plan: QueryPlan,
+    *,
+    question: str | None = None,
+    require_answer_contract: bool = True,
+    require_answer_target: bool = True,
+) -> list[PlanIssue]:
     issues: list[PlanIssue] = []
     pattern_ids: set[str] = set()
     variables: set[str] = set()
@@ -156,9 +162,14 @@ def validate_plan(plan: QueryPlan, *, question: str | None = None) -> list[PlanI
                     )
                 )
 
-    if plan.answer_contract is None:
+    if plan.answer_contract is None and require_answer_contract:
         issues.append(PlanIssue("MISSING_ANSWER_CONTRACT", "plan must declare an answer_contract", "answer_contract"))
-    elif plan.answer_contract.target is None and plan.answer_contract.type != "BOOLEAN":
+    elif (
+        plan.answer_contract is not None
+        and require_answer_target
+        and plan.answer_contract.target is None
+        and plan.answer_contract.type != "BOOLEAN"
+    ):
         issues.append(
             PlanIssue(
                 "MISSING_ANSWER_TARGET",
@@ -208,8 +219,19 @@ def validate_plan(plan: QueryPlan, *, question: str | None = None) -> list[PlanI
     return issues
 
 
-def ensure_valid_plan(plan: QueryPlan, *, question: str | None = None) -> QueryPlan:
-    issues = validate_plan(plan, question=question)
+def ensure_valid_plan(
+    plan: QueryPlan,
+    *,
+    question: str | None = None,
+    require_answer_contract: bool = True,
+    require_answer_target: bool = True,
+) -> QueryPlan:
+    issues = validate_plan(
+        plan,
+        question=question,
+        require_answer_contract=require_answer_contract,
+        require_answer_target=require_answer_target,
+    )
     if any(issue.fatal for issue in issues):
         raise PlanValidationError(issues)
     return plan

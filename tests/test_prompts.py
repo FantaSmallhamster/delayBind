@@ -9,6 +9,9 @@ def test_prompt_builders_keep_protocol_markers_and_no_future_instruction():
     )
     assert "<PLAN version=v1>" in plan_prompt("q", schema={"type": "object"})
     assert "Never invent values" in plan_prompt("q", schema={"type": "object"})
+    assert "Do not generate answer_contract" in plan_prompt(
+        "q", schema={"type": "object"}, require_answer_target=False
+    )
     rendered = update_prompt(
         "q", plan, {}, [{"source_ref": "s1", "text": "fact"}], schema={"type": "object"}
     )
@@ -18,4 +21,6 @@ def test_prompt_builders_keep_protocol_markers_and_no_future_instruction():
     assert "<VERIFY version=v1>" in verify_prompt(
         "q", {"claim_id": "c"}, [], schema={"type": "object"}
     )
-    assert "<ANSWER version=v1>" in answer_prompt("q", {}, schema={"type": "object"})
+    rendered_answer = answer_prompt("q", {}, schema={"type": "object"})
+    assert "<ANSWER version=v1>" in rendered_answer
+    assert "source_refs" in rendered_answer

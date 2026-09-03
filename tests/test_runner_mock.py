@@ -219,3 +219,72 @@ def test_runner_expands_verify_context_once_on_need_more_context():
     )
     assert client.verify_calls == 2
     assert result["state"]["status"] == "ANSWERED"
+
+
+class TargetFreeEvidenceClient:
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, *, run_id, interface, messages, response_schema=None, extra=None):
+        self.calls.append(interface)
+        if interface == "PLAN":
+            return json.dumps(
+                {
+                    "plan_id": "target-free",
+                    "patterns": [
+                        {"id": "director", "subject": "Film A", "relation": "director", "object": "?director"}
+                    ],
+                }
+            )
+        if interface == "UPDATE":
+            window = json.loads(messages[0]["content"].split("Current window:\n", 1)[1].split("\n\nReturn only", 1)[0])
+            return json.dumps(
+                {
+                    "events": [
+                        {
+                            "event_id": "target-free-director",
+                            "source_ref": window[0]["source_ref"],
+                            "subject": "Film A",
+                            "concrete_relation": "director",
+                            "matched_family": "director",
+                            "object": "Martin Lee",
+                            "source_order": window[0]["stream_position"],
+                        }
+                    ]
+                }
+            )
+        if interface == "VERIFY":
+            claim = json.loads(messages[0]["content"].split("Candidate claim:\n", 1)[1].split("\n\nRaw neighborhood:", 1)[0])
+            return json.dumps({"claim_id": claim["claim_id"], "status": "ACCEPT"})
+        if interface == "ANSWER":
+            return json.dumps(
+                {
+                    "answer": "Martin Lee",
+                    "answer_type": "ENTITY",
+                    "source_refs": ["q-evidence:d00000:s0"],
+                }
+            )
+        raise AssertionError(interface)
+
+
+def test_target_free_evidence_answer_uses_verified_graph_only():
+    sample = canonicalize_record(
+        {
+            "id": "q-evidence",
+            "question": "Who directed Film A?",
+            "context": [["Film A", ["Film A was directed by Martin Lee."]]],
+        }
+    )
+    client = TargetFreeEvidenceClient()
+    result = asyncio.run(
+        V5Runner(client, config=RunnerConfig(answer_mode="evidence", chunk_size=100)).run(
+            run_id="evidence-run",
+            sample=sample,
+            manifest=build_manifest(sample),
+            store=SQLiteEventStore(),
+        )
+    )
+    assert client.calls == ["PLAN", "UPDATE", "VERIFY", "ANSWER"]
+    assert result["state"]["status"] == "ANSWERED"
+    assert result["state"]["plan"]["answer_contract"]["target"] is None
+    assert result["evidence_pack"]["answer_value"] == "Martin Lee"

@@ -17,6 +17,12 @@ Predicted Plan 的测试结果。
 实体别名通过显式 `question_anchor` 保存；comparison 中即使两个 gold 值相同也使用两个独立
 变量，避免把 Yes/No 答案泄漏到 Plan 拓扑。该编译器只能用于 Oracle 实验和监督数据生成。
 
+`answer_mode="runtime"` 是严格 target-based 消融：PLAN 必须给出
+`answer_contract.target`，Runtime 直接读取绑定值。`answer_mode="evidence"` 是推荐的完整
+V5 回答模式：PLAN 只提供 patterns/operators，答案类型由问题画像推断；所有 required pattern
+被验证后，ANSWER 只能读取 EvidencePack 并必须返回其中存在的 `source_refs`。因此 ANSWER 可以
+根据问题选择图中的最终变量，但不能重新读取全文或使用图外事实。
+
 ## 2. Manifest 条件
 
 - `original`：数据集原始文档和句子顺序，即 Forward 条件。
@@ -43,6 +49,13 @@ MODEL_API_KEY=...
 ```bash
 PYTHONPATH=. python -m delaybind_core experiment \
   --config configs/experiment_smoke.json
+```
+
+使用 target-free evidence-answer 运行完整 V5 矩阵：
+
+```bash
+PYTHONPATH=. python -m delaybind_core experiment \
+  --config configs/evidence_answer_smoke.json
 ```
 
 只测 Direct Full Context 时使用独立配置，不需要 Oracle Plan：

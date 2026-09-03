@@ -332,6 +332,38 @@ def test_no_future_source_access_is_rejected():
         runtime.apply_event(event)
 
 
+def test_batch_events_skip_future_source_without_aborting_window():
+    runtime, store = make_runtime()
+    future = TripleEvent(
+        event_id="future-batch",
+        source_ref="q1:d1:s2",
+        subject="Film A",
+        concrete_relation="director",
+        matched_family="DIRECTOR",
+        object="Martin Lee",
+        source_order=1,
+    )
+    valid = TripleEvent(
+        event_id="valid-batch",
+        source_ref="q1:d1:s1",
+        subject="Martin Lee",
+        concrete_relation="birth_year",
+        matched_family="TEMPORAL_ORDER_KEY",
+        object=1948,
+        source_order=0,
+    )
+    # Simulate a prefix containing only the first entry.
+    store.close()
+    store = SQLiteEventStore()
+    archive = RawArchive(store, "batch-prefix")
+    archive.append(make_manifest().entries[:1])
+    runtime = EvidenceRuntime(run_id="batch-prefix", plan=runtime.state.plan, archive=archive, store=store)
+    results = runtime.apply_events([future, valid])
+    assert len(results) == 2
+    assert any(event.event_type == "SOURCE_ACCESS_REJECTED" for event in store.list_runtime_events("batch-prefix"))
+    assert len(runtime.state.deferred) == 1
+
+
 def test_manifest_rejects_non_monotonic_stream_positions():
     import pytest
 

@@ -61,6 +61,19 @@ def test_plan_validation_requires_answer_contract_for_runner_plans():
     assert any(issue.code == "MISSING_ANSWER_CONTRACT" for issue in issues)
 
 
+def test_plan_validation_allows_target_free_evidence_plan():
+    plan = QueryPlan(
+        plan_id="target-free",
+        patterns=[{"id": "p1", "subject": "Film A", "relation": "director", "object": "?director"}],
+    )
+    assert validate_plan(
+        plan,
+        question="Who directed Film A?",
+        require_answer_contract=False,
+        require_answer_target=False,
+    ) == []
+
+
 def test_plan_validation_checks_nested_operator_variables():
     plan = QueryPlan(
         plan_id="nested-input",

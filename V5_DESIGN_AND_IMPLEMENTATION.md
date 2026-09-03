@@ -61,7 +61,7 @@ V5 把此问题拆成五个明确责任：
 | Q20-Q24 | 保留完整早期候选，但只在变量绑定后精确检索；先从 Deferred Workspace 找最相关候选，再回到该候选附近的已读原文做精确核验。 | `DEFER -> BIND -> LOOKUP -> FETCH -> VERIFY -> PROMOTE`；Runtime 是事实裁决者，模型只提案。 |
 | Q25-Q29 | 先用通用 Qwen3/Qwen3.5 做 predicted Plan；效果差时用强模型诊断；2Wiki Oracle Plan 可用于后续监督训练。 | `PLAN` 有 Schema/语义校验和一次纠错重试；Oracle plan 文件可通过 CLI 注入。 |
 | Q30-Q36 | 先保留模型生成计划，再根据 trajectory 做修正；统一一个 Agent 的多个接口；比较需同一 checkpoint。 | `PLAN/UPDATE/VERIFY/ANSWER` 共用 `OpenAICompatibleClient`；Direct Full Context 是主公平基线。 |
-| Q37-Q46 | 保留 Direct Full Context；先评估 Runtime 直接给答案，效果不足再启用 ANSWER 模型；所有方法固定 thinking 和输出预算。 | `answer_mode=runtime` 默认，`answer_mode=evidence` 可选；提示词禁用长 Chain-of-Thought。 |
+| Q37-Q46 | 保留 Direct Full Context；先评估 Runtime 直接给答案，效果不足再启用 ANSWER 模型；所有方法固定 thinking 和输出预算。 | `answer_mode=runtime` 保留为严格 target 消融；`answer_mode=evidence` 使用问题类型和已验证图回答，不要求 PLAN target。 |
 | Q47-Q60 | 不复制完整世界状态；Graph 只留当前题已核验事实，未绑定候选留在外部；否定、冲突和事实更新必须可追踪。 | Claim 带 polarity/modality/disposition/source；冲突终止为 `CONFLICTED`，不覆盖旧事实。 |
 | Q61-Q80 | 关系/规则由 Plan 显式提出，运行时只执行注册的确定性算子；找不到足够证据就拒答。 | Operator registry、EOS Sufficiency Gate 和 `INSUFFICIENT/UNSUPPORTED` 状态。 |
 | Q81-Q100 | 先做结构、证据、顺序、成本和鲁棒性测试；同窗口和跨窗口均按 Manifest 原文流位置排序；保留 Snapshot。 | Manifest 是不可变输入契约；Runtime 重排模型事件；Runner 按窗口写 SQLite Snapshot。 |
@@ -198,7 +198,7 @@ Pydantic `extra="forbid"`，即未知字段不能静默进入运行时。
 | `patterns` | 1 至 16 条 | 定义所需关系跳数与变量。 |
 | `relation_specs` | 最多 16 条 | 描述关系方向、实体类型、基数和可接受表述。 |
 | `operators` | 最多 8 条 | 声明比较、集合或投影等派生步骤。 |
-| `answer_contract` | 非布尔题必须有目标变量 | 规定答案类型、基数与规范化方式。 |
+| `answer_contract` | runtime-answer 时声明目标变量；evidence-answer 时由问题画像提供类型 | 规定答案类型、基数与规范化方式。 |
 
 三元组方向始终是 `subject -> relation -> object`。例如“Film A 的导演的母亲是谁”应包含：
 
@@ -224,7 +224,8 @@ JSON Schema 只能检查字段形状，不能保证计划能从问题出发。�
   `UNANCHORED_PATTERN_COMPONENT`，防止无关扫描。
 - 非变量常量必须实际出现在问题中，避免模型把答案或外部知识偷塞进计划。
 - 算子必须在 V5 允许词表中，算子输入及答案目标变量必须已被模式或算子输出声明。
-- 缺少 `answer_contract`、或非布尔答案缺少 `target` 均会失败。
+- runtime-answer 中缺少 `answer_contract`、或非布尔答案缺少 `target` 会失败；
+  evidence-answer 中由问题画像补齐 type，不要求 Plan 指定 target。
 
 Runner 对无效的计划最多执行一次纠正重试（`max_plan_retries=1`）：将结构或语义错误格式化
 后放回 PLAN 提示词，要求模型返回完整替代计划；重试仍失败则抛出 `PlanValidationError`。
@@ -355,10 +356,10 @@ EOS（end of stream，输入流读完）时调用 `EvidenceRuntime.finalize()`�
 ### 7.3 两种答案模式
 
 - `answer_mode="runtime"`（默认）：使用 `EvidencePack.answer_value`，即答案契约目标变量的
-  已绑定值，最小化最终模型自由度。
-- `answer_mode="evidence"`：EOS 成功后调用 ANSWER，提示词只包含 EvidencePack，要求模型按
-  答案契约格式化答案。当前实现将其返回的 `answer`、`answer_type` 覆盖证据包中的对应字段，
-  但不对回答再次作来源或契约一致性校验。
+  已绑定值，最小化最终模型自由度；Plan 必须声明 target。
+- `answer_mode="evidence"`：EOS 成功后调用 ANSWER，提示词只包含问题和 EvidencePack；
+  Runtime 从问题画像补齐答案类型，不要求 Plan target。ANSWER 的每个 `source_ref` 必须属于
+  verified Claim，否则回答被拒绝为 `INSUFFICIENT`；这使模型做最终变量选择但不能引入图外事实。
 
 ## 8. 事件、SQLite 与可重放性
 

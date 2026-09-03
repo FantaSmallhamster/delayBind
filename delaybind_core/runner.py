@@ -18,6 +18,7 @@ from .api import OpenAICompatibleClient
 from .archive import RawArchive
 from .cursor import ReadCursor
 from .data import CanonicalSample
+from .profiler import infer_answer_contract
 from .manifest import Manifest
 from .prompts import answer_prompt, plan_prompt, update_prompt, verify_prompt
 from .plan_validation import (
@@ -54,6 +55,7 @@ class RunnerConfig:
     defer_unbound: bool = True
     max_verify_expansions: int = 1
     verify_expansion_limit: int = 32
+    require_evidence_sources: bool = True
 
 
 class ModelBudgetExceeded(RuntimeError):
@@ -91,6 +93,21 @@ class V5Runner:
             logical_model_calls += 1
             return await self.client.complete(**kwargs)
 
+        target_free_answer = self.config.answer_mode == "evidence"
+
+        def prepare_plan(candidate: QueryPlan) -> QueryPlan:
+            if not target_free_answer:
+                return candidate
+            contract = infer_answer_contract(sample)
+            constraints = {
+                **candidate.constraints,
+                "answer_contract_source": "QUESTION_PROFILE",
+                "answer_target_mode": "EVIDENCE_MODEL",
+            }
+            return candidate.model_copy(
+                update={"answer_contract": contract, "constraints": constraints}
+            )
+
         if plan is None:
             plan_schema = QueryPlan.model_json_schema()
             correction: str | None = None
@@ -102,7 +119,10 @@ class V5Runner:
                         {
                             "role": "user",
                             "content": plan_prompt(
-                                sample.question, schema=plan_schema, correction=correction
+                                sample.question,
+                                schema=plan_schema,
+                                correction=correction,
+                                require_answer_target=not target_free_answer,
                             ),
                         }
                     ],
@@ -122,7 +142,13 @@ class V5Runner:
                     if attempt >= self.config.max_plan_retries:
                         raise PlanValidationError(issues) from exc
                     continue
-                issues = validate_plan(candidate_plan, question=sample.question)
+                candidate_plan = prepare_plan(candidate_plan)
+                issues = validate_plan(
+                    candidate_plan,
+                    question=sample.question,
+                    require_answer_contract=not target_free_answer,
+                    require_answer_target=not target_free_answer,
+                )
                 if not any(issue.fatal for issue in issues):
                     plan = candidate_plan
                     break
@@ -132,7 +158,13 @@ class V5Runner:
             if plan is None:
                 raise PlanValidationError([PlanIssue("PLAN_MISSING", "no valid plan returned")])
         else:
-            ensure_valid_plan(plan, question=sample.question)
+            plan = prepare_plan(plan)
+            ensure_valid_plan(
+                plan,
+                question=sample.question,
+                require_answer_contract=not target_free_answer,
+                require_answer_target=not target_free_answer,
+            )
         runtime = EvidenceRuntime(
             run_id=run_id,
             plan=plan,
@@ -140,6 +172,7 @@ class V5Runner:
             store=store,
             verify_committed=self.config.verify_committed,
             defer_unbound=self.config.defer_unbound,
+            execute_operators=not target_free_answer,
         )
         cursor = ReadCursor(manifest, archive)
         update_schema = UpdateResponse.model_json_schema()
@@ -299,8 +332,39 @@ class V5Runner:
                 pack = None
             if pack is not None:
                 answer = AnswerResponse.model_validate_json(raw_answer)
-                pack.answer_value = answer.answer
-                pack.answer_type = answer.answer_type
+                permitted_refs = {
+                    assertion.source_ref
+                    for claim in pack.claims
+                    for assertion in claim.evidence_assertions
+                }
+                invalid_refs = sorted(set(answer.source_refs) - permitted_refs)
+                missing_refs = self.config.require_evidence_sources and bool(pack.claims) and not answer.source_refs
+                if answer.answer is None or invalid_refs or missing_refs:
+                    runtime.state.status = RuntimeStatus.INSUFFICIENT
+                    reasons = []
+                    if answer.answer is None:
+                        reasons.append("ANSWER_MODEL_ABSTAINED")
+                    if invalid_refs:
+                        reasons.append("ANSWER_UNSUPPORTED_SOURCE_REFS:" + ",".join(invalid_refs))
+                    if missing_refs:
+                        reasons.append("ANSWER_SOURCE_REFS_MISSING")
+                    runtime.state.reason_codes = reasons
+                    runtime._emit(
+                        "ANSWER_REJECTED",
+                        {"reason_codes": reasons, "answer": answer.model_dump(mode="json")},
+                    )
+                    runtime._emit(
+                        "RUN_STATUS",
+                        {"status": runtime.state.status.value, "reason_codes": reasons},
+                    )
+                    pack = None
+                else:
+                    pack.answer_value = answer.answer
+                    pack.answer_type = answer.answer_type or pack.answer_type
+                    runtime._emit(
+                        "ANSWER_ACCEPTED",
+                        {"answer": answer.model_dump(mode="json")},
+                    )
         return {
             "run_id": run_id,
             "question": sample.question,

@@ -16,7 +16,11 @@ def _json(value: Any) -> str:
 
 
 def plan_prompt(
-    question: str, *, schema: dict[str, Any], correction: str | None = None
+    question: str,
+    *,
+    schema: dict[str, Any],
+    correction: str | None = None,
+    require_answer_target: bool = True,
 ) -> str:
     correction_block = ""
     if correction:
@@ -25,6 +29,13 @@ The previous plan failed deterministic validation. Correct these issues and
 return a complete replacement plan:
 {correction}
 """
+    answer_instruction = (
+        "Declare an answer_contract with a target variable for ENTITY/NUMBER/DATE/SHORT_TEXT "
+        "answers (BOOLEAN may use a typed operator result)."
+        if require_answer_target
+        else "Do not generate answer_contract or an answer target. The Runtime derives answer type "
+        "from the Question and a later evidence-grounded ANSWER interface selects the final value."
+    )
     return f"""<PLAN version={PROMPT_VERSION}>
 Generate a typed QueryPlan for the question. Do not answer the question and do
 not use any document, evidence, or gold annotation. RelationSpec descriptions
@@ -34,10 +45,8 @@ such as unknown_person_1; use variables such as ?director for unknowns.
 Every pattern component must connect to an entity/value mentioned in the
 question. Preserve semantic relation direction: if the question asks for the
 mother of a director, use (?director, mother, ?mother), not the reverse.
-Provide one RelationSpec for each relation family when possible. Declare an
-answer_contract with a target variable for ENTITY/NUMBER/DATE/SHORT_TEXT
-answers (BOOLEAN may use a typed operator result). Return all required hops,
-not a free-form reasoning trace. Safe operator names are DIRECT, PATH_JOIN,
+Provide one RelationSpec for each relation family when possible. {answer_instruction}
+Return all required hops, not a free-form reasoning trace. Safe operator names are DIRECT, PATH_JOIN,
 REGISTERED_RULE, RULE, COMPARE, EARLIER, LATER, YOUNGER, OLDER, COUNT,
 INTERSECTION, UNION, FILTER, ARGMAX, ARGMIN, and PROJECT.
 
@@ -125,7 +134,13 @@ def answer_prompt(
 ) -> str:
     return f"""<ANSWER version={PROMPT_VERSION}>
 Answer the question using only the verified EvidencePack. Do not access the
-raw document or introduce unsupported facts. Follow the answer contract.
+raw document or introduce unsupported facts. The graph may contain multiple
+intermediate variables: determine the requested value from the Question, not
+from a predeclared target variable. You may apply simple reasoning over the
+verified claims and operator trace, but never introduce a fact absent from the
+pack. Return every source_ref actually used; each must be copied exactly from
+an EvidenceAssertion in the pack. If the pack cannot determine the answer,
+return answer=null and an empty source_refs list.
 
 Question:
 {question}
