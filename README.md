@@ -125,6 +125,7 @@ the decisions consolidated from the 208-question design review are documented
 in [`V5_DESIGN_AND_IMPLEMENTATION.md`](V5_DESIGN_AND_IMPLEMENTATION.md).
 The executable Direct/V5/Oracle/no-DEFER evaluation matrix and artifact format
 are documented in [`EXPERIMENTS.md`](EXPERIMENTS.md).
+For a first Direct-only run, use [`configs/direct_only.json`](configs/direct_only.json).
 
 ## AI-Assisted Development
 

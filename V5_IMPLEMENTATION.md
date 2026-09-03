@@ -41,6 +41,9 @@ PYTHONPATH=... python -m delaybind_core run --config configs/base.json
 
 PYTHONPATH=... python -m delaybind_core experiment \
   --config configs/experiment_smoke.json
+
+PYTHONPATH=... python -m delaybind_core experiment \
+  --config configs/direct_only.json
 ```
 
 The `run` command is API-backed and requires `input` plus model credentials.

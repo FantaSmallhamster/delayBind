@@ -29,7 +29,7 @@ Predicted Plan 的测试结果。
 
 ## 3. 一行运行
 
-先把 2Wiki JSON 路径写入 `configs/experiment_smoke.json` 的 `input`，模型凭据继续放在
+先把 2Wiki JSON 路径写入配置的 `input`，模型凭据继续放在
 `.env.local`：
 
 ```dotenv
@@ -44,6 +44,33 @@ MODEL_API_KEY=...
 PYTHONPATH=. python -m delaybind_core experiment \
   --config configs/experiment_smoke.json
 ```
+
+只测 Direct Full Context 时使用独立配置，不需要 Oracle Plan：
+
+```bash
+PYTHONPATH=. python -m delaybind_core experiment \
+  --config configs/direct_only.json
+```
+
+师妹第一次上手只需要修改配置中的 `input`，并在仓库根目录创建 `.env.local`：
+
+```dotenv
+MODEL_BASE_URL=https://你的中转站地址/v1
+MODEL_NAME=Qwen/Qwen3.5-Flash
+MODEL_API_KEY=你的密钥
+```
+
+然后安装轻量 V5 依赖并运行：
+
+```bash
+python3 -m pip install -e .
+PYTHONPATH=. python -m delaybind_core experiment \
+  --config configs/direct_only.json
+```
+
+Direct 会把当前样本的整个 Manifest 一次发送给模型，结果写入
+`results/2wiki-direct-only/`。它不是 V5 流式流程，只用于同一模型的 Full Context 基线；
+如果完整上下文超过服务端窗口，需要先缩小样本上下文或明确记录为 truncated/extended 条件。
 
 也可以提前生成并人工审核 Oracle Plan：
 
