@@ -28,6 +28,8 @@ SUPPORTED_METHODS = {
     "v5_predicted",
     "v5_oracle",
     "v5_oracle_no_defer",
+    "v5_oracle_flat",
+    "v5_oracle_flat_no_defer",
 }
 SUPPORTED_ORDERS = {"original", "reverse", "interleaved", "distant", "shuffle"}
 
@@ -74,6 +76,11 @@ class ExperimentConfig:
             max_verify_expansions=int(runner_raw.get("max_verify_expansions", 1)),
             verify_expansion_limit=int(runner_raw.get("verify_expansion_limit", 32)),
             require_evidence_sources=bool(runner_raw.get("require_evidence_sources", True)),
+            min_streaming_windows=int(runner_raw.get("min_streaming_windows", 0)),
+            query_graph_mode=str(runner_raw.get("query_graph_mode", "open")),
+            require_source_span=bool(runner_raw.get("require_source_span", True)),
+            callback_retrieval_limit=int(runner_raw.get("callback_retrieval_limit", 16)),
+            max_targeted_updates=int(runner_raw.get("max_targeted_updates", 16)),
         )
         methods = tuple(str(item) for item in value.get("methods", cls.methods))
         orders = tuple(str(item) for item in value.get("orders", cls.orders))
@@ -274,9 +281,13 @@ class ExperimentHarness:
             [
                 "sample_id", "method", "order", "runtime_status", "prediction",
                 "gold_answers", "answer_exact", "answer_token_f1", "supporting_f1",
-                "triple_event_f1", "graph_triple_f1", "plan_valid", "plan_relation_recall",
+                "triple_event_f1", "graph_triple_f1", "verifier_precision", "verifier_recall",
+                "verifier_f1", "verifier_micro_precision", "verifier_micro_recall", "verifier_micro_f1",
+                "verifier_candidate_count", "plan_valid", "plan_relation_recall",
                 "early_latent_evidence_recall", "callback_hit_rate",
-                "deferred_to_promoted", "model_calls", "input_tokens", "output_tokens",
+                "deferred_to_promoted", "cross_window_deferred_to_promoted",
+                "cross_window_deferred_promoted_count", "non_early_deferred_promoted_count",
+                "windows_processed", "window_word_budget", "streaming_protocol_valid", "model_calls", "input_tokens", "output_tokens",
                 "latency_ms", "error_type", "error",
             ],
         )
@@ -331,7 +342,8 @@ class ExperimentHarness:
                     plan_valid = True
                 runner_config = replace(
                     self.config.runner,
-                    defer_unbound=(method != "v5_oracle_no_defer"),
+                    defer_unbound=not method.endswith("no_defer"),
+                    query_graph_mode=("flat" if "_flat" in method else self.config.runner.query_graph_mode),
                 )
                 result = await V5Runner(client, config=runner_config).run(
                     run_id=run_id,

@@ -20,6 +20,8 @@ class ExperimentClient:
                 }
             )
         if interface == "UPDATE":
+            if "<UPDATE_CALLBACK" in content:
+                return json.dumps({"matches": []})
             window = json.loads(content.split("Current window:\n", 1)[1].split("\n\nReturn only", 1)[0])
             entry = window[0]
             return json.dumps(
@@ -32,6 +34,7 @@ class ExperimentClient:
                             "concrete_relation": "director",
                             "matched_family": "director",
                             "object": "Martin Lee",
+                            "span_hint": "directed by Martin Lee",
                             "source_order": entry["stream_position"],
                         }
                     ]
@@ -41,7 +44,12 @@ class ExperimentClient:
             claim = json.loads(
                 content.split("Candidate claim:\n", 1)[1].split("\n\nRaw neighborhood:", 1)[0]
             )
-            return json.dumps({"claim_id": claim["claim_id"], "status": "ACCEPT"})
+            neighborhood = json.loads(content.split("Raw neighborhood:\n", 1)[1].split("\n\nReturn only", 1)[0])
+            return json.dumps({
+                "claim_id": claim["claim_id"], "status": "ACCEPT", "reason": "explicit statement",
+                "supporting_source_refs": [neighborhood[0]["source_ref"]],
+                "supporting_text": neighborhood[0]["text"],
+            })
         if interface == "ANSWER":
             context = json.loads(content.split("Complete context:\n", 1)[1].split("\n\nReturn only", 1)[0])
             return json.dumps(

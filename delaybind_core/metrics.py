@@ -19,7 +19,14 @@ def normalize_answer(value: Any) -> str:
         return "yes" if value else "no"
     text = "" if value is None else str(value)
     text = _PUNCTUATION.sub(" ", text.casefold())
-    return " ".join(text.split())
+    normalized = " ".join(text.split())
+    # JSON mode often serializes Boolean answers as strings.  The benchmark
+    # convention uses yes/no, so preserve the semantic value before EM/F1.
+    if normalized == "true":
+        return "yes"
+    if normalized == "false":
+        return "no"
+    return normalized
 
 
 def answer_exact(prediction: Any, gold_answers: Iterable[Any]) -> bool:
@@ -133,6 +140,94 @@ def _event_items(result: dict[str, Any], event_type: str) -> list[dict[str, Any]
     return [event for event in result.get("events", []) if event.get("event_type") == event_type]
 
 
+def _claim_triple(claim: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (
+        claim.get("subject"),
+        claim.get("relation"),
+        claim.get("object"),
+    )
+
+
+def verifier_metrics(
+    events: Iterable[dict[str, Any]],
+    gold_evidences: Iterable[Iterable[Any]],
+) -> dict[str, int | float | None]:
+    """Score the terminal VERIFY decision for each submitted claim.
+
+    This is deliberately conditional on claims that reached VERIFY.  It
+    measures verifier discrimination, not UPDATE coverage; the latter remains
+    ``triple_event_*``.  A NEED_MORE_CONTEXT followed by an expanded-context
+    ACCEPT is counted only as ACCEPT.
+    """
+    terminal: dict[str, tuple[str, tuple[Any, Any, Any]]] = {}
+    event_to_status = {
+        "VERIFY_NEED_MORE_CONTEXT": "NEED_MORE_CONTEXT",
+        "VERIFY_REJECTED": "REJECT",
+        "VERIFY_CONFLICT": "CONFLICT",
+        "CLAIM_PROMOTED": "ACCEPT",
+    }
+    for event in events:
+        status = event_to_status.get(str(event.get("event_type")))
+        if status is None:
+            continue
+        claim = event.get("payload", {}).get("claim")
+        if not isinstance(claim, dict):
+            continue
+        claim_id = claim.get("claim_id")
+        if not isinstance(claim_id, str):
+            continue
+        terminal[claim_id] = (status, _claim_triple(claim))
+    if not terminal:
+        return {
+            "verifier_candidate_count": 0,
+            "verifier_gold_candidate_count": 0,
+            "verifier_accept_count": 0,
+            "verifier_tp": 0,
+            "verifier_fp": 0,
+            "verifier_fn": 0,
+            "verifier_precision": None,
+            "verifier_recall": None,
+            "verifier_f1": None,
+        }
+
+    gold = {_normalized_triple(item[:3]) for item in gold_evidences if len(item) >= 3}
+    accepted = 0
+    true_positive = 0
+    false_positive = 0
+    false_negative = 0
+    gold_candidates = 0
+    for status, triple in terminal.values():
+        is_gold = _normalized_triple(triple) in gold
+        if is_gold:
+            gold_candidates += 1
+        if status == "ACCEPT":
+            accepted += 1
+            if is_gold:
+                true_positive += 1
+            else:
+                false_positive += 1
+        elif is_gold:
+            false_negative += 1
+    precision = true_positive / accepted if accepted else None
+    recall = true_positive / gold_candidates if gold_candidates else None
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision is not None and recall is not None and precision + recall
+        else None
+    )
+    return {
+        "verifier_candidate_count": len(terminal),
+        "verifier_gold_candidate_count": gold_candidates,
+        "verifier_accept_count": accepted,
+        "verifier_tp": true_positive,
+        "verifier_fp": false_positive,
+        "verifier_fn": false_negative,
+        "verifier_precision": precision,
+        "verifier_recall": recall,
+        "verifier_f1": f1,
+    }
+
+
 def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, Any]:
     """Score one method result while preserving diagnostic fields."""
     method = str(result.get("method", "v5"))
@@ -174,6 +269,9 @@ def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, A
         event.get("payload", {}).get("origin") == "DEFERRED"
         for event in _event_items(result, "CLAIM_PROMOTED")
     )
+    cross_window_promoted = event_counts.get("CROSS_WINDOW_DEFERRED_PROMOTED", 0)
+    non_early_promoted = event_counts.get("NON_EARLY_DEFERRED_PROMOTED", 0)
+    verifier = verifier_metrics(result.get("events", []), sample.evidences)
     return {
         **result,
         "prediction": prediction,
@@ -200,7 +298,15 @@ def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, A
         "promoted_count": event_counts.get("CLAIM_PROMOTED", 0),
         "deferred_promoted_count": promoted_events,
         "deferred_to_promoted": promoted_events / deferred_events if deferred_events else 0.0,
+        "cross_window_deferred_promoted_count": cross_window_promoted,
+        "non_early_deferred_promoted_count": non_early_promoted,
+        "cross_window_deferred_to_promoted": (
+            cross_window_promoted / deferred_events if deferred_events else 0.0
+        ),
         "conflict_count": event_counts.get("VERIFY_CONFLICT", 0),
+        "windows_processed": result.get("windows_processed"),
+        "streaming_protocol_valid": result.get("streaming_protocol_valid"),
+        **verifier,
         "run_success": result.get("status") == "OK",
     }
 
@@ -219,6 +325,27 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
     summaries: list[dict[str, Any]] = []
     for (method, order), items in sorted(groups.items()):
         status_counts = Counter(str(item.get("runtime_status", "UNKNOWN")) for item in items)
+        verifier_tp = sum(int(item.get("verifier_tp", 0)) for item in items)
+        verifier_fp = sum(int(item.get("verifier_fp", 0)) for item in items)
+        verifier_fn = sum(int(item.get("verifier_fn", 0)) for item in items)
+        verifier_micro_precision = (
+            verifier_tp / (verifier_tp + verifier_fp)
+            if verifier_tp + verifier_fp
+            else None
+        )
+        verifier_micro_recall = (
+            verifier_tp / (verifier_tp + verifier_fn)
+            if verifier_tp + verifier_fn
+            else None
+        )
+        verifier_micro_f1 = (
+            2 * verifier_micro_precision * verifier_micro_recall
+            / (verifier_micro_precision + verifier_micro_recall)
+            if verifier_micro_precision is not None
+            and verifier_micro_recall is not None
+            and verifier_micro_precision + verifier_micro_recall
+            else None
+        )
         summaries.append(
             {
                 "method": method,
@@ -229,6 +356,19 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "supporting_f1": mean(items, "supporting_f1"),
                 "graph_triple_f1": mean(items, "graph_triple_f1"),
                 "triple_event_f1": mean(items, "triple_event_f1"),
+                "verifier_precision": mean(items, "verifier_precision"),
+                "verifier_recall": mean(items, "verifier_recall"),
+                "verifier_f1": mean(items, "verifier_f1"),
+                "verifier_micro_precision": verifier_micro_precision,
+                "verifier_micro_recall": verifier_micro_recall,
+                "verifier_micro_f1": verifier_micro_f1,
+                "verifier_tp": verifier_tp,
+                "verifier_fp": verifier_fp,
+                "verifier_fn": verifier_fn,
+                "verifier_candidate_count": mean(items, "verifier_candidate_count"),
+                "verifier_gold_candidate_count": mean(items, "verifier_gold_candidate_count"),
+                "windows_processed": mean(items, "windows_processed"),
+                "streaming_protocol_valid_rate": mean(items, "streaming_protocol_valid"),
                 "plan_valid": mean(items, "plan_valid"),
                 "plan_relation_recall": mean(items, "plan_relation_recall"),
                 "early_latent_evidence_recall": mean(items, "early_latent_evidence_recall"),
@@ -236,6 +376,15 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "callback_count": mean(items, "callback_count"),
                 "promoted_count": mean(items, "promoted_count"),
                 "deferred_to_promoted": mean(items, "deferred_to_promoted"),
+                "cross_window_deferred_promoted_count": mean(
+                    items, "cross_window_deferred_promoted_count"
+                ),
+                "cross_window_deferred_to_promoted": mean(
+                    items, "cross_window_deferred_to_promoted"
+                ),
+                "non_early_deferred_promoted_count": mean(
+                    items, "non_early_deferred_promoted_count"
+                ),
                 "callback_hit_rate": mean(items, "callback_hit_rate"),
                 "model_calls": mean(items, "model_calls"),
                 "latency_ms": mean(items, "latency_ms"),

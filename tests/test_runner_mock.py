@@ -30,6 +30,8 @@ class FakeClient:
                 }
             )
         if interface == "UPDATE":
+            if "<UPDATE_CALLBACK" in messages[0]["content"]:
+                return json.dumps({"matches": []})
             if "q1:d1:s1" in messages[0]["content"]:
                 return json.dumps(
                     {
@@ -41,6 +43,7 @@ class FakeClient:
                                 "concrete_relation": "director",
                                 "matched_family": "DIRECTOR",
                                 "object": "Martin Lee",
+                                "span_hint": "directed by Martin Lee",
                                 "proposed_action": "COMMIT",
                                 "source_order": 1,
                             }
@@ -57,6 +60,7 @@ class FakeClient:
                             "concrete_relation": "birth_year",
                             "matched_family": "TEMPORAL_ORDER_KEY",
                             "object": 1948,
+                            "span_hint": "born in 1948",
                             "proposed_action": "DEFER",
                             "source_order": 0,
                         }
@@ -65,7 +69,12 @@ class FakeClient:
             )
         if interface == "VERIFY":
             claim = json.loads(messages[0]["content"].split("Candidate claim:\n", 1)[1].split("\n\nRaw neighborhood:", 1)[0])
-            return json.dumps({"claim_id": claim["claim_id"], "status": "ACCEPT"})
+            neighborhood = json.loads(messages[0]["content"].split("Raw neighborhood:\n", 1)[1].split("\n\nReturn only", 1)[0])
+            return json.dumps({
+                "claim_id": claim["claim_id"], "status": "ACCEPT", "reason": "explicit statement",
+                "supporting_source_refs": [neighborhood[0]["source_ref"]],
+                "supporting_text": neighborhood[0]["text"],
+            })
         raise AssertionError(f"unexpected interface: {interface}")
 
 
@@ -166,6 +175,28 @@ def test_runner_stops_at_model_call_budget():
     assert result["state"]["status"] == "RESOURCE_LIMIT"
 
 
+def test_runner_marks_single_window_as_invalid_streaming_protocol():
+    sample = canonicalize_record(
+        {
+            "id": "q-streaming",
+            "question": "Who directed Film A?",
+            "context": [["Film A", ["Film A was directed by Martin Lee."]]],
+        }
+    )
+    result = asyncio.run(
+        V5Runner(FakeClient(), config=RunnerConfig(chunk_size=100, min_streaming_windows=2)).run(
+            run_id="single-window-run",
+            sample=sample,
+            manifest=build_manifest(sample),
+            store=SQLiteEventStore(),
+        )
+    )
+    assert result["windows_processed"] == 1
+    assert result["streaming_protocol_valid"] is False
+    assert result["state"]["status"] == "INSUFFICIENT"
+    assert result["state"]["reason_codes"] == ["STREAMING_PROTOCOL_TOO_SHORT:1<2"]
+
+
 class ExpandingVerifyClient:
     def __init__(self):
         self.verify_calls = 0
@@ -183,6 +214,7 @@ class ExpandingVerifyClient:
                             "concrete_relation": "director",
                             "matched_family": "director",
                             "object": "Martin Lee",
+                            "span_hint": "directed by Martin Lee",
                             "source_order": window[0]["stream_position"],
                         }
                     ]
@@ -192,7 +224,14 @@ class ExpandingVerifyClient:
             self.verify_calls += 1
             claim = json.loads(messages[0]["content"].split("Candidate claim:\n", 1)[1].split("\n\nRaw neighborhood:", 1)[0])
             status = "NEED_MORE_CONTEXT" if self.verify_calls == 1 else "ACCEPT"
-            return json.dumps({"claim_id": claim["claim_id"], "status": status})
+            result = {"claim_id": claim["claim_id"], "status": status, "reason": "fixture verification"}
+            if status == "ACCEPT":
+                neighborhood = json.loads(messages[0]["content"].split("Raw neighborhood:\n", 1)[1].split("\n\nReturn only", 1)[0])
+                result.update({
+                    "supporting_source_refs": [neighborhood[0]["source_ref"]],
+                    "supporting_text": neighborhood[0]["text"],
+                })
+            return json.dumps(result)
         raise AssertionError(interface)
 
 
@@ -248,6 +287,7 @@ class TargetFreeEvidenceClient:
                             "concrete_relation": "director",
                             "matched_family": "director",
                             "object": "Martin Lee",
+                            "span_hint": "directed by Martin Lee",
                             "source_order": window[0]["stream_position"],
                         }
                     ]
@@ -255,7 +295,12 @@ class TargetFreeEvidenceClient:
             )
         if interface == "VERIFY":
             claim = json.loads(messages[0]["content"].split("Candidate claim:\n", 1)[1].split("\n\nRaw neighborhood:", 1)[0])
-            return json.dumps({"claim_id": claim["claim_id"], "status": "ACCEPT"})
+            neighborhood = json.loads(messages[0]["content"].split("Raw neighborhood:\n", 1)[1].split("\n\nReturn only", 1)[0])
+            return json.dumps({
+                "claim_id": claim["claim_id"], "status": "ACCEPT", "reason": "explicit statement",
+                "supporting_source_refs": [neighborhood[0]["source_ref"]],
+                "supporting_text": neighborhood[0]["text"],
+            })
         if interface == "ANSWER":
             return json.dumps(
                 {
@@ -288,3 +333,78 @@ def test_target_free_evidence_answer_uses_verified_graph_only():
     assert result["state"]["status"] == "ANSWERED"
     assert result["state"]["plan"]["answer_contract"]["target"] is None
     assert result["evidence_pack"]["answer_value"] == "Martin Lee"
+
+
+class CallbackRecoveryClient:
+    async def complete(self, *, run_id, interface, messages, response_schema=None, extra=None):
+        content = messages[0]["content"]
+        if interface == "UPDATE" and "<UPDATE_CALLBACK" in content:
+            entries = json.loads(content.split("Read-prefix entries:\n", 1)[1].split("\n\nReturn only", 1)[0])
+            entry = next(item for item in entries if "born in 1948" in item["text"])
+            return json.dumps({
+                "matches": [{
+                    "source_ref": entry["source_ref"],
+                    "subject": "Martin Lee",
+                    "object": 1948,
+                    "supporting_text": "born in 1948",
+                }]
+            })
+        if interface == "UPDATE":
+            entries = json.loads(content.split("Current window:\n", 1)[1].split("\n\nReturn only", 1)[0])
+            entry = entries[0]
+            if "directed by" not in entry["text"]:
+                return json.dumps({"events": []})
+            return json.dumps({
+                "events": [{
+                    "event_id": "e01",
+                    "source_ref": entry["source_ref"],
+                    "subject": "Film A",
+                    "concrete_relation": "director",
+                    "matched_family": "DIRECTOR",
+                    "object": "Martin Lee",
+                    "pattern_hint": "director",
+                    "span_hint": "directed by Martin Lee",
+                    "source_order": entry["stream_position"],
+                }]
+            })
+        if interface == "VERIFY":
+            claim = json.loads(content.split("Candidate claim:\n", 1)[1].split("\n\nRaw neighborhood:", 1)[0])
+            entries = json.loads(content.split("Raw neighborhood:\n", 1)[1].split("\n\nReturn only", 1)[0])
+            entry = next(item for item in entries if item["source_ref"] == claim["evidence_assertions"][0]["source_ref"])
+            return json.dumps({
+                "claim_id": claim["claim_id"],
+                "status": "ACCEPT",
+                "reason": "explicit statement",
+                "supporting_source_refs": [entry["source_ref"]],
+                "supporting_text": entry["text"],
+            })
+        raise AssertionError(interface)
+
+
+def test_binding_activation_recovers_missed_fact_from_read_prefix():
+    sample = canonicalize_record({
+        "id": "q-callback",
+        "question": "When was the director of Film A born?",
+        "context": [["Martin Lee", ["Martin Lee was born in 1948."]], ["Film A", ["Film A was directed by Martin Lee."]]],
+    })
+    plan = QueryPlan(
+        plan_id="callback-plan",
+        patterns=[
+            {"id": "director", "subject": "Film A", "relation": "DIRECTOR", "object": "?director"},
+            {"id": "birth", "subject": "?director", "relation": "TEMPORAL_ORDER_KEY", "object": "?year"},
+        ],
+        answer_contract={"target": "?year", "type": "NUMBER"},
+    )
+    result = asyncio.run(V5Runner(
+        CallbackRecoveryClient(),
+        config=RunnerConfig(chunk_size=1, max_targeted_updates=4),
+    ).run(
+        run_id="callback-recovery",
+        sample=sample,
+        manifest=build_manifest(sample),
+        store=SQLiteEventStore(),
+        plan=plan,
+    ))
+    assert result["state"]["status"] == "ANSWERED"
+    assert result["evidence_pack"]["answer_value"] == 1948
+    assert result["state"]["edge_status"] == {"director": "SATISFIED", "birth": "SATISFIED"}

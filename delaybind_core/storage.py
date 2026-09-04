@@ -287,7 +287,8 @@ class SQLiteEventStore:
         for row in rows:
             entry = ManifestEntry.model_validate_json(row[0])
             folded = " ".join(entry.text.casefold().split())
-            if any(needle in folded for needle in needles):
+            title = " ".join(entry.title.casefold().split())
+            if any(needle in folded or needle == title for needle in needles):
                 matches.append(entry)
                 if len(matches) >= limit:
                     break

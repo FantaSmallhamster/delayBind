@@ -91,6 +91,27 @@ def validate_plan(
             )
         if not pattern.relation.strip():
             issues.append(PlanIssue("EMPTY_RELATION", f"{path}.relation is empty", f"{path}.relation"))
+        for field in ("subject", "object"):
+            aliases = pattern.qualifiers.get(f"{field}_aliases")
+            if aliases is None:
+                continue
+            if not isinstance(aliases, list) or not aliases or len(aliases) > 4:
+                issues.append(
+                    PlanIssue(
+                        "INVALID_PATTERN_ALIASES",
+                        f"{path}.{field}_aliases must contain one to four non-empty strings",
+                        f"{path}.qualifiers.{field}_aliases",
+                    )
+                )
+                continue
+            if any(not isinstance(alias, str) or not alias.strip() or _VARIABLE.match(alias) for alias in aliases):
+                issues.append(
+                    PlanIssue(
+                        "INVALID_PATTERN_ALIASES",
+                        f"{path}.{field}_aliases must contain concrete entity strings",
+                        f"{path}.qualifiers.{field}_aliases",
+                    )
+                )
 
     # Every pattern component must be reachable from at least one concrete
     # entity/value. Otherwise UPDATE has no principled starting point and can

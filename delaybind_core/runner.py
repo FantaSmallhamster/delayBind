@@ -20,7 +20,7 @@ from .cursor import ReadCursor
 from .data import CanonicalSample
 from .profiler import infer_answer_contract
 from .manifest import Manifest
-from .prompts import answer_prompt, plan_prompt, update_prompt, verify_prompt
+from .prompts import answer_prompt, plan_prompt, targeted_update_prompt, update_prompt, verify_prompt
 from .plan_validation import (
     PlanIssue,
     PlanValidationError,
@@ -31,14 +31,17 @@ from .plan_validation import (
 from .runtime import EvidenceRuntime
 from .schema import (
     AnswerResponse,
+    EdgeFillResponse,
     QueryPlan,
     TripleEvent,
+    VerifyDecision,
     UpdateResponse,
     VerifyResult,
     VerifyStatus,
     RuntimeStatus,
 )
 from .storage import SQLiteEventStore
+from .text_match import contains_normalized_span
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,11 @@ class RunnerConfig:
     max_verify_expansions: int = 1
     verify_expansion_limit: int = 32
     require_evidence_sources: bool = True
+    min_streaming_windows: int = 0
+    query_graph_mode: str = "open"
+    require_source_span: bool = True
+    callback_retrieval_limit: int = 16
+    max_targeted_updates: int = 16
 
 
 class ModelBudgetExceeded(RuntimeError):
@@ -172,56 +180,169 @@ class V5Runner:
             store=store,
             verify_committed=self.config.verify_committed,
             defer_unbound=self.config.defer_unbound,
-            execute_operators=not target_free_answer,
+            execute_operators=True,
+            query_graph_mode=self.config.query_graph_mode,
+            require_source_span=self.config.require_source_span,
         )
         cursor = ReadCursor(manifest, archive)
         update_schema = UpdateResponse.model_json_schema()
+        edge_fill_schema = EdgeFillResponse.model_json_schema()
+        verify_schema = VerifyDecision.model_json_schema()
         windows = 0
         resource_limited = False
-        while not cursor.exhausted:
-            if windows >= self.config.max_windows:
-                runtime.state.status = RuntimeStatus.RESOURCE_LIMIT
-                runtime.state.reason_codes.append("MAX_WINDOWS")
-                resource_limited = True
-                runtime._emit(
-                    "RUN_STATUS",
-                    {"status": runtime.state.status.value, "reason_codes": runtime.state.reason_codes},
-                )
-                break
-            window = cursor.next_window(token_budget=self.config.chunk_size)
-            if window is None:
-                break
+        targeted_attempted: set[tuple[str, str]] = set()
+        targeted_updates = 0
+
+        def parse_verify_decision(
+            raw: str,
+            claim_id: str,
+            neighborhood_entries: list[Any],
+        ) -> VerifyResult:
             try:
-                raw_update = await complete(
+                decision = VerifyDecision.model_validate_json(raw)
+            except ValidationError as exc:
+                return VerifyResult(
+                    claim_id=claim_id,
+                    status=VerifyStatus.REJECT,
+                    reason=f"VERIFY_SCHEMA_INVALID:{exc.errors()[0]['type']}",
+                )
+            if decision.claim_id != claim_id:
+                raise ValueError(
+                    f"VERIFY returned claim_id {decision.claim_id!r} for candidate {claim_id!r}"
+                )
+            if decision.status == VerifyStatus.ACCEPT:
+                by_ref = {entry.source_ref: entry for entry in neighborhood_entries}
+                invalid_refs = sorted(set(decision.supporting_source_refs) - set(by_ref))
+                supporting_text = decision.supporting_text or ""
+                cited_text = [
+                    by_ref[source_ref].text
+                    for source_ref in decision.supporting_source_refs
+                    if source_ref in by_ref
+                ]
+                if invalid_refs or not supporting_text.strip() or not any(
+                    contains_normalized_span(text, supporting_text) for text in cited_text
+                ):
+                    reason = "INVALID_VERIFY_EVIDENCE: " + (
+                        "unknown source_ref" if invalid_refs else "supporting_text not found in cited source"
+                    )
+                    return VerifyResult(claim_id=decision.claim_id, status=VerifyStatus.REJECT, reason=reason)
+            return VerifyResult(
+                claim_id=decision.claim_id,
+                status=decision.status,
+                reason=decision.reason,
+                expanded_source_refs=decision.supporting_source_refs,
+                supporting_text=decision.supporting_text,
+            )
+
+        async def targeted_candidates(
+            edge_id: str,
+            entries: list[Any],
+            *,
+            trigger: str,
+        ) -> list[Any]:
+            nonlocal targeted_updates, resource_limited
+            if edge_id not in runtime.active_edge_ids():
+                return []
+            fresh = [
+                entry
+                for entry in entries
+                if (edge_id, entry.source_ref) not in targeted_attempted
+            ][: self.config.callback_retrieval_limit]
+            if not fresh or targeted_updates >= self.config.max_targeted_updates:
+                return []
+            targeted_updates += 1
+            targeted_attempted.update((edge_id, entry.source_ref) for entry in fresh)
+            runtime._emit(
+                "TARGETED_UPDATE_REQUESTED",
+                {
+                    "edge_id": edge_id,
+                    "trigger": trigger,
+                    "source_refs": [entry.source_ref for entry in fresh],
+                },
+            )
+            try:
+                raw = await complete(
                     run_id=run_id,
                     interface="UPDATE",
                     messages=[
                         {
                             "role": "user",
-                            "content": update_prompt(
+                            "content": targeted_update_prompt(
                                 sample.question,
-                                plan,
-                                runtime.state.graph_projection(max_claims=self.config.max_graph_claims),
-                                [entry.model_dump(mode="json") for entry in window.entries],
+                                runtime.edge_projection(edge_id),
+                                [entry.model_dump(mode="json") for entry in fresh],
                                 schema=update_schema,
                             ),
                         }
                     ],
                     response_schema=update_schema,
                 )
-            except ModelBudgetExceeded as exc:
+            except ModelBudgetExceeded:
                 runtime.state.status = RuntimeStatus.RESOURCE_LIMIT
                 runtime.state.reason_codes.append("MAX_MODEL_CALLS")
                 resource_limited = True
-                runtime._emit("RUN_STATUS", {"status": runtime.state.status.value, "reason_codes": runtime.state.reason_codes})
-                break
-            update = UpdateResponse.model_validate_json(raw_update)
+                return []
+            callback_events: list[TripleEvent] = []
+            try:
+                legacy_update = UpdateResponse.model_validate_json(raw)
+            except ValidationError as update_exc:
+                # Some OpenAI-compatible gateways/cache entries still return
+                # the compact callback envelope. Accept it as a compatibility
+                # path, while Runtime continues to enforce source/span/edge
+                # matching deterministically.
+                try:
+                    edge_fill = EdgeFillResponse.model_validate_json(raw)
+                except ValidationError as edge_exc:
+                    # A callback is a recall enhancement, never a prerequisite
+                    # for preserving already verified state. Treat malformed
+                    # output as empty and leave an auditable trace.
+                    runtime._emit(
+                        "TARGETED_UPDATE_SCHEMA_INVALID",
+                        {
+                            "edge_id": edge_id,
+                            "trigger": trigger,
+                            "error": str(update_exc),
+                            "compact_error": str(edge_exc),
+                        },
+                    )
+                    return []
+                allowed_refs = {entry.source_ref for entry in fresh}
+                edge_projection = runtime.edge_projection(edge_id)
+                callback_events.extend(
+                    TripleEvent(
+                        event_id=f"edge-fill-{index}",
+                        source_ref=match.source_ref,
+                        subject=match.subject,
+                        concrete_relation=str(edge_projection["relation"]),
+                        matched_family=str(edge_projection["relation"]),
+                        object=match.object,
+                        pattern_hint=edge_id,
+                        span_hint=match.supporting_text,
+                    )
+                    for index, match in enumerate(edge_fill.matches)
+                )
+            else:
+                allowed_refs = {entry.source_ref for entry in fresh}
+                callback_events = [
+                    event.model_copy(update={"pattern_hint": edge_id})
+                    for event in legacy_update.events
+                    if event.source_ref in allowed_refs
+                ]
+            update = UpdateResponse(events=callback_events)
+            runtime._emit(
+                "TARGETED_UPDATE_COMPLETED",
+                {"edge_id": edge_id, "event_count": len(update.events), "trigger": trigger},
+            )
             results = runtime.apply_events(update.events)
-            verification_queue = [
+            return [
                 claim
                 for result in results
                 for claim in (*result.deferred_matches, *result.verification_candidates)
             ]
+
+        async def verify_candidates(initial: list[Any]) -> None:
+            nonlocal resource_limited
+            verification_queue = list(initial)
             seen_claim_ids: set[str] = set()
             while verification_queue and len(seen_claim_ids) < self.config.max_verify_candidates:
                 claim = verification_queue.pop(0)
@@ -229,7 +350,6 @@ class V5Runner:
                     continue
                 seen_claim_ids.add(claim.claim_id)
                 neighborhood = archive.fetch(claim.evidence_assertions[0].source_ref, neighborhood=1)
-                verify_schema = VerifyResult.model_json_schema()
                 try:
                     raw_verify = await complete(
                         run_id=run_id,
@@ -247,7 +367,7 @@ class V5Runner:
                         ],
                         response_schema=verify_schema,
                     )
-                    verify_result = VerifyResult.model_validate_json(raw_verify)
+                    verify_result = parse_verify_decision(raw_verify, claim.claim_id, neighborhood)
                     for _ in range(self.config.max_verify_expansions):
                         if verify_result.status != VerifyStatus.NEED_MORE_CONTEXT:
                             break
@@ -276,15 +396,100 @@ class V5Runner:
                             ],
                             response_schema=verify_schema,
                         )
-                        verify_result = VerifyResult.model_validate_json(raw_verify)
+                        verify_result = parse_verify_decision(raw_verify, claim.claim_id, expanded)
                 except ModelBudgetExceeded:
                     runtime.state.status = RuntimeStatus.RESOURCE_LIMIT
                     runtime.state.reason_codes.append("MAX_MODEL_CALLS")
                     resource_limited = True
-                    runtime._emit("RUN_STATUS", {"status": runtime.state.status.value, "reason_codes": runtime.state.reason_codes})
-                    break
+                    return
                 runtime.apply_verification(verify_result)
                 verification_queue.extend(runtime.drain_verification_matches())
+                for activated_edge_id in runtime.drain_activated_edges():
+                    anchors = runtime.edge_anchor_values(activated_edge_id)
+                    recalled = archive.search_mentions(
+                        anchors, limit=self.config.callback_retrieval_limit
+                    )
+                    verification_queue.extend(
+                        await targeted_candidates(
+                            activated_edge_id,
+                            recalled,
+                            trigger="BINDING_ACTIVATION",
+                        )
+                    )
+
+        while not cursor.exhausted:
+            if windows >= self.config.max_windows:
+                runtime.state.status = RuntimeStatus.RESOURCE_LIMIT
+                runtime.state.reason_codes.append("MAX_WINDOWS")
+                resource_limited = True
+                runtime._emit(
+                    "RUN_STATUS",
+                    {"status": runtime.state.status.value, "reason_codes": runtime.state.reason_codes},
+                )
+                break
+            window = cursor.next_window(token_budget=self.config.chunk_size)
+            if window is None:
+                break
+            runtime.register_read_window(
+                windows, [entry.source_ref for entry in window.entries]
+            )
+            try:
+                raw_update = await complete(
+                    run_id=run_id,
+                    interface="UPDATE",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": update_prompt(
+                                sample.question,
+                                plan,
+                                runtime.state.graph_projection(max_claims=self.config.max_graph_claims),
+                                [entry.model_dump(mode="json") for entry in window.entries],
+                                schema=update_schema,
+                            ),
+                        }
+                    ],
+                    response_schema=update_schema,
+                )
+            except ModelBudgetExceeded as exc:
+                runtime.state.status = RuntimeStatus.RESOURCE_LIMIT
+                runtime.state.reason_codes.append("MAX_MODEL_CALLS")
+                resource_limited = True
+                runtime._emit("RUN_STATUS", {"status": runtime.state.status.value, "reason_codes": runtime.state.reason_codes})
+                break
+            update = UpdateResponse.model_validate_json(raw_update)
+            results = runtime.apply_events(update.events)
+            verification_candidates = [
+                claim
+                for result in results
+                for claim in (*result.deferred_matches, *result.verification_candidates)
+            ]
+            await verify_candidates(verification_candidates)
+            if resource_limited:
+                break
+
+            # A focused second pass protects ACTIVE root edges from sparse
+            # general UPDATE omissions without scanning unrelated archive text.
+            for edge_id in runtime.active_edge_ids():
+                anchors = runtime.edge_anchor_values(edge_id)
+                relevant_entries = [
+                    entry
+                    for entry in window.entries
+                    if any(
+                        contains_normalized_span(entry.text, anchor)
+                        or " ".join(entry.title.casefold().split())
+                        == " ".join(anchor.casefold().split())
+                        for anchor in anchors
+                    )
+                ]
+                candidates = await targeted_candidates(
+                    edge_id,
+                    relevant_entries,
+                    trigger="ACTIVE_EDGE_CURRENT_WINDOW",
+                )
+                await verify_candidates(candidates)
+                if resource_limited:
+                    break
             windows += 1
             if (
                 self.config.snapshot_every_windows > 0
@@ -306,7 +511,26 @@ class V5Runner:
                 )
             if resource_limited:
                 break
-        pack = None if resource_limited else runtime.finalize()
+        streaming_protocol_valid = windows >= self.config.min_streaming_windows
+        if not resource_limited and not streaming_protocol_valid:
+            runtime.state.status = RuntimeStatus.INSUFFICIENT
+            runtime.state.reason_codes = [
+                f"STREAMING_PROTOCOL_TOO_SHORT:{windows}<{self.config.min_streaming_windows}"
+            ]
+            runtime._emit(
+                "STREAMING_PROTOCOL_REJECTED",
+                {
+                    "windows_processed": windows,
+                    "min_streaming_windows": self.config.min_streaming_windows,
+                },
+            )
+            runtime._emit(
+                "RUN_STATUS",
+                {"status": runtime.state.status.value, "reason_codes": runtime.state.reason_codes},
+            )
+            pack = None
+        else:
+            pack = None if resource_limited else runtime.finalize()
         if pack is not None and self.config.answer_mode == "evidence":
             answer_schema = AnswerResponse.model_json_schema()
             try:
@@ -368,6 +592,9 @@ class V5Runner:
         return {
             "run_id": run_id,
             "question": sample.question,
+            "windows_processed": windows,
+            "window_word_budget": self.config.chunk_size,
+            "streaming_protocol_valid": streaming_protocol_valid,
             "state": runtime.state.export(),
             "evidence_pack": pack.model_dump(mode="json") if pack is not None else None,
         }

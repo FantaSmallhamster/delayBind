@@ -12,16 +12,26 @@ Predicted Plan 的测试结果。
 | `v5_oracle` | gold evidence 编译 Oracle Plan，启用 DEFER | 隔离 Runtime、UPDATE、VERIFY 和延迟绑定能力。 |
 | `v5_predicted` | 模型仅根据问题生成 Plan | 测试完整 V5 系统。 |
 | `v5_oracle_no_defer` | Oracle Plan，但未绑定候选直接 SKIP | 测量 Delayed Binding 的因果贡献。 |
+| `v5_oracle_flat` | 同一 Oracle Plan，但关闭 OQG 的 DORMANT/ACTIVE frontier | 测量查询图拓扑激活相对平铺 Pattern List 的贡献。 |
+| `v5_oracle_flat_no_defer` | Flat Pattern List 且关闭 DEFER | 用于拆分拓扑激活与延迟绑定两个因素。 |
 
 `compile_oracle_plan()` 使用 2Wiki 的 `evidences` 关系链构造 Plan，并把非问题常量替换为变量。
-实体别名通过显式 `question_anchor` 保存；comparison 中即使两个 gold 值相同也使用两个独立
-变量，避免把 Yes/No 答案泄漏到 Plan 拓扑。该编译器只能用于 Oracle 实验和监督数据生成。
+实体别名通过显式 `question_anchor` 和 `subject_aliases` / `object_aliases` 保存。Runtime 只接受
+计划中可审计地声明的别名，绝不依据字符串相似度把两个实体自动合并；comparison 中即使两个 gold
+值相同也使用两个独立变量，避免把 Yes/No 答案泄漏到 Plan 拓扑。该编译器只能用于 Oracle 实验和
+监督数据生成。
 
 `answer_mode="runtime"` 是严格 target-based 消融：PLAN 必须给出
 `answer_contract.target`，Runtime 直接读取绑定值。`answer_mode="evidence"` 是推荐的完整
 V5 回答模式：PLAN 只提供 patterns/operators，答案类型由问题画像推断；所有 required pattern
 被验证后，ANSWER 只能读取 EvidencePack 并必须返回其中存在的 `source_refs`。因此 ANSWER 可以
 根据问题选择图中的最终变量，但不能重新读取全文或使用图外事实。
+
+所有 V5 条件都将 `QueryPlan.patterns` 确定性编译为 **Open Query Graph (OQG)**：常量、共享变量、
+答案变量和算子是节点，Pattern 是边。默认 `query_graph_mode="open"`：两端未知的边为 `DORMANT`，
+一端绑定后为 `ACTIVE`，只有带来源的验证 Claim 才能令其 `SATISFIED`。最终 Evidence Graph 与 OQG
+通过 `edge_support` mapping 连接。`flat` 仅用于消融，它保留相同 Pattern 和模型调用，但关闭由绑定
+触发的 frontier 激活。
 
 ## 2. Manifest 条件
 
@@ -56,6 +66,24 @@ PYTHONPATH=. python -m delaybind_core experiment \
 ```bash
 PYTHONPATH=. python -m delaybind_core experiment \
   --config configs/evidence_answer_smoke.json
+```
+
+进行延迟绑定主实验时，使用严格多窗口的 Oracle 对照配置：
+
+```bash
+PYTHONPATH=. python -m delaybind_core experiment \
+  --config configs/oracle_streaming.json
+```
+
+该配置以 80 个词的近似窗口预算读取，且设置 `min_streaming_windows=2`。任一样本若实际只形成
+一个窗口，会以 `STREAMING_PROTOCOL_TOO_SHORT` 标记为协议不合格，而不是被混入流式结果。主实验
+应优先检查 `windows_processed` 和 `streaming_protocol_valid`，再解释准确率差异。
+
+比较 Open Query Graph 与 Flat Pattern List 的四格消融：
+
+```bash
+PYTHONPATH=. python -m delaybind_core experiment \
+  --config configs/oracle_query_graph_ablation.json
 ```
 
 只测 Direct Full Context 时使用独立配置，不需要 Oracle Plan：
@@ -123,9 +151,13 @@ checkpoint、方法矩阵或 Runtime 参数后会拒绝续跑，防止新旧结�
 - Supporting-Fact precision/recall/F1，按稳定 `source_ref` 计算。
 - Triple Event F1，基于模型提出的 `TRIPLE_EVENT_PROPOSED` 与 gold evidence triples。
 - Graph Triple F1，基于最终 EvidencePack 中的 verified Claim。
+- Verifier precision/recall/F1：仅在已经送入 VERIFY 的候选 Claim 上评估其终态 ACCEPT，和 UPDATE
+  的事实抽取召回分开报告；扩展上下文后的最终决定覆盖先前 `NEED_MORE_CONTEXT`。
 - Plan Validity 与 Oracle relation-family recall。
 - Early Latent Evidence Recall：首次 grounded Claim 前出现的 gold evidence 中，被正确 DEFER 的比例。
 - Deferred-to-Promoted conversion 与 exact callback hit rate。
+- Cross-window Deferred Promotion：仅当 deferred Claim 的 source 严格早于触发 binding 的 source
+  时计数；同一句或较晚事实的提升单列为 non-early，不能作为延迟回查机制证据。
 - `INSUFFICIENT`、`CONFLICTED`、`UNSUPPORTED`、`RESOURCE_LIMIT` 和运行错误。
 - logical model calls、实际尝试、cache hit、输入/输出 token、模型延迟和端到端延迟。
 - Reverse-Forward Accuracy Gap。
@@ -136,12 +168,16 @@ checkpoint、方法矩阵或 Runtime 参数后会拒绝续跑，防止新旧结�
 VERIFY 默认先读取候选句的同文档邻域；若返回 `NEED_MORE_CONTEXT`，Runtime 最多执行一次受控
 扩展，加入该已读文档和主体/客体在 read prefix 中的 mention。对应配置为
 `max_verify_expansions` 和 `verify_expansion_limit`，扩展仍不能访问未来后缀。
+VERIFY 的模型接口只包含 `claim_id`、三态 `status`、必填 `reason`、支撑 `source_refs` 和连续
+`supporting_text`；其内部 Claim 状态由 Runtime 维护，避免把完整嵌套 Claim schema 反复放入验证
+提示词。VERIFY 只判断原子 Claim 是否被本地来源支持，不得要求后续 hop 或完整问题答案。
 
 ## 6. 推荐执行顺序
 
 1. 先运行 `sample_count=16`、`original/reverse`，人工检查所有 error trajectory。
-2. 确认 `v5_oracle` 可运行后比较 `v5_oracle_no_defer`，验证机制信号。
-3. 比较 `v5_predicted` 与 `v5_oracle`，决定是否优先训练 PLAN。
+2. 先运行 `v5_oracle`、`v5_oracle_flat`、`v5_oracle_no_defer`，并只用 cross-window 指标解释
+   图拓扑与延迟绑定信号。
+3. 确认 Oracle 图可运行后比较 `v5_predicted` 与 `v5_oracle`，决定是否优先训练 PLAN。
 4. 扩至 hard-128，并加入 `interleaved/distant`。
 5. 最后扩展到 50/200/800/1600 documents；超出 checkpoint 原生窗口时必须将 Direct 标为
    extended 或 truncated，不能继续写作 Full Context。

@@ -1,5 +1,5 @@
 from delaybind_core import canonicalize_record
-from delaybind_core.profiler import profile_sample
+from delaybind_core.profiler import infer_answer_contract, profile_sample
 
 
 def test_profiler_maps_2wiki_question_type_to_contract():
@@ -30,3 +30,20 @@ def test_profiler_maps_compositional_question_to_path_join():
         }
     )
     assert profile_sample(sample).required_ops == ["PATH_JOIN"]
+
+
+def test_answer_contract_uses_question_head_not_entity_title_words():
+    nationality = canonicalize_record(
+        {
+            "id": "q-nationality",
+            "question": "What nationality is the performer of song When The Stars Go Blue?",
+        }
+    )
+    location = canonicalize_record(
+        {
+            "id": "q-location",
+            "question": "What is the place of birth of the performer?",
+        }
+    )
+    assert infer_answer_contract(nationality).type == "NATIONALITY"
+    assert infer_answer_contract(location).type == "LOCATION"

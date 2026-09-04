@@ -85,11 +85,12 @@ canonicalize_record -> CanonicalSample -> build_manifest -> Manifest
                  +-------------------- RawArchive <---+--- 仅追加当前读窗
                  |                         |
                  |                         v
-问题 --> PLAN 模型 --> QueryPlan --> 计划校验 --> EvidenceRuntime <--- SQLiteEventStore
-                                          |               |
+问题 --> PLAN 模型 --> QueryPlan --编译--> Open Query Graph --> EvidenceRuntime <--- SQLiteEventStore
+                                          |                    |               |
 当前窗口 --> UPDATE 模型 --> TripleEvent --+               |
                                                           v
-            DEFER -> BIND -> 精确回查 -> VERIFY -> PROMOTE -> EOS 完整性检查
+ Open Query Graph: DORMANT -> ACTIVE -> SATISFIED
+            DEFER -> BIND -> 精确回查 -> VERIFY -> PROMOTE -> Evidence Graph -> EOS 完整性检查
                                                           |
                                                           v
                                          EvidencePack -> （可选 ANSWER 模型）
@@ -111,14 +112,17 @@ canonicalize_record -> CanonicalSample -> build_manifest -> Manifest
 | 清单（Manifest） | 不可变的句子级输入顺序，记录稳定 `source_ref`、哈希和 `stream_position`。 |
 | 读取游标（ReadCursor） | 按清单正向切出预算内窗口，不能回退或跳读。 |
 | 原始档案（RawArchive） | 已读取句子的持久化副本，是所有证据引用的访问控制层。 |
-| 查询计划（QueryPlan） | 由关系模式、算子和答案契约组成的结构化推理目标。 |
-| 关系模式（Pattern） | `subject -> relation -> object` 的三元组模板，`?x` 表示待绑定变量。 |
+| 查询计划（QueryPlan） | 模型输出的兼容 envelope；其 Pattern 会被确定性编译为 Open Query Graph。 |
+| 开放查询图（Open Query Graph） | 问题到来后临时建立的需求图，包含常量节点、变量节点、答案节点、关系边和算子节点；它描述尚待找到的证据，不是长期记忆库。 |
+| 查询边状态 | `DORMANT` 表示两端都未绑定；`ACTIVE` 表示至少一端可锚定；`SATISFIED` 表示已有经验证 Claim 支持；`CONFLICTED` 表示出现未解决冲突。 |
+| 关系模式（Pattern） | `subject -> relation -> object` 的旧 JSON 序列化形式；运行时等价于 Open Query Graph 的一条关系边，`?x` 是共享变量节点。 |
 | 关系族（relation family） | 将具体表述如 `birth_year` 归到计划语义关系如 `TEMPORAL_ORDER_KEY`。 |
-| 绑定（binding） | 将 `?director` 这类变量确定为实体值的运行时状态改变。 |
+| 绑定（binding） | 将 `?director` 这类变量确定为实体值的显式图状态改变；它会激活相邻 DORMANT 查询边并触发精确回查。 |
 | Claim | 带来源、极性、模态、处置状态的候选事实；不是无来源的模型结论。 |
-| 延迟 Claim | 关系相关但尚未可落到已知实体的 Claim，存入 `deferred`。 |
+| 延迟 Claim | 来自某条 DORMANT 查询边、且原句同时明确给出两端与关系的早到候选；它不是 DORMANT 边本身。 |
 | 验证（verification） | 对候选 Claim 与原文邻域是否精确支持进行 `ACCEPT/REJECT/...` 判断。 |
-| 证据包（EvidencePack） | 终止时导出的可用 Claim、算子轨迹和候选答案值。 |
+| Evidence Graph | 本题已经验证的 Claim 图；每条 Claim 带 `source_ref`，且通过 edge-support mapping 对应到 Open Query Graph 的查询边。 |
+| 证据包（EvidencePack） | 终止时导出的 Evidence Graph、Open Query Graph 状态、edge-support mapping、算子轨迹和候选答案值。 |
 | 事件溯源（event sourcing） | 将状态变化写成有序事件，之后可从日志重新投影状态。 |
 
 ## 4. 数据层：从原始记录到受控读取流
@@ -169,21 +173,36 @@ tokenizer 的精确计数，实际 API 上下文仍可能与该预算有偏差�
 `fetch(source_ref, neighborhood=1)` 仅返回已归档、且属于同一 `document_id` 的相邻句子，
 绝不会为了凑足邻域去读未来或把相邻文档的内容混入 VERIFY。
 
-### 4.4 Graph Working Memory 与提示词投影
+### 4.4 双层图：Open Query Graph 与 Evidence Graph
 
-Graph Working Memory 是当前问题唯一进入 UPDATE 上下文的持久事实状态。它由已通过验证门的
-RAW Claim 组成；开放 Pattern、pending/deferred Claim、完整原文和未执行算子都不属于图。
-工程上，`RuntimeState.verified` 保存带完整 provenance 的 Claim，而
-`RuntimeState.graph_projection(max_claims=N)` 只向模型暴露以下字段：绑定、主体、关系、客体、
-限定条件、极性、模态和匹配 Pattern ID。这样模型能够判断下一窗口的相关性，同时不会把
-`source_ref`、验证断言等审计冗余字段在每一轮重复展开；完整数据仍保留在 SQLite 与最终
-EvidencePack 中。`max_graph_claims` 只限制提示词投影，不删除运行时事实。
+V5 不把问题图与已知事实图混为一张图。
 
-图的生命周期是单题单运行：`G_0=empty`，每个 VERIFY `ACCEPT` 才新增边，运行结束导出
-EvidencePack；不同样本使用不同 `run_id`，不共享当前问题图。后续长期图工作只能消费这些已
-验证局部图，不能在第一篇 V5 中反向改变读取或绑定规则。
+1. **Open Query Graph（OQG）** 表示“当前问题还需要什么”。它在 PLAN 后由
+   `compile_open_query_graph()` 从 QueryPlan 确定性构建，节点为问题常量、共享变量、答案变量和
+   算子，边为所需关系。
+2. **Evidence Graph（EG）** 表示“当前已经验证了什么”。它由 `RuntimeState.verified` 中带
+   provenance 的 Claim 构成，只有 VERIFY ACCEPT 后才能加入。
+3. **support mapping** `edge_support[query_edge_id] -> [claim_id, ...]` 连接两层图。EOS 不再只问
+   “某个变量是否有值”，而是检查每条 required OQG 边是否为 `SATISFIED` 且至少有一个 verified
+   Claim 支持。
 
-## 5. 计划层：QueryPlan、答案契约与确定性校验
+例如“Cindy 的老师的母亲是谁”的 OQG 为：
+
+```text
+[Cindy] --TEACHER--> [?teacher] --MOTHER--> [lambda ?answer]
+       ACTIVE                    DORMANT
+```
+
+`Cindy --teacher--> Alice` 被验证后写入 EG，并使 `?teacher=Alice`。该绑定事件把第二条边变为
+`ACTIVE`；之后 `Alice --mother--> Betty` 才能满足该边并绑定答案。若后者在前一个窗口已经出现，
+它只能作为带来源的 deferred Claim 等待此绑定，而不能提前当作答案证据。
+
+`RuntimeState.graph_projection(max_claims=N)` 向 UPDATE 暴露当前变量绑定、OQG 的 active/dormant
+frontier、以及紧凑 EG Claim。`max_graph_claims` 只限制提示词投影，不删除运行时事实。图的生命
+周期严格为单题单运行；它不是 PlugMem/REMem 式预建长期记忆图。后续长期工作可消费已验证的
+Evidence Graph，但不能反向改变本题读取或绑定规则。
+
+## 5. 计划层：QueryPlan、Open Query Graph 与确定性校验
 
 ### 5.1 模型输出契约
 
@@ -200,6 +219,11 @@ Pydantic `extra="forbid"`，即未知字段不能静默进入运行时。
 | `operators` | 最多 8 条 | 声明比较、集合或投影等派生步骤。 |
 | `answer_contract` | runtime-answer 时声明目标变量；evidence-answer 时由问题画像提供类型 | 规定答案类型、基数与规范化方式。 |
 
+`QueryPlan` 是模型容易生成和审计的 JSON envelope，并不是平铺列表的最终执行语义。Runtime 在
+创建时把每个 Pattern 编译成 OQG 的一条 `QueryEdge`，将同名变量合并为同一个 `QueryNode`，并将
+OperatorSpec 编译为 Operator Node。也就是说，下列两条 Pattern 不是两个孤立模板，而是共享
+`?director` 节点的有向图：
+
 三元组方向始终是 `subject -> relation -> object`。例如“Film A 的导演的母亲是谁”应包含：
 
 ```json
@@ -211,6 +235,16 @@ Pydantic `extra="forbid"`，即未知字段不能静默进入运行时。
   "answer_contract": {"target": "?mother", "type": "ENTITY"}
 }
 ```
+
+编译后拓扑为：
+
+```text
+[Film A] --director--> [?director] --mother--> [?mother/answer]
+```
+
+初始时第一条边为 `ACTIVE`，第二条边为 `DORMANT`。这一区别由 Runtime 确定性计算，不要求
+模型为每条边生成额外的自然语言子计划。`query_graph_mode="flat"` 是正式消融：使用同一 Plan 和
+同一事件协议，但关闭由变量绑定驱动的 frontier 激活；`open` 是默认执行模式。
 
 ### 5.2 防止“看似合法、语义失效”的计划
 
@@ -235,16 +269,17 @@ Runner 对无效的计划最多执行一次纠正重试（`max_plan_retries=1`�
 ### 6.1 Claim 的状态与动作
 
 模型的 `TripleEvent` 提供 `source_ref`、实体、具体关系、可选关系族、对象、来源顺序和
-置信度等信息。运行时把它转换为带原始来源 `EvidenceAssertion` 的 `Claim`。
+置信度等信息。运行时把它转换为带原始来源 `EvidenceAssertion` 的 `Claim`，然后与 OQG 的
+active frontier 或 dormant edge 对齐。
 
 ```text
 模型 TripleEvent
        |
-       +-- 无匹配 Pattern -------------------------> SKIPPED
+       +-- 无匹配 OQG edge ------------------------> SKIPPED
        |
-       +-- Pattern 已可落地 --> COMMITTED --（可选验证）--> PROMOTED
+       +-- ACTIVE edge --> COMMITTED --（可选验证）--> PROMOTED --> edge SATISFIED
        |
-       +-- Pattern 尚不可落地 --> DEFERRED -- BIND/LOOKUP --> VERIFY
+       +-- DORMANT edge 的 source-local 候选 --> DEFERRED -- BIND/LOOKUP --> VERIFY
                                                        | ACCEPT
                                                        v
                                                     PROMOTED
@@ -256,7 +291,9 @@ Runner 对无效的计划最多执行一次纠正重试（`max_plan_retries=1`�
 
 术语上，`COMMITTED` 表示运行时判断候选匹配且可落地；在 Runner 默认的统一验证模式下，
 它先进入 `state.pending`，收到 `VERIFY ACCEPT` 后才进入 `state.verified` 并触发绑定。
-`PROMOTED` 表示该 Claim 收到过 `VERIFY ACCEPT`。将 `verify_committed=false` 用于低成本消融时，
+`PROMOTED` 表示该 Claim 收到过 `VERIFY ACCEPT`。它会写入 Evidence Graph、更新
+`edge_support`、将对应 OQG edge 标为 `SATISFIED`；若它绑定新变量，则相邻 DORMANT edge 会变为
+`ACTIVE` 并产生 `QUERY_EDGE_ACTIVATED`。将 `verify_committed=false` 用于低成本消融时，
 COMMITTED Claim 才会直接进入 `verified`，因此该开关必须在实验报告中明确记录。
 
 ### 6.2 `apply_event()` 的精确决策顺序
@@ -266,13 +303,17 @@ COMMITTED Claim 才会直接进入 `verified`，因此该开关必须在实验�
 1. 通过 `archive.entry(source_ref)` 确保来源已读；`context_only=True` 的来源也会拒绝。
 2. 将模型报出的 `source_order` 与 Manifest 真值比较；不一致时写
    `EVENT_SOURCE_ORDER_MISMATCH` 并用 Manifest 的流位置覆盖它。
-3. 用 `proposal:<event_id>` 查询事件库，实现同一模型事件的幂等处理。**幂等**指重试不会
-   产生第二份状态变更。
-4. 仅按关系/关系族和已知常量、已绑定变量筛选匹配 Pattern；多条命中时当前实现取第一条。
-5. 无 Pattern 命中时生成 `SKIPPED` Claim；Pattern 至少有一端是常量或已绑定变量时为
-   `COMMITTED`，否则为 `DEFERRED`。
-6. `COMMITTED` 时，填充此前未绑定的变量、写入 `ENTITY_BOUND`，并查找可能因新绑定而
-   可回查的 deferred Claim。
+3. 不信任模型在每个窗口重复使用的 `e01/e02` 局部编号。Runtime 用
+   `source_ref + subject + relation + object + qualifiers + polarity + modality` 生成内容级 canonical
+   event ID，再以 `proposal:<canonical_event_id>` 查询事件库。这样同一事实重试保持幂等，不同窗口的
+   `e01` 不会互相吞掉。
+4. 首先按关系/关系族筛选 OQG edge；`ACTIVE` edge 优先于 `DORMANT` edge，随后再按已知常量、
+   显式别名和已绑定变量匹配。`pattern_hint` 只是排序提示，不能屏蔽实体匹配的候选。
+5. 无 edge 命中时生成 `SKIPPED` Claim。ACTIVE edge 至少一端是常量或已绑定变量，候选进入
+   `COMMITTED`；DORMANT edge 两端均未绑定，只接受“同一 source 中明确给出主语、关系、宾语”的
+   `DEFERRED` 候选。关系族相同但无 source-local 三元组不得进入 deferred。
+6. `COMMITTED`/`PROMOTED` 后，Runtime 写入 `QUERY_VARIABLE_BOUND`、刷新 edge 状态、激活下游
+   frontier，并按实体和 relation family 查询 deferred Claim。
 
 `apply_events()` 无条件按 Archive 中的真实 `stream_position`、`span_hint`、`event_id` 排序。
 因此 UPDATE 返回的 JSON 数组即使乱序，运行时也会写 `EVENTS_REORDERED` 并按输入阅读顺序
@@ -290,27 +331,33 @@ T2: (?director, TEMPORAL_ORDER_KEY, ?year)
 
 | 流位置 | 句子与 UPDATE 候选 | 运行时结果 | 原因 |
 | --- | --- | --- | --- |
-| 0 | `Martin Lee was born in 1948.` -> `(Martin Lee, birth_year, 1948)`，关系族为 `TEMPORAL_ORDER_KEY` | `DEFERRED` | `?director` 尚未绑定，不能证明 Martin Lee 就是问题所问导演。 |
-| 1 | `Film A was directed by Martin Lee.` -> `(Film A, director, Martin Lee)` | `COMMITTED`，绑定 `?director=Martin Lee` | T1 有来自问题的常量 `Film A`，可安全落地。 |
+| 0 | `Martin Lee was born in 1948.` -> `(Martin Lee, birth_year, 1948)`，关系族为 `TEMPORAL_ORDER_KEY` | T2 仍为 `DORMANT`，Claim `DEFERRED` | `?director` 尚未绑定，不能证明 Martin Lee 就是问题所问导演。 |
+| 1 | `Film A was directed by Martin Lee.` -> `(Film A, director, Martin Lee)` | T1 `COMMITTED` 后验证、`SATISFIED`，绑定 `?director=Martin Lee`，T2 变 `ACTIVE` | T1 有来自问题的常量 `Film A`，可安全落地。 |
 | 1 后 | `DEFERRED_LOOKUP` | 命中位置 0 的 Claim | 当前实现以 `(Martin Lee, TEMPORAL_ORDER_KEY)` 精确匹配。 |
 | 回查 | 向 VERIFY 提供位置 0 及已读邻域 | `ACCEPT` 后 `PROMOTED`，绑定 `?year=1948` | 原文支持该精确候选。 |
 | EOS | 必需 T1、T2 均满足 | `ANSWERED`，证据包答案为 `1948` | 运行时输出可以不再请求答案模型。 |
 
 `_lookup_deferred()` 的匹配键是“新绑定变量所在的一侧（主语或宾语）+ 实体 + `relation_key`”。
-它覆盖单变量的正向和反向落地；需要多个变量共同决定的关系、通用 join 或复杂集合索引，
-仍应视为后续扩展项。
+每次 lookup 还记录 deferred source 与 binding source。仅当 deferred source 的 stream position
+严格早于 binding source 时，Runtime 才写 `CROSS_WINDOW_DEFERRED_PROMOTED` 并计为真正的早到
+证据恢复；同一句、同窗口内仅因 UPDATE 事件排序导致的提升写为
+`NON_EARLY_DEFERRED_PROMOTED`，不得作为 Delayed Binding 主结论。
 
 ### 6.4 验证及冲突处理
 
 Runner 默认会对 grounded 的 pending Claim，以及被 `deferred_matches` 找回的 Claim 发起 VERIFY。
 验证提示词只提供：问题、候选 Claim、以原始来源为中心的已读 `neighborhood=1` 句子；它明示
-模型不可引用外部事实。
+模型只能判断**这一条原子 Claim**，不得要求另一跳、另一实体或最终比较答案。问题只用于关系语义
+消歧，不能将局部验证退化为整题问答。
 
-- `ACCEPT`：Claim 变为 `PROMOTED`，从 deferred 移除，写入可用集合，并尝试由其再次绑定变量。
+- `ACCEPT`：必须返回邻域中存在的 `supporting_source_refs` 和原文连续 `supporting_text`。Runtime
+  验证 source_ref 可访问且该文本确实属于被引用来源；不合规 ACCEPT 降为 `REJECT`，不会让整题报错。
+  合规 Claim 变为 `PROMOTED`，写入 Evidence Graph，并尝试由其再次绑定变量。
 - `REJECT`：Claim 变为 `REJECTED`，从 deferred 移除并写入 rejected 集合。
 - `CONFLICT`：记录冲突原因并终止时标记 `CONFLICTED`；当前实现还保留原集合成员，故不应在
   冲突状态下使用 `EvidencePack`。
-- `NEED_MORE_CONTEXT`：只记录事件，不自动扩展窗口、重试或改变 Claim 处置状态。
+- `NEED_MORE_CONTEXT`：先记录事件；Runner 最多按 `max_verify_expansions` 在已读前缀中扩展同文档与
+  实体 mention 后重验，绝不读取未来后缀。最终仍不足时不改变 Claim 处置状态。
 
 默认配置下，grounded 和 deferred 两条入图路径都必须经过 VERIFY；关闭
 `verify_committed` 只应用于低成本消融，不应作为高风险证据模式。
@@ -321,7 +368,8 @@ Runner 默认会对 grounded 的 pending Claim，以及被 `deferred_matches` �
 
 EOS（end of stream，输入流读完）时调用 `EvidenceRuntime.finalize()`：
 
-1. 收集 `verified` 集合中命中的 Pattern ID，并与所有 `required=True` 的模式比较。
+1. 收集 OQG 中 `SATISFIED` 的 edge ID，并与所有 `required=True` 的 query edge 比较；每条
+   satisfied edge 必须在 `edge_support` 中至少对应一个 verified Claim。
 2. 缺失任一必需模式时返回 `INSUFFICIENT`，原因形如
    `REQUIRED_PATTERN_MISSING:T1,T2`。
 3. 存在任何冲突时返回 `CONFLICTED`，原因是 `UNRESOLVED_CONFLICT`。
@@ -398,13 +446,14 @@ deferred、可用、拒绝、冲突与运行状态。它不访问模型和原文
 
 ### 9.1 四个无状态接口
 
-提示词构建位于 `delaybind_core/prompts.py`，每个提示词以 `version=v1` 标记并要求只返回 JSON：
+提示词构建位于 `delaybind_core/prompts.py`。Open Query Graph、source-local UPDATE 与原子 VERIFY
+启用后，四类提示词升为 `version=v2` 并要求只返回 JSON：
 
 | 接口 | 输入 | 允许输出 | 运行时防线 |
 | --- | --- | --- | --- |
-| `PLAN` | 问题、QueryPlan JSON Schema、可选纠错 | 查询计划 | Schema + 问题锚定 + 连通性校验。 |
-| `UPDATE` | 问题、计划、当前可用 Claim 投影、当前窗口 | 有来源的 `TripleEvent` 列表 | Archive、排序、Pattern 匹配和绑定门。 |
-| `VERIFY` | 问题、候选 Claim、已读原文邻域 | 验证状态和可选规范化 Claim | 仅允许对已存在 Claim 应用结果。 |
+| `PLAN` | 问题、QueryPlan JSON Schema、可选纠错 | 可编译为 OQG 的查询计划 | Schema + 问题锚定 + 连通性校验。 |
+| `UPDATE` | 问题、计划、OQG active/dormant frontier、当前 Evidence Graph、当前窗口 | 有来源的 `TripleEvent` 列表 | 每个事件必须 source-local；Archive、排序、edge 匹配和绑定门。 |
+| `VERIFY` | 问题、一个候选 Claim、已读原文邻域 | `claim_id`、三态结果、理由、支撑 source/text | 仅验证原子 Claim；Runtime 校验引用与连续原文 span 后才改变图状态。 |
 | `ANSWER` | 问题、EvidencePack | 答案 | 仅在 `answer_mode=evidence` 成功终止后调用。 |
 
 `OpenAICompatibleClient` 使用标准库 `urllib` POST 到以下之一：主机地址加
@@ -434,6 +483,7 @@ Runner 的 `RunnerConfig` 目前有效字段为：
 | 字段 | 默认值 | 效果 |
 | --- | --- | --- |
 | `chunk_size` | 5000 | 每个窗口的词数近似预算。 |
+| `min_streaming_windows` | 0 | 大于 0 时要求至少形成该数量的窗口；不足时标记 `STREAMING_PROTOCOL_TOO_SHORT`，防止单窗口结果被解释为流式实验。 |
 | `answer_mode` | `runtime` | 选择运行时答案或最终 ANSWER 模型。 |
 | `max_windows` | 100000 | 已读取窗口的上限。 |
 | `max_verify_candidates` | 1000 | 每个窗口回查候选的截断上限。 |
@@ -443,6 +493,8 @@ Runner 的 `RunnerConfig` 目前有效字段为：
 | `verify_committed` | `true` | grounded Claim 是否也先进入 pending 并经过 VERIFY；关闭仅用于低成本消融。 |
 | `max_graph_claims` | 128 | UPDATE 提示词最多携带的紧凑 verified Claim 数，不删除 Runtime 事实。 |
 | `defer_unbound` | `true` | 是否保存未绑定候选；`false` 是正式的 w/o DEFER 消融。 |
+| `query_graph_mode` | `open` | `open` 使用 DORMANT/ACTIVE/SATISFIED 查询图状态机；`flat` 关闭拓扑激活，是 Flat Pattern List 消融。 |
+| `require_source_span` | `true` | UPDATE 事件必须携带当前 source 中的连续 `span_hint`，且主体/客体必须出现在句子或文档标题中。 |
 | `max_verify_expansions` | 1 | VERIFY 返回 `NEED_MORE_CONTEXT` 后最多扩展已读上下文的次数。 |
 | `verify_expansion_limit` | 32 | 扩展上下文最多包含的同文档句子和实体 mention 数。 |
 
@@ -528,18 +580,21 @@ PYTHONPATH=. pytest -q tests
    `verify_committed=false` 会恢复 direct commit 直接入图的低成本消融路径，正式结果必须记录该配置。
 2. **关系规范化依赖模型。** 运行时只比较字符串的大小写/空白规范化；`birth_year` 到
    `TEMPORAL_ORDER_KEY` 的映射必须由 UPDATE 正确填写 `matched_family`，没有本体或词典兜底。
-3. **延迟回查是单向局部 join。** 它只关注“新绑定主语变量 + 关系族”，不处理对象侧绑定、
-   多变量合取、集合基数或跨 Claim 的通用查询计划。
-4. **结构型算子不等于事实推导。** `ARGMAX/ARGMIN`、集合与比较已实现，但 `RULE`、
+3. **OQG 当前是单绑定执行。** 它支持主语或宾语变量激活的局部 lookup，但对 `SINGLE` 边仍先
+   接受首个通过验证的绑定；尚未实现多假设分支、全局回溯或不确定性排序。多表演者、多导演等
+   关系需要候选集合/beam 扩展，不能在当前版本宣称已经解决。
+4. **DORMANT 候选仍需控制。** Runtime 区分 DORMANT 查询边与 deferred Claim，但 source-local
+   抽取质量仍依赖 UPDATE；面对大量同关系事实时，应进一步加入类型过滤、每边预算和实体索引。
+5. **结构型算子不等于事实推导。** `ARGMAX/ARGMIN`、集合与比较已实现，但 `RULE`、
    `REGISTERED_RULE` 和 `FILTER` 仍只声明需求，不自动物化 DERIVED Claim。
-5. **资源预算分辨率有限。** `max_model_calls`、`max_windows` 和
+6. **资源预算分辨率有限。** `max_model_calls`、`max_windows` 和
    `max_verify_candidates` 已由 Runner 强制执行；输入 token 和货币成本仍需服务端 tokenizer/
    价格适配，不能只用当前词数近似推断。
-6. **API 方言差异。** 客户端使用 OpenAI-compatible Chat Completions 与 `enable_thinking`，
+7. **API 方言差异。** 客户端使用 OpenAI-compatible Chat Completions 与 `enable_thinking`，
    某些兼容服务可能不支持 JSON Schema 或该字段；部署前需做服务端契约测试。
-7. **Snapshot 目前用于审计，不是自动断点续跑。** Runner 会保存状态和游标位置，但恢复命令仍
+8. **Snapshot 目前用于审计，不是自动断点续跑。** Runner 会保存状态和游标位置，但恢复命令仍
    需要实现 Cursor/Archive/模型缓存的协调；`replay_events()` 只负责离线状态投影。
-8. **基线尚未集成。** V5 当前为 CPU/API 小规模实验核心；ReMemR1/verl adapter、训练奖励、
+9. **基线尚未集成。** V5 当前为 CPU/API 小规模实验核心；ReMemR1/verl adapter、训练奖励、
    GPU rollout 和产物导出仍需独立设计与实现，不能宣称已替代上游训练系统。
 
 ## 13. 维护约定

@@ -13,8 +13,14 @@ baseline intact. The V5 implementation is added independently under
 - A read-gated `RawArchive` that rejects future source references.
 - SQLite runtime/model-call/raw-span storage with idempotent runtime events.
 - Delayed binding: `DEFER -> BIND -> exact lookup -> VERIFY -> PROMOTE`.
+- Question-conditioned Open Query Graph: Pattern JSON is compiled into shared
+  constant/variable/operator nodes, with `DORMANT -> ACTIVE -> SATISFIED` edge
+  transitions and an auditable query-edge-to-evidence-Claim support mapping.
 - Runner 默认让 grounded Claim 先进入 `pending`，统一经过 VERIFY 后再绑定并进入图；
   `verify_committed=false` 可用于低成本消融。
+- VERIFY is source-local and requires a cited source span for ACCEPT; it cannot
+  use a missing downstream hop as grounds to reject an otherwise supported
+  atomic Claim.
 - Pure event-log replay.
 - Deterministic `COUNT`/comparison/set/`PROJECT` operators with an auditable trace.
 - Logical model-call and window budgets plus per-window SQLite snapshots.

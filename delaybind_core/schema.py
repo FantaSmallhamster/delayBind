@@ -71,6 +71,19 @@ class QuestionType(str, Enum):
     BRIDGE_COMPARISON = "bridge-comparison"
 
 
+class QueryNodeKind(str, Enum):
+    CONSTANT = "CONSTANT"
+    VARIABLE = "VARIABLE"
+    ANSWER = "ANSWER"
+
+
+class QueryEdgeStatus(str, Enum):
+    DORMANT = "DORMANT"
+    ACTIVE = "ACTIVE"
+    SATISFIED = "SATISFIED"
+    CONFLICTED = "CONFLICTED"
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -93,6 +106,7 @@ class Pattern(StrictModel):
 class RelationSpec(StrictModel):
     id: str
     description: str
+    relation_family: str | None = None
     subject_type: str | None = None
     object_type: str | None = None
     direction: str | None = None
@@ -110,7 +124,17 @@ class OperatorSpec(StrictModel):
 
 class AnswerContract(StrictModel):
     target: str | None = None
-    type: Literal["ENTITY", "BOOLEAN", "NUMBER", "DATE", "ENTITY_SET", "SHORT_TEXT"]
+    type: Literal[
+        "ENTITY",
+        "BOOLEAN",
+        "NUMBER",
+        "DATE",
+        "COUNTRY",
+        "NATIONALITY",
+        "LOCATION",
+        "ENTITY_SET",
+        "SHORT_TEXT",
+    ]
     cardinality: Literal["SINGLE", "SET"] = "SINGLE"
     normalization: str = "IDENTITY"
 
@@ -134,6 +158,53 @@ class QueryPlan(StrictModel):
     operators: list[OperatorSpec] = Field(default_factory=list, max_length=8)
     constraints: dict[str, Any] = Field(default_factory=dict)
     answer_contract: AnswerContract | None = None
+
+
+class QueryNode(StrictModel):
+    id: str
+    kind: QueryNodeKind
+    symbol: str
+    value_type: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class QueryEdge(StrictModel):
+    id: str
+    subject_node_id: str
+    relation: str
+    object_node_id: str
+    relation_family: str | None = None
+    cardinality: Literal["SINGLE", "OPTIONAL_SINGLE", "SET"] = "SINGLE"
+    required: bool = True
+    qualifiers: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def relation_key(self) -> str:
+        return self.relation_family or self.relation
+
+
+class QueryOperatorNode(StrictModel):
+    id: str
+    operator_type: str
+    input_node_ids: list[str] = Field(default_factory=list)
+    output_node_id: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class OpenQueryGraph(StrictModel):
+    """Question-conditioned graph of evidence requirements.
+
+    This is a demand graph, not a memory graph: constants and open variables
+    describe what evidence must be found while reading the stream.
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    graph_id: str
+    nodes: list[QueryNode] = Field(min_length=1, max_length=64)
+    edges: list[QueryEdge] = Field(min_length=1, max_length=16)
+    operator_nodes: list[QueryOperatorNode] = Field(default_factory=list, max_length=8)
+    answer_node_id: str | None = None
+    constraints: dict[str, Any] = Field(default_factory=dict)
 
 
 class Value(StrictModel):
@@ -166,6 +237,18 @@ class UpdateResponse(StrictModel):
     schema_version: Literal["v1"] = SCHEMA_VERSION
     events: list[TripleEvent] = Field(default_factory=list)
     has_more: bool = False
+
+
+class EdgeFillMatch(StrictModel):
+    source_ref: str
+    subject: str
+    object: Any
+    supporting_text: str = Field(min_length=1, max_length=800)
+
+
+class EdgeFillResponse(StrictModel):
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    matches: list[EdgeFillMatch] = Field(default_factory=list, max_length=8)
 
 
 class AnswerResponse(StrictModel):
@@ -219,6 +302,33 @@ class VerifyResult(StrictModel):
     normalized_claim: Claim | None = None
     reason: str | None = None
     expanded_source_refs: list[str] = Field(default_factory=list)
+    supporting_text: str | None = None
+
+
+class VerifyDecision(StrictModel):
+    """Compact model-facing decision for one verification attempt.
+
+    ``VerifyResult`` is the Runtime's richer internal record.  Sending its
+    complete JSON Schema to a verifier also sends the nested Claim schema,
+    which is unnecessary for a three-way decision and measurably bloats the
+    prompt.  This DTO deliberately keeps the model interface small.
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    claim_id: str
+    status: VerifyStatus
+    reason: str = Field(min_length=1, max_length=480)
+    supporting_source_refs: list[str] = Field(default_factory=list, max_length=3)
+    supporting_text: str | None = Field(default=None, max_length=480)
+
+    @model_validator(mode="after")
+    def require_support_for_accept(self) -> "VerifyDecision":
+        if self.status == VerifyStatus.ACCEPT:
+            if not self.supporting_source_refs:
+                raise ValueError("ACCEPT requires at least one supporting_source_ref")
+            if not self.supporting_text or not self.supporting_text.strip():
+                raise ValueError("ACCEPT requires supporting_text copied from the cited source")
+        return self
 
 
 class EvidencePack(StrictModel):
@@ -227,6 +337,8 @@ class EvidencePack(StrictModel):
     operator_trace: list[dict[str, Any]] = Field(default_factory=list)
     answer_value: Any = None
     answer_type: str | None = None
+    query_graph: dict[str, Any] | None = None
+    support_mapping: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class RuntimeEvent(StrictModel):

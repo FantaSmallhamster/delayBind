@@ -51,3 +51,7 @@ class RawArchive:
         ]
         by_ref = {entry.source_ref: entry for entry in entries}
         return sorted(by_ref.values(), key=lambda entry: entry.stream_position)[:limit]
+
+    def search_mentions(self, mentions: list[str], *, limit: int = 32) -> list[ManifestEntry]:
+        """Search only the current read prefix by sentence text or document title."""
+        return self.store.search_raw_mentions(self.run_id, mentions, limit=limit)

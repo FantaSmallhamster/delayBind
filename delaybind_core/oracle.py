@@ -12,6 +12,7 @@ from typing import Any, Iterable
 from .data import CanonicalSample
 from .plan_validation import PlanValidationError, ensure_valid_plan
 from .profiler import infer_answer_contract
+from .relation_semantics import relation_signature
 from .schema import OperatorSpec, Pattern, QueryPlan, RelationSpec
 
 
@@ -100,6 +101,23 @@ def _mentioned(value: str, question: str) -> bool:
     return re.search(rf"(?<!\w){re.escape(value.casefold())}(?!\w)", question.casefold()) is not None
 
 
+def _key_mentioned(value: str, question: str) -> bool:
+    """Match an entity while ignoring quote/case/punctuation differences."""
+    value_key = _entity_key(value)
+    question_key = _entity_key(question)
+    return re.search(rf"(?<!\w){re.escape(value_key)}(?!\w)", question_key) is not None
+
+
+def _question_surface_with_disambiguator(value: str, question: str) -> str | None:
+    match = re.search(rf"(?<!\w){re.escape(value)}(?!\w)", question, re.IGNORECASE)
+    if match is None:
+        return None
+    suffix = question[match.end():]
+    parenthetical = re.match(r"\s*\([^)]{1,80}\)", suffix)
+    end = match.end() + (parenthetical.end() if parenthetical else 0)
+    return question[match.start():end]
+
+
 def _entity_key(value: str) -> str:
     value = re.sub(r"\s*\([^)]*\)\s*$", "", value.strip().strip('"\''))
     return " ".join(re.sub(r"[^\w]+", " ", value.casefold()).split())
@@ -168,6 +186,14 @@ def compile_oracle_plan(sample: CanonicalSample) -> QueryPlan:
     if not triples:
         raise OraclePlanError(f"sample {sample.sample_id} has no evidence triples")
     comparison = "comparison" in (sample.question_type or "").casefold()
+    supporting_titles = {
+        index: str(sample.supporting_facts[index][0])
+        for index in range(min(len(triples), len(sample.supporting_facts)))
+    }
+    subject_support_titles = {
+        _entity_key(str(triples[index][0])): title
+        for index, title in supporting_titles.items()
+    }
     alias_keys: dict[str, str] = {}
     earlier_objects: list[str] = []
     for subject, _, obj in triples:
@@ -197,7 +223,14 @@ def compile_oracle_plan(sample: CanonicalSample) -> QueryPlan:
     value_slots: dict[str, str] = {}
     representatives: dict[str, str] = {}
     for subject, _, obj in triples:
-        representatives.setdefault(key(str(subject)), str(subject))
+        subject_text = str(subject)
+        support_title = subject_support_titles.get(_entity_key(subject_text))
+        representative = (
+            support_title
+            if support_title and _key_mentioned(support_title, sample.question)
+            else subject_text
+        )
+        representatives.setdefault(key(subject_text), representative)
         representatives.setdefault(key(str(obj)), str(obj))
 
     for subject, relation, obj in triples:
@@ -228,14 +261,42 @@ def compile_oracle_plan(sample: CanonicalSample) -> QueryPlan:
             object_slot = _variable_name(str(relation), used_variables)
         subject_slot = value_slots[subject_key]
         qualifiers: dict[str, Any] = {}
+        support_title = supporting_titles.get(index - 1)
+        subject_surface = (
+            _question_surface_with_disambiguator(subject_slot, sample.question)
+            if not subject_slot.startswith("?")
+            else None
+        )
+        if subject_surface and subject_surface.casefold().strip() != subject_slot.casefold().strip():
+            qualifiers["subject_question_anchor"] = subject_surface
+            qualifiers["subject_aliases"] = [subject_surface]
         if not subject_slot.startswith("?") and not _mentioned(subject_slot, sample.question):
-            qualifiers["subject_question_anchor"] = _best_question_anchor(
-                subject_slot, sample.question
-            )
+            anchor = (
+                _question_surface_with_disambiguator(support_title, sample.question)
+                if support_title
+                else None
+            ) or _best_question_anchor(subject_slot, sample.question)
+            qualifiers["subject_question_anchor"] = anchor
+            qualifiers["subject_aliases"] = [anchor]
+        if not subject_slot.startswith("?"):
+            aliases = qualifiers.setdefault("subject_aliases", [])
+            for alias in (str(subject), support_title):
+                if alias and alias.casefold().strip() != subject_slot.casefold().strip() and alias not in aliases:
+                    aliases.append(alias)
+            if not aliases:
+                qualifiers.pop("subject_aliases", None)
+        object_surface = (
+            _question_surface_with_disambiguator(object_slot, sample.question)
+            if not object_slot.startswith("?")
+            else None
+        )
+        if object_surface and object_surface.casefold().strip() != object_slot.casefold().strip():
+            qualifiers["object_question_anchor"] = object_surface
+            qualifiers["object_aliases"] = [object_surface]
         if not object_slot.startswith("?") and not _mentioned(object_slot, sample.question):
-            qualifiers["object_question_anchor"] = _best_question_anchor(
-                object_slot, sample.question
-            )
+            anchor = _best_question_anchor(object_slot, sample.question)
+            qualifiers["object_question_anchor"] = anchor
+            qualifiers["object_aliases"] = [anchor]
         patterns.append(
             Pattern(
                 id=f"p{index:02d}",
@@ -246,14 +307,36 @@ def compile_oracle_plan(sample: CanonicalSample) -> QueryPlan:
                 qualifiers=qualifiers,
             )
         )
-    relation_specs = [
-        RelationSpec(
-            id=f"r{index:02d}",
-            description=f"Gold evidence relation: {relation}",
-            direction="subject_to_object",
+    consumed_variables = {
+        pattern.subject for pattern in patterns if pattern.subject.startswith("?")
+    }
+    patterns = [
+        pattern.model_copy(
+            update={
+                "qualifiers": {
+                    **pattern.qualifiers,
+                    "binding_policy": "PATH_CONSISTENT",
+                    "candidate_output": pattern.object,
+                }
+            }
         )
-        for index, relation in enumerate(dict.fromkeys(str(item[1]) for item in triples), start=1)
+        if pattern.object.startswith("?") and pattern.object in consumed_variables
+        else pattern
+        for pattern in patterns
     ]
+    relation_specs = []
+    for index, relation in enumerate(dict.fromkeys(str(item[1]) for item in triples), start=1):
+        signature = relation_signature(relation)
+        relation_specs.append(
+            RelationSpec(
+                id=f"r{index:02d}",
+                description=f"Gold evidence relation: {relation}",
+                relation_family=relation,
+                subject_type=signature.subject_type,
+                object_type=signature.object_type,
+                direction="subject_to_object",
+            )
+        )
     operators: list[OperatorSpec] = []
     contract = infer_answer_contract(sample)
 

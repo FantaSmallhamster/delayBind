@@ -34,8 +34,20 @@ def infer_answer_contract(sample: CanonicalSample) -> AnswerContract:
         answer_type = "BOOLEAN"
     elif re.search(r"\bhow many\b|\bnumber of\b|\bcount\b", question):
         answer_type = "NUMBER"
-    elif re.search(r"\bwhen\b|\bdate\b|\byear\b", question):
+    elif re.match(r"\s*when\b", question) or re.search(
+        r"\b(?:what|which)\s+(?:date|year)\b|\bdate (?:of|was|is)\b",
+        question,
+    ):
         answer_type = "DATE"
+    elif re.search(r"\bnationalit(?:y|ies)\b", question):
+        answer_type = "NATIONALITY"
+    elif re.search(r"\b(?:which|what) country\b|\bcountry (?:is|was|are|were|does|did)\b", question):
+        answer_type = "COUNTRY"
+    elif re.match(r"\s*where\b", question) or re.search(
+        r"\bplace of (?:birth|death)\b|\b(?:which|what) (?:city|place|location)\b",
+        question,
+    ):
+        answer_type = "LOCATION"
     elif re.search(r"\bwho\b|\bwhich (person|film|movie|company)\b", question):
         answer_type = "ENTITY"
     else:
@@ -44,7 +56,13 @@ def infer_answer_contract(sample: CanonicalSample) -> AnswerContract:
         target=None,
         type=answer_type,
         cardinality="SINGLE",
-        normalization="2WIKI" if answer_type in {"ENTITY", "SHORT_TEXT"} else "IDENTITY",
+        normalization={
+            "ENTITY": "2WIKI",
+            "SHORT_TEXT": "2WIKI",
+            "COUNTRY": "2WIKI_COUNTRY",
+            "NATIONALITY": "2WIKI_NATIONALITY",
+            "LOCATION": "2WIKI_LOCATION",
+        }.get(answer_type, "IDENTITY"),
     )
 
 
