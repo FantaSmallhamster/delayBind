@@ -1,15 +1,15 @@
-from delaybind_core.prompts import answer_prompt, plan_prompt, update_prompt, verify_prompt
-from delaybind_core.schema import QueryPlan, VerifyDecision
+from delaybind_core.prompts import answer_prompt, graph_plan_prompt, update_prompt, verify_prompt
+from delaybind_core.schema import GraphQueryPlan, VerifyDecision
 
 
 def test_prompt_builders_keep_protocol_markers_and_no_future_instruction():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="p",
         patterns=[{"id": "T1", "subject": "Film A", "relation": "DIRECTOR", "object": "?d"}],
     )
-    assert "<PLAN version=v2>" in plan_prompt("q", schema={"type": "object"})
-    assert "Never invent values" in plan_prompt("q", schema={"type": "object"})
-    assert "Do not generate answer_contract" in plan_prompt(
+    assert "<PLAN version=v2>" in graph_plan_prompt("q", schema={"type": "object"})
+    assert "Never invent values" in graph_plan_prompt("q", schema={"type": "object"})
+    assert "Do not generate answer_contract" in graph_plan_prompt(
         "q", schema={"type": "object"}, require_answer_target=False
     )
     rendered = update_prompt(

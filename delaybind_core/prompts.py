@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .schema import AnswerResponse, QueryPlan, UpdateResponse, VerifyDecision
+from .schema import AnswerResponse, GraphQueryPlan, UpdateResponse, VerifyDecision
 
 
 PROMPT_VERSION = "v2"
@@ -15,7 +15,10 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2)
 
 
-def plan_prompt(
+from .agent_prompts import plan_prompt, reading_prompt, query_verify_prompt
+
+
+def graph_plan_prompt(
     question: str,
     *,
     schema: dict[str, Any],
@@ -75,7 +78,7 @@ Return only JSON matching this schema:
 
 def update_prompt(
     question: str,
-    plan: QueryPlan,
+    plan: GraphQueryPlan,
     graph: dict[str, Any],
     entries: list[dict[str, Any]],
     *,

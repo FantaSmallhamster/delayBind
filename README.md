@@ -119,6 +119,14 @@ It includes components from [MemAgent](https://github.com/BytedTsinghua-SIA/MemA
 
 ## V5 Design and Implementation
 
+The default V5.1 runner uses a high-level planning/memory agent and a low-level
+reading/deferred-review agent, natural-language subqueries, and source-fact memory.
+ReMemR1-style `input`/`context` records can be passed directly, without preparing a
+Manifest. See [`SUBQUERY_RUNTIME.md`](SUBQUERY_RUNTIME.md) for the current plan,
+reading protocol, state transitions, and [`configs/subqueries_smoke.json`](configs/subqueries_smoke.json)
+for a streaming experiment. Historical graph experiments explicitly select
+`plan_format="graph"`.
+
 The complete V5 specification, terminology, module mapping, runtime state
 machine, 2Wiki evaluation protocol, training plan, reproducibility rules, and
 the decisions consolidated from the 208-question design review are documented

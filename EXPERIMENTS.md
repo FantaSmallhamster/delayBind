@@ -1,5 +1,17 @@
 # V5 2Wiki Experiment Harness
 
+128 题、50 文档的 benchmark 已按 seed=4 重新生成，当前 8 题冒烟配置为
+`configs/v51_2wiki50_smoke8.json`，数据来源、指纹和复现方法见
+[`BENCHMARK_SEED4.md`](BENCHMARK_SEED4.md)。旧 seed42 baseline 分数不与新数据配对。
+
+默认 V5.1 使用高层/低层两个 Agent、自然语言子查询和事实工作记忆。
+ACTIVE 事实直接接受，仅对绑定激活后选中的 defer 候选回看原文 VERIFY，最后直接 ANSWER。
+运行说明与已确认的文档覆盖项见
+[`SUBQUERY_RUNTIME.md`](SUBQUERY_RUNTIME.md)。使用
+`python3 -m delaybind_core experiment --config configs/subqueries_smoke.json`
+执行新流程。新流程保留答案、来源和暂存统计，三元组指标记为 `null`。
+以下图机制对照仍使用显式 `plan_format="graph"` 的历史配置。
+
 本文件说明第一轮机制可行性实验的可执行入口。所有条件使用同一个
 `MODEL_NAME` checkpoint、API 参数和 Manifest；Oracle Plan 只用于上界与机制诊断，不能作为
 Predicted Plan 的测试结果。

@@ -192,7 +192,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--local_dir', default='./data/test')
     parser.add_argument('--data_sources', default='nq')
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--seed', type=int, default=4)
     parser.add_argument('--n_subset', type=int, default=0, help='number of samples to subset')
     args = parser.parse_args()
 

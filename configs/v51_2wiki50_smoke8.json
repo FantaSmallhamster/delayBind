@@ -1,0 +1,73 @@
+{
+  "experiment_id": "v51-2wiki50-seed4-smoke8",
+  "input": "data/test/seed4/eval_2wikimultihopqa_50.json",
+  "expected_data_sha256": "24bf5d18ce3911d05e4ad3666e9836adfbb1e73e436a146e55d436cec2a8e576",
+  "expected_total_samples": 128,
+  "expected_documents": 50,
+  "output_dir": "results/v51-2wiki50-seed4-smoke8",
+  "dataset_id": "2wiki",
+  "methods": [
+    "v5_predicted"
+  ],
+  "orders": [
+    "original"
+  ],
+  "sample_start": 0,
+  "sample_count": 8,
+  "sample_ids": [
+    "dev_3867",
+    "dev_4969",
+    "dev_1690",
+    "dev_11816",
+    "dev_6489",
+    "dev_7845",
+    "dev_2539",
+    "dev_1476"
+  ],
+  "seed": 4,
+  "resume": true,
+  "retry_errors": false,
+  "max_concurrency": 1,
+  "tokenizer_path": "models/Qwen3.5-9B-tokenizer/tokenizer.json",
+  "api": {
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "Qwen/Qwen3.5-9B",
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "model_seed": null,
+    "max_output_tokens": 10000,
+    "enable_thinking": false,
+    "api_max_retries": 2,
+    "timeout_seconds": 120
+  },
+  "runner": {
+    "plan_format": "subqueries",
+    "chunk_size": 5000,
+    "answer_format": "boxed",
+    "memory_token_budget": 8192,
+    "max_model_calls": 1000,
+    "candidate_batch_size": 32,
+    "max_verify_candidates": 1000,
+    "max_plan_retries": 1,
+    "max_response_retries": 1,
+    "verify_source_neighborhood": 0,
+    "defer_unbound": true,
+    "enable_defer_callback": true,
+    "snapshot_every_windows": 1,
+    "min_streaming_windows": 0
+  },
+  "data_provenance": {
+    "selection_seed": 4,
+    "distractor_seed": 4,
+    "document_permutation_seed": 4,
+    "paper_selection_seed": 4,
+    "paper_exact_sample_match": false,
+    "source": "/root/delayBind/artifacts/rememr1_eval/data/source/2wikimultihopqa_dev.jsonl",
+    "source_sha256": "b4d74d73d1cb3c0632c665a85e1e5060e3411968b807721618cfd2464fc905e3",
+    "rng_schedule": "one local Random(seed); question draw first, then distractors in selected question order",
+    "generation_provenance": "data/test/seed4/eval_2wikimultihopqa_50.provenance.json",
+    "baseline_comparison_status": "new dataset; seed42 baseline results cannot be reused",
+    "paper": "https://arxiv.org/html/2509.23040v5#A3.SS3"
+  },
+  "api_reference_identity": "/root/.paseo/worktrees/2wdfssbm/busy-ladybug/results/direct_io_v1_128x3/experiment.json"
+}

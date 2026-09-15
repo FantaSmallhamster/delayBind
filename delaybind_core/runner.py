@@ -16,11 +16,11 @@ from pydantic import ValidationError
 
 from .api import OpenAICompatibleClient
 from .archive import RawArchive
-from .cursor import ReadCursor
-from .data import CanonicalSample
+from .cursor import ReadCursor, TextTokenizer
+from .data import CanonicalSample, build_manifest, canonicalize_record
 from .profiler import infer_answer_contract
 from .manifest import Manifest
-from .prompts import answer_prompt, plan_prompt, targeted_update_prompt, update_prompt, verify_prompt
+from .prompts import answer_prompt, graph_plan_prompt, targeted_update_prompt, update_prompt, verify_prompt
 from .plan_validation import (
     PlanIssue,
     PlanValidationError,
@@ -32,6 +32,7 @@ from .runtime import EvidenceRuntime
 from .schema import (
     AnswerResponse,
     EdgeFillResponse,
+    GraphQueryPlan,
     QueryPlan,
     TripleEvent,
     VerifyDecision,
@@ -46,6 +47,7 @@ from .text_match import contains_normalized_span
 
 @dataclass(frozen=True)
 class RunnerConfig:
+    plan_format: str = "subqueries"
     chunk_size: int = 5000
     answer_mode: str = "runtime"
     max_windows: int = 100000
@@ -64,6 +66,23 @@ class RunnerConfig:
     require_source_span: bool = True
     callback_retrieval_limit: int = 16
     max_targeted_updates: int = 16
+    candidate_batch_size: int = 32
+    verify_source_neighborhood: int = 0
+    max_response_retries: int = 1
+    memory_token_budget: int | None = None
+    memory_char_budget: int = 24000
+    answer_format: str = "auto"
+    enable_defer_callback: bool = True
+
+    def __post_init__(self) -> None:
+        if self.candidate_batch_size <= 0 or self.chunk_size <= 0:
+            raise ValueError("candidate_batch_size and chunk_size must be positive")
+        if self.answer_format not in {"auto", "boxed", "text", "json"}:
+            raise ValueError("answer_format must be auto, boxed, text, or json")
+        if self.max_response_retries < 0 or self.verify_source_neighborhood < 0:
+            raise ValueError("retry and source neighborhood limits must be nonnegative")
+        if self.memory_char_budget <= 0 or self.memory_token_budget is not None and self.memory_token_budget <= 0:
+            raise ValueError("memory budgets must be positive")
 
 
 class ModelBudgetExceeded(RuntimeError):
@@ -76,18 +95,57 @@ class V5Runner:
         client: OpenAICompatibleClient,
         *,
         config: RunnerConfig | None = None,
+        reader_client: OpenAICompatibleClient | None = None,
+        tokenizer: TextTokenizer | None = None,
     ):
         self.client = client
         self.config = config or RunnerConfig()
+        self.reader_client = reader_client
+        self.tokenizer = tokenizer
 
     async def run(
         self,
         *,
         run_id: str,
-        sample: CanonicalSample,
-        manifest: Manifest,
+        sample: CanonicalSample | None = None,
+        manifest: Manifest | None = None,
         store: SQLiteEventStore,
-        plan: QueryPlan | None = None,
+        plan: QueryPlan | GraphQueryPlan | None = None,
+        item: dict[str, Any] | None = None,
+        question: str | None = None,
+        context: str | None = None,
+    ) -> dict[str, Any]:
+        if item is not None and (question is not None or context is not None):
+            raise ValueError("choose item or question/context, not both")
+        if sample is None:
+            if item is not None:
+                sample = canonicalize_record(item)
+            elif question is not None and context is not None:
+                sample = CanonicalSample(sample_id=run_id, question=question, context=context)
+            else:
+                raise ValueError("provide sample, a ReMemR1 item, or question and context")
+        elif item is not None or question is not None or context is not None:
+            raise ValueError("choose one input form")
+        if self.config.plan_format not in {"subqueries", "graph"}:
+            raise ValueError("plan_format must be 'subqueries' or 'graph'")
+        if isinstance(plan, QueryPlan) or (plan is None and self.config.plan_format == "subqueries"):
+            from .subquery_runner import run_subqueries
+
+            return await run_subqueries(
+                client=self.client, config=self.config, run_id=run_id,
+                sample=sample, manifest=manifest, store=store, plan=plan,
+                reader_client=self.reader_client, tokenizer=self.tokenizer,
+            )
+        if manifest is None:
+            manifest = build_manifest(sample)
+        result = await self._run_graph(
+            run_id=run_id, sample=sample, manifest=manifest, store=store, plan=plan,
+        )
+        return {**result, "plan_format": "graph"}
+
+    async def _run_graph(
+        self, *, run_id: str, sample: CanonicalSample, manifest: Manifest,
+        store: SQLiteEventStore, plan: GraphQueryPlan | None = None,
     ) -> dict[str, Any]:
         archive = RawArchive(store, run_id)
         logical_model_calls = 0
@@ -103,7 +161,7 @@ class V5Runner:
 
         target_free_answer = self.config.answer_mode == "evidence"
 
-        def prepare_plan(candidate: QueryPlan) -> QueryPlan:
+        def prepare_plan(candidate: GraphQueryPlan) -> GraphQueryPlan:
             if not target_free_answer:
                 return candidate
             contract = infer_answer_contract(sample)
@@ -117,7 +175,7 @@ class V5Runner:
             )
 
         if plan is None:
-            plan_schema = QueryPlan.model_json_schema()
+            plan_schema = GraphQueryPlan.model_json_schema()
             correction: str | None = None
             for attempt in range(self.config.max_plan_retries + 1):
                 raw_plan = await complete(
@@ -126,7 +184,7 @@ class V5Runner:
                     messages=[
                         {
                             "role": "user",
-                            "content": plan_prompt(
+                            "content": graph_plan_prompt(
                                 sample.question,
                                 schema=plan_schema,
                                 correction=correction,
@@ -137,7 +195,7 @@ class V5Runner:
                     response_schema=plan_schema,
                 )
                 try:
-                    candidate_plan = QueryPlan.model_validate_json(raw_plan)
+                    candidate_plan = GraphQueryPlan.model_validate_json(raw_plan)
                 except ValidationError as exc:
                     issues = [
                         PlanIssue(

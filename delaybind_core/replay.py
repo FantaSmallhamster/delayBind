@@ -5,16 +5,19 @@ from __future__ import annotations
 from typing import Iterable
 
 from .query_graph import compile_open_query_graph
-from .schema import Claim, QueryEdgeStatus, QueryPlan, RuntimeEvent, RuntimeStatus
+from .schema import Claim, QueryEdgeStatus, QueryPlan, RuntimeEvent, RuntimeStatus, parse_query_plan
 from .runtime import RuntimeState
+from .subqueries import SubqueryState, replay_subqueries
 
 
-def replay_events(events: Iterable[RuntimeEvent]) -> RuntimeState:
+def replay_events(events: Iterable[RuntimeEvent]) -> RuntimeState | SubqueryState:
     ordered = sorted(events, key=lambda event: event.event_seq or 0)
-    plan_event = next((event for event in ordered if event.event_type == "PLAN_CREATED"), None)
+    plan_event = next((event for event in reversed(ordered) if event.event_type == "PLAN_CREATED"), None)
     if plan_event is None:
         raise ValueError("event log has no PLAN_CREATED event")
-    plan = QueryPlan.model_validate(plan_event.payload["plan"])
+    plan = parse_query_plan(plan_event.payload["plan"])
+    if isinstance(plan, QueryPlan):
+        return replay_subqueries([event for event in ordered if (event.event_seq or 0) >= (plan_event.event_seq or 0)], plan)
     graph = (
         plan_event.payload.get("query_graph")
         if plan_event.payload.get("query_graph") is not None

@@ -26,6 +26,7 @@ class APIConfig:
     api_key: str
     model: str
     temperature: float = 0.0
+    top_p: float | None = None
     seed: int | None = 4
     timeout_seconds: float = 120.0
     max_retries: int = 2
@@ -55,6 +56,8 @@ class OpenAICompatibleClient:
         }
         if self.config.seed is not None:
             payload["seed"] = self.config.seed
+        if self.config.top_p is not None:
+            payload["top_p"] = self.config.top_p
         if response_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -105,9 +108,10 @@ class OpenAICompatibleClient:
         messages: list[dict[str, str]],
         response_schema: dict[str, Any] | None = None,
         extra: dict[str, Any] | None = None,
+        agent_role: str | None = None,
     ) -> str:
         payload = self._request_payload(interface, messages, response_schema=response_schema, extra=extra)
-        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        serialized = json.dumps({"payload": payload, "agent_role": agent_role}, ensure_ascii=False, sort_keys=True)
         request_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         prompt_hash = hashlib.sha256(
             json.dumps(messages, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -138,6 +142,7 @@ class OpenAICompatibleClient:
                             call_id=call_id,
                             run_id=run_id,
                             interface=interface,  # type: ignore[arg-type]
+                            agent_role=agent_role,
                             request_hash=request_hash,
                             model=self.config.model,
                             parameters=payload,
@@ -160,6 +165,7 @@ class OpenAICompatibleClient:
                             call_id=call_id,
                             run_id=run_id,
                             interface=interface,  # type: ignore[arg-type]
+                            agent_role=agent_role,
                             request_hash=request_hash,
                             model=self.config.model,
                             parameters=payload,

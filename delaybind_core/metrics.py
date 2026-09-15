@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from .data import CanonicalSample
-from .schema import QueryPlan
+from .schema import GraphQueryPlan, QueryPlan
 
 
 _PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
@@ -94,8 +94,10 @@ def triple_f1(
     )
 
 
-def plan_relation_recall(predicted: QueryPlan | None, oracle: QueryPlan | None) -> float | None:
-    if oracle is None:
+def plan_relation_recall(
+    predicted: QueryPlan | GraphQueryPlan | None, oracle: GraphQueryPlan | None,
+) -> float | None:
+    if oracle is None or isinstance(predicted, QueryPlan):
         return None
     gold = {normalize_answer(pattern.relation_key) for pattern in oracle.patterns}
     if not gold:
@@ -112,7 +114,8 @@ def _v5_predicted_answer(result: dict[str, Any]) -> Any:
 
 
 def _v5_source_refs(result: dict[str, Any]) -> set[str]:
-    refs: set[str] = set()
+    refs = {ref for fact in (result.get("evidence_pack") or {}).get("facts", [])
+            for ref in fact.get("source_refs", [fact["source_ref"]] if "source_ref" in fact else [])}
     for claim in (result.get("evidence_pack") or {}).get("claims", []):
         for assertion in claim.get("evidence_assertions", []):
             source_ref = assertion.get("source_ref")
@@ -272,7 +275,7 @@ def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, A
     cross_window_promoted = event_counts.get("CROSS_WINDOW_DEFERRED_PROMOTED", 0)
     non_early_promoted = event_counts.get("NON_EARLY_DEFERRED_PROMOTED", 0)
     verifier = verifier_metrics(result.get("events", []), sample.evidences)
-    return {
+    scored = {
         **result,
         "prediction": prediction,
         "gold_answers": gold,
@@ -309,6 +312,40 @@ def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, A
         **verifier,
         "run_success": result.get("status") == "OK",
     }
+    if result.get("plan_format") == "subqueries" or "queries" in state.get("plan", {}):
+        promotions = _event_items(result, "FACT_PROMOTED")
+        deferred_promotions = [event for event in promotions if event["payload"].get("origin") == "CANDIDATE"]
+        deferred_events = event_counts.get("FACT_DEFERRED", 0)
+        lookups = _event_items(result, "DEFER_WORKSPACE_LOOKUP")
+        cross_window = sum(bool(event["payload"].get("cross_window")) for event in promotions)
+        # Prose facts have no gold triple alignment. Do not report fabricated
+        # zero precision/recall for metrics defined only on the graph format.
+        for key in (*verifier, "graph_triple_precision", "graph_triple_recall",
+                    "graph_triple_f1", "triple_event_precision", "triple_event_recall", "triple_event_f1"):
+            scored[key] = None
+        scored.update({
+            "deferred_count": sum(len(ids) for ids in state.get("defer_workspace", {}).values()),
+            "pending_count": 0,
+            "verified_count": sum(use.get("status") == "ACCEPTED" and use.get("acceptance") == "PROMOTE"
+                                  for uses in state.get("uses", {}).values() for use in uses.values()),
+            "committed_count": event_counts.get("FACT_COMMITTED", 0),
+            "working_memory_fact_count": len(state.get("working_memory", {}).get("facts", [])),
+            "working_memory_link_count": len(state.get("working_memory", {}).get("links", [])),
+            "callback_count": len(lookups),
+            "callback_hit_rate": sum(bool(event["payload"].get("fact_ids")) for event in lookups) / len(lookups) if lookups else 0.0,
+            "promoted_count": len(promotions),
+            "deferred_promoted_count": len(deferred_promotions),
+            "revalidated_count": len(promotions) - len(deferred_promotions),
+            "deferred_to_promoted": len(deferred_promotions) / deferred_events if deferred_events else 0.0,
+            "cross_window_deferred_promoted_count": cross_window,
+            "non_early_deferred_promoted_count": len(deferred_promotions) - cross_window,
+            "cross_window_deferred_to_promoted": cross_window / deferred_events if deferred_events else 0.0,
+            "conflict_count": sum(bool(execution.get("conflicts")) for execution in state.get("executions", {}).values()),
+        })
+    if sample.context is not None and not sample.supporting_facts:
+        for key in ("supporting_precision", "supporting_recall", "supporting_f1"):
+            scored[key] = None
+    return scored
 
 
 def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -325,9 +362,10 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
     summaries: list[dict[str, Any]] = []
     for (method, order), items in sorted(groups.items()):
         status_counts = Counter(str(item.get("runtime_status", "UNKNOWN")) for item in items)
-        verifier_tp = sum(int(item.get("verifier_tp", 0)) for item in items)
-        verifier_fp = sum(int(item.get("verifier_fp", 0)) for item in items)
-        verifier_fn = sum(int(item.get("verifier_fn", 0)) for item in items)
+        verifier_items = [item for item in items if item.get("verifier_tp") is not None]
+        verifier_tp = sum(int(item.get("verifier_tp") or 0) for item in verifier_items)
+        verifier_fp = sum(int(item.get("verifier_fp") or 0) for item in verifier_items)
+        verifier_fn = sum(int(item.get("verifier_fn") or 0) for item in verifier_items)
         verifier_micro_precision = (
             verifier_tp / (verifier_tp + verifier_fp)
             if verifier_tp + verifier_fp
@@ -362,9 +400,9 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "verifier_micro_precision": verifier_micro_precision,
                 "verifier_micro_recall": verifier_micro_recall,
                 "verifier_micro_f1": verifier_micro_f1,
-                "verifier_tp": verifier_tp,
-                "verifier_fp": verifier_fp,
-                "verifier_fn": verifier_fn,
+                "verifier_tp": verifier_tp if verifier_items else None,
+                "verifier_fp": verifier_fp if verifier_items else None,
+                "verifier_fn": verifier_fn if verifier_items else None,
                 "verifier_candidate_count": mean(items, "verifier_candidate_count"),
                 "verifier_gold_candidate_count": mean(items, "verifier_gold_candidate_count"),
                 "windows_processed": mean(items, "windows_processed"),

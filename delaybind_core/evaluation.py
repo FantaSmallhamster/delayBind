@@ -15,11 +15,12 @@ from typing import Any, Callable
 
 from .api import APIConfig, OpenAICompatibleClient
 from .data import CanonicalSample, build_manifest, load_records
+from .cursor import TextTokenizer
 from .direct import run_direct_full_context
 from .metrics import gold_source_refs, plan_relation_recall, score_result, summarize_results
 from .oracle import compile_oracle_plans, load_oracle_plans, write_oracle_plans
 from .runner import RunnerConfig, V5Runner
-from .schema import QueryPlan
+from .schema import GraphQueryPlan, parse_query_plan
 from .storage import SQLiteEventStore
 
 
@@ -42,9 +43,7 @@ class ExperimentConfig:
     dataset_id: str = "2wiki"
     methods: tuple[str, ...] = (
         "direct_full_context",
-        "v5_oracle",
         "v5_predicted",
-        "v5_oracle_no_defer",
     )
     orders: tuple[str, ...] = ("original", "reverse")
     sample_start: int = 0
@@ -57,12 +56,17 @@ class ExperimentConfig:
     fail_fast: bool = False
     oracle_plans: str | None = None
     compile_oracle: bool = False
+    tokenizer_path: str | None = None
+    expected_data_sha256: str | None = None
+    expected_total_samples: int | None = None
+    expected_documents: int | None = None
     runner: RunnerConfig = field(default_factory=RunnerConfig)
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ExperimentConfig":
         runner_raw = value.get("runner") or value
         runner = RunnerConfig(
+            plan_format=str(runner_raw.get("plan_format", "subqueries")),
             chunk_size=int(runner_raw.get("chunk_size", 5000)),
             answer_mode=str(runner_raw.get("answer_mode", "runtime")),
             max_windows=int(runner_raw.get("max_windows", 100000)),
@@ -81,6 +85,13 @@ class ExperimentConfig:
             require_source_span=bool(runner_raw.get("require_source_span", True)),
             callback_retrieval_limit=int(runner_raw.get("callback_retrieval_limit", 16)),
             max_targeted_updates=int(runner_raw.get("max_targeted_updates", 16)),
+            candidate_batch_size=int(runner_raw.get("candidate_batch_size", 32)),
+            verify_source_neighborhood=int(runner_raw.get("verify_source_neighborhood", 0)),
+            max_response_retries=int(runner_raw.get("max_response_retries", 1)),
+            memory_token_budget=(int(runner_raw["memory_token_budget"]) if runner_raw.get("memory_token_budget") is not None else None),
+            memory_char_budget=int(runner_raw.get("memory_char_budget", 24000)),
+            answer_format=str(runner_raw.get("answer_format", "auto")),
+            enable_defer_callback=bool(runner_raw.get("enable_defer_callback", True)),
         )
         methods = tuple(str(item) for item in value.get("methods", cls.methods))
         orders = tuple(str(item) for item in value.get("orders", cls.orders))
@@ -110,6 +121,10 @@ class ExperimentConfig:
             fail_fast=bool(value.get("fail_fast", False)),
             oracle_plans=value.get("oracle_plans"),
             compile_oracle=bool(value.get("compile_oracle", False)),
+            tokenizer_path=value.get("tokenizer_path"),
+            expected_data_sha256=value.get("expected_data_sha256"),
+            expected_total_samples=(int(value["expected_total_samples"]) if value.get("expected_total_samples") is not None else None),
+            expected_documents=(int(value["expected_documents"]) if value.get("expected_documents") is not None else None),
             runner=runner,
         )
 
@@ -166,6 +181,8 @@ class ExperimentHarness:
         *,
         api_config: APIConfig | None = None,
         client_factory: ClientFactory | None = None,
+        reader_api_config: APIConfig | None = None,
+        tokenizer: TextTokenizer | None = None,
     ):
         if client_factory is None and api_config is None:
             raise ValueError("api_config or client_factory is required")
@@ -173,6 +190,8 @@ class ExperimentHarness:
         self.client_factory = client_factory or (
             lambda store: OpenAICompatibleClient(api_config, store=store)  # type: ignore[arg-type]
         )
+        self.reader_api_config = reader_api_config
+        self.tokenizer = tokenizer
         self.output_dir = Path(config.output_dir)
         self.db_path = self.output_dir / "experiment.sqlite"
         self.api_metadata = (
@@ -180,6 +199,7 @@ class ExperimentHarness:
                 "model": api_config.model,
                 "base_url": api_config.base_url,
                 "temperature": api_config.temperature,
+                "top_p": api_config.top_p,
                 "seed": api_config.seed,
                 "max_tokens": api_config.max_tokens,
                 "enable_thinking": api_config.enable_thinking,
@@ -192,6 +212,10 @@ class ExperimentHarness:
         resolved = asdict(self.config)
         resolved["runner"] = asdict(self.config.runner)
         resolved["api"] = self.api_metadata
+        resolved["reader_api"] = (
+            {key: value for key, value in asdict(self.reader_api_config).items() if key != "api_key"}
+            if self.reader_api_config else None
+        )
         semantic = dict(resolved)
         for key in ("output_dir", "resume", "retry_errors", "fail_fast", "max_concurrency"):
             semantic.pop(key, None)
@@ -200,6 +224,40 @@ class ExperimentHarness:
         return resolved
 
     def _samples(self) -> list[CanonicalSample]:
+        input_path = Path(self.config.input)
+        if any(value is not None for value in (self.config.expected_data_sha256,
+               self.config.expected_total_samples, self.config.expected_documents)):
+            if not input_path.exists():
+                raise ValueError(f"benchmark input does not exist: {input_path}")
+            raw = input_path.read_bytes()
+            actual_sha256 = hashlib.sha256(raw).hexdigest()
+            if self.config.expected_data_sha256 and actual_sha256 != self.config.expected_data_sha256:
+                raise ValueError(
+                    f"benchmark input SHA-256 mismatch: expected {self.config.expected_data_sha256}, got {actual_sha256}"
+                )
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                raise ValueError("benchmark input must be a JSON list")
+            if self.config.expected_total_samples is not None and len(parsed) != self.config.expected_total_samples:
+                raise ValueError(
+                    f"benchmark input sample count mismatch: expected {self.config.expected_total_samples}, got {len(parsed)}"
+                )
+            if self.config.expected_documents is not None:
+                document_counts = []
+                for index, record in enumerate(parsed):
+                    context = record.get("context") if isinstance(record, dict) else None
+                    if not isinstance(context, str):
+                        raise ValueError(f"benchmark record {index} does not contain raw string context")
+                    headers = re.findall(r"(?m)^Document ([1-9][0-9]*):\r?$", context)
+                    if headers != [str(number) for number in range(1, len(headers) + 1)]:
+                        raise ValueError(f"benchmark record {index} has non-contiguous Document headers")
+                    if record.get("num_docs", len(headers)) != len(headers):
+                        raise ValueError(f"benchmark record {index} num_docs disagrees with Document headers")
+                    document_counts.append(len(headers))
+                if set(document_counts) != {self.config.expected_documents}:
+                    raise ValueError(
+                        f"benchmark document count mismatch: expected every record to have {self.config.expected_documents}, got {sorted(set(document_counts))}"
+                    )
         samples = list(load_records(self.config.input, dataset_id=self.config.dataset_id))
         if self.config.sample_ids:
             wanted = set(self.config.sample_ids)
@@ -214,7 +272,7 @@ class ExperimentHarness:
             raise ValueError("experiment sample selection is empty")
         return samples
 
-    def _oracle_plans(self, samples: list[CanonicalSample]) -> dict[str, QueryPlan]:
+    def _oracle_plans(self, samples: list[CanonicalSample]) -> dict[str, GraphQueryPlan]:
         requires_oracle = any("oracle" in method for method in self.config.methods)
         if not requires_oracle:
             return {}
@@ -306,7 +364,7 @@ class ExperimentHarness:
         sample: CanonicalSample,
         method: str,
         order: str,
-        oracle_plans: dict[str, QueryPlan],
+        oracle_plans: dict[str, GraphQueryPlan],
     ) -> dict[str, Any]:
         manifest = build_manifest(
             sample, dataset_id=self.config.dataset_id, seed=self.config.seed, order=order
@@ -345,10 +403,12 @@ class ExperimentHarness:
                     defer_unbound=not method.endswith("no_defer"),
                     query_graph_mode=("flat" if "_flat" in method else self.config.runner.query_graph_mode),
                 )
-                result = await V5Runner(client, config=runner_config).run(
+                reader_client = (OpenAICompatibleClient(self.reader_api_config, store=store)
+                                 if self.reader_api_config else None)
+                result = await V5Runner(client, config=runner_config, reader_client=reader_client, tokenizer=self.tokenizer).run(
                     run_id=run_id,
                     sample=sample,
-                    manifest=manifest,
+                    manifest=None if sample.context is not None and runner_config.plan_format == "subqueries" else manifest,
                     store=store,
                     plan=plan,
                 )
@@ -398,7 +458,7 @@ class ExperimentHarness:
         committed_positions = [
             positions[event["source_ref"]]
             for event in events
-            if event["event_type"] == "CLAIM_COMMITTED"
+            if event["event_type"] in {"CLAIM_COMMITTED", "FACT_PENDING", "FACT_COMMITTED"}
             and event.get("source_ref") in positions
         ]
         first_grounded = min(committed_positions) if committed_positions else None
@@ -410,7 +470,7 @@ class ExperimentHarness:
         deferred_refs = {
             event["source_ref"]
             for event in events
-            if event["event_type"] == "CLAIM_DEFERRED" and event.get("source_ref")
+            if event["event_type"] in {"CLAIM_DEFERRED", "FACT_DEFERRED"} and event.get("source_ref")
         }
         result["early_latent_evidence_count"] = len(early_gold)
         result["early_latent_evidence_recall"] = (
@@ -419,12 +479,12 @@ class ExperimentHarness:
         oracle = oracle_plans.get(sample.sample_id)
         predicted_plan = None
         if (result.get("state") or {}).get("plan"):
-            predicted_plan = QueryPlan.model_validate(result["state"]["plan"])
+            predicted_plan = parse_query_plan(result["state"]["plan"])
         elif event_counts.get("PLAN_CREATED"):
             plan_event = next(
                 event for event in events if event["event_type"] == "PLAN_CREATED"
             )
-            predicted_plan = QueryPlan.model_validate(plan_event["payload"]["plan"])
+            predicted_plan = parse_query_plan(plan_event["payload"]["plan"])
         result["plan_relation_recall"] = plan_relation_recall(predicted_plan, oracle)
         scored = score_result(result, sample)
         trajectory_path = self.output_dir / "trajectories" / f"{run_id}.json"
@@ -457,7 +517,10 @@ async def run_experiment(
     *,
     api_config: APIConfig | None = None,
     client_factory: ClientFactory | None = None,
+    reader_api_config: APIConfig | None = None,
+    tokenizer: TextTokenizer | None = None,
 ) -> dict[str, Any]:
     return await ExperimentHarness(
-        config, api_config=api_config, client_factory=client_factory
+        config, api_config=api_config, client_factory=client_factory,
+        reader_api_config=reader_api_config, tokenizer=tokenizer,
     ).run()

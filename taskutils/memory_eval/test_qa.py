@@ -60,6 +60,10 @@ def get_pred(data, args, out_file):
         from utils.rememr1 import async_query_llm
         from utils import extract_boxed_answer as extract_answer
         nocallback = 'nocallback' in args.save_file
+    elif args.api == "v51":
+        from utils.v51 import async_query_llm
+        from utils import extract_boxed_answer as extract_answer
+        nocallback = 'nocallback' in args.save_file
     elif args.api == "recurrent-boxed":
         from utils.recurrent_boxed import async_query_llm
         from utils import extract_boxed_answer as extract_answer
@@ -71,7 +75,7 @@ def get_pred(data, args, out_file):
         raise ValueError
     coros = []
     for item in data:
-        if args.api == "recurrent_revisit":
+        if args.api in {"recurrent_revisit", "v51"}:
             coro = async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95, nocallback=nocallback)
         else:
             coro = async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95)

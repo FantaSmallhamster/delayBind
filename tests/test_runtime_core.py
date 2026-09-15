@@ -4,7 +4,7 @@ from delaybind_core import (
     Manifest,
     ManifestEntry,
     Polarity,
-    QueryPlan,
+    GraphQueryPlan,
     RawArchive,
     RelationSpec,
     SQLiteEventStore,
@@ -49,7 +49,7 @@ def make_manifest() -> Manifest:
 
 
 def make_runtime():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="plan-1",
         relation_specs=[
             RelationSpec(
@@ -260,7 +260,7 @@ def test_deferred_lookup_filters_by_entity_and_relation_family():
 
 def test_pattern_hint_falls_back_to_entity_matched_same_relation_pattern():
     base_runtime, store = make_runtime()
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="hint-plan",
         patterns=[
             {"id": "FilmA", "subject": "Film A", "relation": "DIRECTOR", "object": "?director_a"},
@@ -288,7 +288,7 @@ def test_pattern_hint_falls_back_to_entity_matched_same_relation_pattern():
 
 def test_pattern_endpoint_matches_explicit_question_alias():
     base_runtime, store = make_runtime()
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="alias-plan",
         patterns=[
             {
@@ -346,7 +346,7 @@ def test_path_consistent_candidates_select_the_supported_complete_branch():
     store = SQLiteEventStore()
     archive = RawArchive(store, "path-run")
     archive.append(manifest.entries)
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="path-plan",
         patterns=[
             {
@@ -396,7 +396,7 @@ def test_path_consistent_candidates_select_the_supported_complete_branch():
 
 def test_document_title_fallback_does_not_reverse_a_directed_edge():
     base_runtime, store = make_runtime()
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="direction-plan",
         patterns=[
             {"id": "director", "subject": "Film A", "relation": "DIRECTOR", "object": "?director"}
@@ -422,7 +422,7 @@ def test_document_title_fallback_does_not_reverse_a_directed_edge():
 
 def test_runtime_rejects_cross_document_event_before_verify():
     base_runtime, store = make_runtime()
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="source-local-plan",
         patterns=[
             {
@@ -473,7 +473,7 @@ def test_deferred_lookup_supports_binding_on_pattern_object_side():
     manifest = Manifest.from_entries(
         manifest_id="object-side", dataset_id="fixture", sample_id="q1", seed=4, entries=entries
     )
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="object-side-plan",
         patterns=[
             {"id": "director", "subject": "?person", "relation": "DIRECTOR", "object": "Film A"},

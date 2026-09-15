@@ -1,9 +1,9 @@
 from delaybind_core.query_graph import compile_open_query_graph
-from delaybind_core.schema import QueryNodeKind, QueryPlan
+from delaybind_core.schema import QueryNodeKind, GraphQueryPlan
 
 
 def test_plan_compiles_shared_variables_into_open_query_graph_topology():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="cindy-chain",
         patterns=[
             {"id": "teacher", "subject": "Cindy", "relation": "teacher", "object": "?teacher"},
@@ -22,7 +22,7 @@ def test_plan_compiles_shared_variables_into_open_query_graph_topology():
 
 
 def test_target_free_chain_infers_terminal_answer_node():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="target-free-chain",
         patterns=[
             {"id": "teacher", "subject": "Cindy", "relation": "teacher", "object": "?teacher"},

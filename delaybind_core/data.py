@@ -29,7 +29,8 @@ class CanonicalSample(BaseModel):
     answer: str | None = None
     answers: list[str] = Field(default_factory=list)
     question_type: str | None = None
-    documents: list[CanonicalDocument]
+    documents: list[CanonicalDocument] = Field(default_factory=list)
+    context: str | None = None
     supporting_facts: list[tuple[str, int]] = Field(default_factory=list)
     evidences: list[list[Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -44,9 +45,14 @@ def _as_sentences(value: Any) -> list[str]:
 def canonicalize_record(record: dict[str, Any], *, dataset_id: str = "2wiki") -> CanonicalSample:
     """Convert official 2Wiki or FlashRAG JSON into one internal shape."""
     metadata = record.get("metadata") or {}
-    context = record.get("context") or metadata.get("context") or []
+    context = record.get("context")
+    if context is None:
+        context = metadata.get("context") or []
     documents: list[CanonicalDocument] = []
-    if isinstance(context, dict):
+    raw_context = context if isinstance(context, str) else None
+    if raw_context is not None:
+        pass
+    elif isinstance(context, dict):
         titles = context.get("title", [])
         contents = context.get("sentences", context.get("content", []))
         for index, (title, content) in enumerate(zip(titles, contents)):
@@ -78,7 +84,7 @@ def canonicalize_record(record: dict[str, Any], *, dataset_id: str = "2wiki") ->
             if len(item) >= 2:
                 supporting.append((str(item[0]), int(item[1])))
 
-    answers = record.get("golden_answers") or []
+    answers = record.get("golden_answers") or record.get("answers") or []
     answer = record.get("answer")
     if answer is not None and not answers:
         answers = [str(answer)]
@@ -86,12 +92,14 @@ def canonicalize_record(record: dict[str, Any], *, dataset_id: str = "2wiki") ->
         answer = str(answers[0])
     question_type = record.get("type") or metadata.get("type")
     return CanonicalSample(
-        sample_id=str(record.get("_id") or record.get("id") or metadata.get("id") or "unknown"),
-        question=str(record.get("question", "")).strip(),
+        sample_id=str(next((value for value in (record.get("_id"), record.get("id"), metadata.get("id"))
+                            if value is not None), "unknown")),
+        question=str(record.get("question", record.get("input", record.get("prompt", "")))).strip(),
         answer=str(answer) if answer is not None else None,
         answers=[str(item) for item in answers],
         question_type=str(question_type) if question_type is not None else None,
         documents=documents,
+        context=raw_context,
         supporting_facts=supporting,
         evidences=[list(item) for item in (record.get("evidences") or metadata.get("evidences") or [])],
         metadata={"dataset_id": dataset_id, **metadata},
@@ -125,6 +133,10 @@ def build_manifest(
     canonical sentence text or gold annotations.
     """
     documents = list(sample.documents)
+    if sample.context is not None:
+        if order != "original":
+            raise ValueError("raw context already has a fixed order; use original or supply documents for order ablations")
+        documents = [CanonicalDocument(document_id="context", title="", sentences=[sample.context])]
     if order == "reverse":
         documents.reverse()
     elif order == "shuffle":

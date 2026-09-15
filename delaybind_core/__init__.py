@@ -1,7 +1,10 @@
 """Deterministic core for the V5 delayed-binding evidence runtime."""
 
 from .archive import FutureSourceAccessError, RawArchive
-from .cursor import ReadCursor, ReadWindow
+from .cursor import ReadCursor, ReadWindow, TextReadCursor, TextTokenizer
+from .agents import HighLevelAgent, LowLevelAgent
+from .fact_protocol import FactEvent, FactUpdate, BindingProposal, parse_plan, parse_update
+from .working_memory import FactNode, FactUse, BindingLink
 from .data import CanonicalDocument, CanonicalSample, build_manifest, canonicalize_record, load_records
 from .direct import DirectFullContextError, run_direct_full_context
 from .evaluation import ExperimentConfig, ExperimentHarness, run_experiment
@@ -12,6 +15,7 @@ from .operators import OperatorError, execute_operator
 from .plan_validation import PlanIssue, PlanValidationError, ensure_valid_plan, validate_plan
 from .query_graph import compile_open_query_graph
 from .runtime import EvidenceRuntime, RuntimeResult, RuntimeState
+from .subqueries import SubqueryRuntime, SubqueryState
 from .runner import ModelBudgetExceeded, RunnerConfig, V5Runner
 from .schema import (
     Action,
@@ -24,6 +28,10 @@ from .schema import (
     Modality,
     Polarity,
     QueryPlan,
+    GraphQueryPlan,
+    Subquery,
+    SubqueryStatus,
+    parse_query_plan,
     OpenQueryGraph,
     QueryEdge,
     QueryEdgeStatus,
@@ -44,6 +52,18 @@ from .storage import SQLiteEventStore
 
 __all__ = [
     "Action",
+    "HighLevelAgent",
+    "LowLevelAgent",
+    "TextReadCursor",
+    "TextTokenizer",
+    "FactEvent",
+    "FactUpdate",
+    "BindingProposal",
+    "FactNode",
+    "FactUse",
+    "BindingLink",
+    "parse_plan",
+    "parse_update",
     "AnswerResponse",
     "Claim",
     "EdgeFillResponse",
@@ -67,6 +87,12 @@ __all__ = [
     "PlanValidationError",
     "Polarity",
     "QueryPlan",
+    "GraphQueryPlan",
+    "Subquery",
+    "SubqueryStatus",
+    "SubqueryRuntime",
+    "SubqueryState",
+    "parse_query_plan",
     "OpenQueryGraph",
     "QueryEdge",
     "QueryEdgeStatus",

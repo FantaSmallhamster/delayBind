@@ -1,4 +1,4 @@
-from delaybind_core import Action, EvidenceRuntime, Manifest, ManifestEntry, QueryPlan, RawArchive, SQLiteEventStore, TripleEvent
+from delaybind_core import Action, EvidenceRuntime, Manifest, ManifestEntry, GraphQueryPlan, RawArchive, SQLiteEventStore, TripleEvent
 from delaybind_core.operators import execute_operator
 
 
@@ -15,7 +15,7 @@ def test_runtime_executes_count_and_projects_operator_output():
         source_ref="q:d:s0", dataset_id="d", sample_id="q", document_id="doc",
         title="T", sentence_id=0, text="Film A has two directors.", stream_position=0,
     )
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="operator-plan",
         patterns=[{"id": "p1", "subject": "Film A", "relation": "director", "object": "?director"}],
         operators=[
@@ -49,7 +49,7 @@ def test_runtime_reorders_model_events_by_source_order():
             title="T", sentence_id=1, text="Martin Lee was born in 1948.", stream_position=1,
         ),
     ]
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="p",
         patterns=[
             {"id": "director", "subject": "Film A", "relation": "DIRECTOR", "object": "?d"},
@@ -82,7 +82,7 @@ def test_runtime_uses_manifest_position_instead_of_model_position():
             title="T", sentence_id=0, text="Film A was directed by Martin Lee.", stream_position=0,
         ),
     ]
-    plan = QueryPlan(plan_id="p", patterns=[
+    plan = GraphQueryPlan(plan_id="p", patterns=[
         {"id": "director", "subject": "Film A", "relation": "DIRECTOR", "object": "?d"}
     ])
     store = SQLiteEventStore()

@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 SCHEMA_VERSION = "v1"
@@ -149,7 +149,9 @@ class QuestionContract(StrictModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class QueryPlan(StrictModel):
+class GraphQueryPlan(StrictModel):
+    """Legacy triple-based plan, retained for existing graph experiments."""
+
     schema_version: Literal["v1"] = SCHEMA_VERSION
     plan_id: str
     plan_version: int = 1
@@ -158,6 +160,45 @@ class QueryPlan(StrictModel):
     operators: list[OperatorSpec] = Field(default_factory=list, max_length=8)
     constraints: dict[str, Any] = Field(default_factory=dict)
     answer_contract: AnswerContract | None = None
+
+
+class SubqueryStatus(str, Enum):
+    DORMANT = "DORMANT"
+    ACTIVE = "ACTIVE"
+    RESOLVED = "RESOLVED"
+
+
+class Subquery(StrictModel):
+    id: str = Field(min_length=1)
+    template: str = Field(min_length=1, validation_alias=AliasChoices("template", "query"))
+    depends_on: list[str] = Field(default_factory=list)
+    output: str = Field(validation_alias=AliasChoices("output", "binds"))
+    required: bool = True
+    requires_complete_set: bool = False
+
+    @property
+    def query(self) -> str:
+        return self.template
+
+    @property
+    def binds(self) -> str:
+        return self.output
+
+
+class QueryPlan(StrictModel):
+    """Natural-language subqueries; execution state is owned by Runtime."""
+
+    schema_version: Literal["v2"] = "v2"
+    plan_id: str = Field(min_length=1)
+    queries: list[Subquery] = Field(min_length=1)
+    # When omitted, the last query supplies the final answer.
+    answer_query_id: str | None = None
+
+
+def parse_query_plan(value: Any) -> QueryPlan | GraphQueryPlan:
+    """Read new plans and explicitly supplied historical graph plans."""
+    model = QueryPlan if isinstance(value, dict) and "queries" in value else GraphQueryPlan
+    return model.model_validate(value)
 
 
 class QueryNode(StrictModel):
@@ -358,7 +399,8 @@ class ModelCall(StrictModel):
     schema_version: Literal["v1"] = SCHEMA_VERSION
     call_id: str
     run_id: str
-    interface: Literal["PLAN", "UPDATE", "VERIFY", "ANSWER"]
+    interface: Literal["PLAN", "UPDATE", "MEMORY", "RECALL", "VERIFY", "ANSWER"]
+    agent_role: Literal["HIGH", "LOW"] | None = None
     request_hash: str
     model: str
     parameters: dict[str, Any] = Field(default_factory=dict)

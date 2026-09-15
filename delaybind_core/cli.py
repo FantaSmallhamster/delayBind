@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from .api import APIConfig, OpenAICompatibleClient
-from .data import build_manifest, load_records
+from .data import build_manifest, canonicalize_record, load_records
+from .fact_protocol import parse_plan
 from .evaluation import ExperimentConfig, run_experiment
 from .oracle import compile_oracle_plans, write_oracle_plans
 from .profiler import profile_dataset
 from .replay import replay_events
 from .runner import RunnerConfig, V5Runner, load_manifest
-from .schema import QueryPlan, RuntimeEvent
+from .schema import RuntimeEvent, parse_query_plan
 from .storage import SQLiteEventStore
 
 
@@ -74,6 +75,7 @@ def _api_config(config: dict[str, Any], *, default_seed: int = 4) -> APIConfig:
         api_key=_required_config_value(merged, "api_key", "MODEL_API_KEY"),
         model=_required_config_value(merged, "model", "MODEL_NAME"),
         temperature=float(merged.get("temperature", 0.0)),
+        top_p=float(merged["top_p"]) if merged.get("top_p") is not None else None,
         seed=model_seed,
         timeout_seconds=float(merged.get("timeout_seconds", 120.0)),
         max_retries=int(merged.get("api_max_retries", 2)),
@@ -85,11 +87,16 @@ def _api_config(config: dict[str, Any], *, default_seed: int = 4) -> APIConfig:
 def _run_from_config(config_path: str | Path) -> dict[str, Any]:
     _load_env_file()
     config = _load_config(config_path)
-    input_path = _required_config_value(config, "input", "DATASET_INPUT")
     dataset_id = str(config.get("dataset_id", "2wiki"))
-    samples = list(load_records(input_path, dataset_id=dataset_id))
+    if config.get("item") is not None:
+        samples = [canonicalize_record(config["item"], dataset_id=dataset_id)]
+    elif "question" in config and "context" in config:
+        samples = [canonicalize_record(config, dataset_id=dataset_id)]
+    else:
+        input_path = _required_config_value(config, "input", "DATASET_INPUT")
+        samples = list(load_records(input_path, dataset_id=dataset_id))
     if not samples:
-        raise SystemExit(f"dataset has no samples: {input_path}")
+        raise SystemExit("dataset has no samples")
     sample_index = int(config.get("sample_index", 0))
     try:
         sample = samples[sample_index]
@@ -101,6 +108,10 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
     manifest_path = config.get("manifest")
     if manifest_path:
         manifest = load_manifest(manifest_path)
+    elif sample.context is not None and config.get("plan_format", "subqueries") == "subqueries":
+        if order != "original":
+            raise ValueError("raw context already has a fixed order; use original")
+        manifest = None
     else:
         manifest = build_manifest(sample, dataset_id=dataset_id, seed=seed, order=order)
         if config.get("manifest_output"):
@@ -109,15 +120,24 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
 
     db_path = str(config.get("db", config.get("db_path", ":memory:")))
     store = SQLiteEventStore(db_path)
-    api_config = _api_config(config, default_seed=seed)
+    api_config = _api_config({**config, "api": {**config.get("api", {}), **config.get("high_api", {})}}, default_seed=seed)
     client = OpenAICompatibleClient(api_config, store=store)
+    reader_client = None
+    if config.get("low_api"):
+        reader_client = OpenAICompatibleClient(_api_config(
+            {**config, "api": {**config.get("api", {}), **config["low_api"]}}, default_seed=seed), store=store)
+    tokenizer = _load_tokenizer(config.get("tokenizer_path"))
     plan = None
     if config.get("plan") or config.get("plan_path"):
         plan_path = config.get("plan") or config.get("plan_path")
-        plan = QueryPlan.model_validate_json(Path(plan_path).read_text(encoding="utf-8"))
+        plan_text = Path(plan_path).read_text(encoding="utf-8")
+        plan = parse_query_plan(json.loads(plan_text)) if plan_text.lstrip().startswith("{") else parse_plan(plan_text)
     runner = V5Runner(
         client,
+        reader_client=reader_client,
+        tokenizer=tokenizer,
         config=RunnerConfig(
+            plan_format=str(config.get("plan_format", "subqueries")),
             chunk_size=int(config.get("chunk_size", 5000)),
             answer_mode=str(config.get("answer_mode", "runtime")),
             max_windows=int(config.get("max_windows", 100000)),
@@ -136,9 +156,16 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
             require_source_span=bool(config.get("require_source_span", True)),
             callback_retrieval_limit=int(config.get("callback_retrieval_limit", 16)),
             max_targeted_updates=int(config.get("max_targeted_updates", 16)),
+            candidate_batch_size=int(config.get("candidate_batch_size", 32)),
+            verify_source_neighborhood=int(config.get("verify_source_neighborhood", 0)),
+            max_response_retries=int(config.get("max_response_retries", 1)),
+            memory_token_budget=(int(config["memory_token_budget"]) if config.get("memory_token_budget") is not None else None),
+            memory_char_budget=int(config.get("memory_char_budget", 24000)),
+            answer_format=str(config.get("answer_format", "auto")),
+            enable_defer_callback=bool(config.get("enable_defer_callback", True)),
         ),
     )
-    run_id = str(config.get("run_id") or f"{sample.sample_id}-{manifest.manifest_id}")
+    run_id = str(config.get("run_id") or f"{sample.sample_id}-{manifest.manifest_id if manifest else 'text'}")
     result = asyncio.run(
         runner.run(run_id=run_id, sample=sample, manifest=manifest, store=store, plan=plan)
     )
@@ -149,6 +176,20 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     store.close()
     return result
+
+
+def _load_tokenizer(path: str | None):
+    if path is None:
+        return None
+    if Path(path).suffix == ".json":
+        from .tokenization import TokenizerJSON
+
+        return TokenizerJSON(path)
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise SystemExit("tokenizer_path requires transformers; install the tokenizer extra") from exc
+    return AutoTokenizer.from_pretrained(path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -235,7 +276,10 @@ def main(argv: list[str] | None = None) -> int:
         summary = asyncio.run(
             run_experiment(
                 config,
-                api_config=_api_config(raw_config, default_seed=config.seed),
+                api_config=_api_config({**raw_config, "api": {**raw_config.get("api", {}), **raw_config.get("high_api", {})}}, default_seed=config.seed),
+                reader_api_config=(_api_config({**raw_config, "api": {**raw_config.get("api", {}), **raw_config["low_api"]}}, default_seed=config.seed)
+                                   if raw_config.get("low_api") else None),
+                tokenizer=_load_tokenizer(config.tokenizer_path),
             )
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))

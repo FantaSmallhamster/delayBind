@@ -4,7 +4,7 @@ import json
 from delaybind_core import Manifest, ManifestEntry, SQLiteEventStore
 from delaybind_core.data import CanonicalSample, build_manifest, canonicalize_record
 from delaybind_core.runner import RunnerConfig, V5Runner
-from delaybind_core.schema import QueryPlan
+from delaybind_core.schema import GraphQueryPlan
 
 
 class FakeClient:
@@ -105,7 +105,7 @@ def test_runner_executes_mock_plan_update_and_verify():
     )
     store = SQLiteEventStore()
     result = asyncio.run(
-        V5Runner(FakeClient(), config=RunnerConfig(chunk_size=1)).run(
+        V5Runner(FakeClient(), config=RunnerConfig(plan_format="graph", chunk_size=1)).run(
             run_id="mock-run", sample=sample, manifest=manifest, store=store
         )
     )
@@ -148,7 +148,7 @@ def test_runner_retries_schema_invalid_plan_once():
     )
     client = RetryPlanClient()
     result = asyncio.run(
-        V5Runner(client, config=RunnerConfig(max_windows=0)).run(
+        V5Runner(client, config=RunnerConfig(plan_format="graph", max_windows=0)).run(
             run_id="retry-run", sample=sample, manifest=manifest, store=SQLiteEventStore()
         )
     )
@@ -167,7 +167,7 @@ def test_runner_stops_at_model_call_budget():
     manifest = build_manifest(sample, dataset_id="2wiki")
     client = FakeClient()
     result = asyncio.run(
-        V5Runner(client, config=RunnerConfig(max_model_calls=1)).run(
+        V5Runner(client, config=RunnerConfig(plan_format="graph", max_model_calls=1)).run(
             run_id="budget-run", sample=sample, manifest=manifest, store=SQLiteEventStore()
         )
     )
@@ -184,7 +184,7 @@ def test_runner_marks_single_window_as_invalid_streaming_protocol():
         }
     )
     result = asyncio.run(
-        V5Runner(FakeClient(), config=RunnerConfig(chunk_size=100, min_streaming_windows=2)).run(
+        V5Runner(FakeClient(), config=RunnerConfig(plan_format="graph", chunk_size=100, min_streaming_windows=2)).run(
             run_id="single-window-run",
             sample=sample,
             manifest=build_manifest(sample),
@@ -244,14 +244,14 @@ def test_runner_expands_verify_context_once_on_need_more_context():
         }
     )
     manifest = build_manifest(sample)
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="expand-plan",
         patterns=[{"id": "director", "subject": "Film A", "relation": "director", "object": "?director"}],
         answer_contract={"target": "?director", "type": "ENTITY"},
     )
     client = ExpandingVerifyClient()
     result = asyncio.run(
-        V5Runner(client, config=RunnerConfig(chunk_size=100, max_verify_expansions=1)).run(
+        V5Runner(client, config=RunnerConfig(plan_format="graph", chunk_size=100, max_verify_expansions=1)).run(
             run_id="expand-run", sample=sample, manifest=manifest,
             store=SQLiteEventStore(), plan=plan,
         )
@@ -322,7 +322,7 @@ def test_target_free_evidence_answer_uses_verified_graph_only():
     )
     client = TargetFreeEvidenceClient()
     result = asyncio.run(
-        V5Runner(client, config=RunnerConfig(answer_mode="evidence", chunk_size=100)).run(
+        V5Runner(client, config=RunnerConfig(plan_format="graph", answer_mode="evidence", chunk_size=100)).run(
             run_id="evidence-run",
             sample=sample,
             manifest=build_manifest(sample),
@@ -387,7 +387,7 @@ def test_binding_activation_recovers_missed_fact_from_read_prefix():
         "question": "When was the director of Film A born?",
         "context": [["Martin Lee", ["Martin Lee was born in 1948."]], ["Film A", ["Film A was directed by Martin Lee."]]],
     })
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="callback-plan",
         patterns=[
             {"id": "director", "subject": "Film A", "relation": "DIRECTOR", "object": "?director"},
@@ -397,7 +397,7 @@ def test_binding_activation_recovers_missed_fact_from_read_prefix():
     )
     result = asyncio.run(V5Runner(
         CallbackRecoveryClient(),
-        config=RunnerConfig(chunk_size=1, max_targeted_updates=4),
+        config=RunnerConfig(plan_format="graph", chunk_size=1, max_targeted_updates=4),
     ).run(
         run_id="callback-recovery",
         sample=sample,

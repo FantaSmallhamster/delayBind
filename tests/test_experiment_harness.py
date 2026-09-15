@@ -96,7 +96,7 @@ def test_experiment_harness_writes_all_artifacts_and_resumes(tmp_path):
             "orders": ["original", "reverse"],
             "compile_oracle": True,
             "max_concurrency": 2,
-            "runner": {"chunk_size": 10, "max_model_calls": 10},
+            "runner": {"plan_format": "graph", "chunk_size": 10, "max_model_calls": 10},
         }
     )
     factory = lambda store: ExperimentClient()

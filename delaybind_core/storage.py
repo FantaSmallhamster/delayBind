@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -15,6 +16,8 @@ from .schema import ModelCall, RuntimeEvent
 class SQLiteEventStore:
     def __init__(self, path: str = ":memory:"):
         self.path = path
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
@@ -206,7 +209,16 @@ class SQLiteEventStore:
 
     def model_call_summary(self, run_id: str) -> dict[str, Any]:
         calls = self.list_model_calls(run_id)
+        interfaces: dict[str, dict[str, Any]] = {}
+        for call in calls:
+            key = f"{call.agent_role or 'SHARED'}:{call.interface}"
+            row = interfaces.setdefault(key, {"records": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0.0})
+            row["records"] += 1
+            row["input_tokens"] += call.input_tokens or 0
+            row["output_tokens"] += call.output_tokens or 0
+            row["latency_ms"] += call.latency_ms or 0.0
         return {
+            "interface_usage": interfaces,
             "model_call_records": len(calls),
             "model_calls": len({call.request_hash for call in calls}),
             "cache_hits": sum(call.cache_hit for call in calls),
