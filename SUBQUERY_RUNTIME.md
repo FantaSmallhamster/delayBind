@@ -99,6 +99,70 @@ ACTIVE 事实通过 ID 和来源合法性检查后直接进入工作记忆，不
 `PLAN_HINT | source_refs | 事实及缺失需求` 保存无法路由的相关证据，供高层局部修改计划。
 无相关事实时输出 NONE。格式错误有日志及有限修复重试，调用成本计入统计。
 
+### 文档编号与来源引用
+
+对于 ReMemR1 的 `Document N:` 长文本，每个原始 token 窗口在读到后再按文档边界登记来源片段。
+窗口大小和正文不变，低层会看到如下标记：
+
+```text
+[D44@C0] Document 44
+Document 44:
+Without the King
+Without the King is a 2007 documentary film.
+```
+
+推荐输出 `Q1 | D44@C0 | Without the King is a 2007 documentary film. | ACTIVE`。
+`D44@C0` 对应内部不可变来源 `<sample_id>:c00000:D44`；同一文档跨窗口时，后续片段使用
+`D44@C1`。VERIFY 只恢复候选引用的已读片段，不将整个窗口中的其他文档混作该来源。
+
+解析器兼容 `Doc44`、`doc_44`、`Document 44`、`D44`、`44` 等写法，但只在本次 UPDATE
+的窗口与显式提供的工作记忆来源中查找。裸文档号若对应多个可见片段，会保留这些片段的全部引用，
+不会扩大到未读部分或未呈现的历史原文。BIND 只能将文档别名转换为已接受的支持事实引用。
+JSON ANSWER 的来源引用也只在证据包范围内转换。
+
+无效或不存在的来源会触发带可用编号列表的格式修复重试；`NONE` 不能成为事实的来源。
+已知的复制格式标题行、没有 query 和来源的 `NONE | | ...` 占位行会被忽略并记录
+`UPDATE_LINE_IGNORED`，不会让同一输出中的有效事实全部解析失败。真实事实行仍必须使用单一动作。
+引用格式正确不代表事实语义正确；ACTIVE 事实仍遵循已有的直接接受规则，defer 候选仍按原流程 VERIFY。
+
+### 协议兼容和局部错误处理（protocol-v4）
+
+- RECALL 支持 `SELECT F1,F2`、`SELECT | F1,F2`、纯 ID 列表、JSON ID 数组、代码块和列表标记。
+  只按明确语法解析，不从解释性长文里搜索并猜测 fact ID。输入已显示的上游绑定支持 ID 若被混入，
+  会记录 `RECALL_CONTEXT_IDS_IGNORED` 并排除；只有当前批次的 defer 候选可以进入 VERIFY。
+  拼错、不存在、属于其他批次的 ID 不会自动纠正或当成有效证据。
+- UPDATE/MEMORY 兼容已声明 query 的 `Q1@NONE`、大小写和引用符号变体，以及
+  `Q1 [ACTIVE]` / `Q1 [DORMANT]` / `Q1 [RESOLVED]`。括号只作为编号装饰移除，
+  不能修改 runtime 的真实状态。UPDATE 的编号转换记录为 `QUERY_IDS_NORMALIZED`。
+  不会因为出现 `Q2@NONE` 就创建不存在的 Q2，也不改变 query 的依赖与状态。
+- 来源/支持引用支持逗号列表和 JSON 字符串数组。MEMORY 中的 NOTE 说明块与合法命令分开处理，
+  无支持的 BIND 会被拒绝；JSON 数组外壳不会被误当成 fact ID 的一部分。
+- UPDATE 按行解析和校验，保留合法事实；混入的 `Q3|NONE|`、无来源或未知 query 行独立记录为
+  `UPDATE_LINE_REJECTED`。有限修复重试后仍有错误时，保留此前通过校验的事实继续读取，不伪造缺失引用。
+- 完整四栏的 `Q2|NONE||DORMANT` 等明确空占位，以及没有来源、符合有限句式的
+  `No document provides ...` / `Cannot determine ... without ...` / `Cannot determine ... because ... are unknown`
+  无结果说明，记录 `UPDATE_LINE_IGNORED` 后跳过，不触发模型重试。带具体断言但缺来源的行仍被拒绝；
+  有来源的否定事实不受此规则影响。阅读模型只需输出发现的事实，不必给每个 query 填一行。
+- UPDATE 来源栏只接受本次可见原文的来源编号。`F...` 是记忆事实编号，不能自动转换为原文来源。
+  一行混有合法文档编号和错误事实编号时整行拒绝，不删除错误项后接受剩余引用。
+- UPDATE 使用局部修复提示词 `UPDATE_REPAIR`，仅列出上次被拒绝的行、逐行原因、允许的 query/来源编号，
+  以及本窗口和显式可见记忆来源的原文。不会推进阅读窗口或搜索额外 Archive。
+  模型只返回可由这些证据支持的修正行；无法修复的行省略，全部无法修复则返回 NONE。
+  合法事实跨尝试保留，按 query、正文、来源集合和路由标记去重；合法 PLAN_HINT 也去重。
+  修复请求记录 `UPDATE_REPAIR_REQUESTED`，包含待修行、已保留事实数和窗口编号。
+  后续仍失败时，只针对本次剩余坏行继续有限重试；其余接口保留原有重试方式。
+- MEMORY 重试后仍部分出错时，只应用最后一次响应中通过语法和 query 检查的命令，仍受 Runtime
+  的支持引用检查约束。未满足依赖或还在等待候选核验的 BIND 记为 `BINDING_HELD`；之后由高层
+  根据最新证据重新提出，不会跳过 VERIFY 自动补绑。
+- VERIFY 接受分隔符与空格的简单变体；必须覆盖实际选中的候选，不能使用未知 ID 或相互矛盾的判定。
+  若重试仍无法解析，该批候选保留为 UNCERTAIN，判定来源标记 `PROTOCOL_FALLBACK`，不会提升事实。
+- RECALL 重试仍无法得到合法候选列表时，本批按未选中处理，原候选继续保存；后续流程可继续。
+
+上述重试耗尽统一记录 `PROTOCOL_REPAIR_EXHAUSTED`。结果包含 `protocol_valid=false` 和详细
+`protocol_repair_failures`；评分同时报告协议失败题数、拒绝行数和暂缓绑定次数。
+能够继续返回答案不等于协议无错误，也不等于证据完整。PLAN 没有合法计划、模型 API 失败和资源耗尽
+仍沿用原有错误处理，不会通过这些格式兼容规则隐瞒。
+
 ## 工作记忆图与版本
 
 事实表正文只保存一份：
@@ -194,8 +258,9 @@ result = await V5Runner(client, tokenizer=tokenizer).run(
 ```
 
 也可直接传 `question="...", context="..."`。
-TextReadCursor 复用传入 tokenizer 的 encode/decode 切 token 窗口；编号 `0:c00000` 等在读到窗口时
-自动分配，并将当时原文加入已读 Archive。无 tokenizer 时按字符分块，输出显式报告单位。
+TextReadCursor 复用传入 tokenizer 的 encode/decode 切 token 窗口。普通长文本按窗口生成
+`0:c00000`；带 `Document N:` 标题的文本按已读文档片段生成 `0:c00000:D44`，给模型显示
+短引用 `D44@C0`。这些来源仅在窗口读到时加入 Archive。无 tokenizer 时按字符分块，输出显式报告单位。
 原 2Wiki 的文档列表和 Manifest 保留为兼容输入及历史顺序消融工具。
 已经拼接好的 raw context 只能使用 original 顺序，不能假称进行了文档 reverse 实验。
 
@@ -209,6 +274,11 @@ python3 -m pytest -q tests
 模型凭据仍放在 `.env.local`。需要 CLI 加载实际 tokenizer 时安装 `.[tokenizer]` 并配置
 `tokenizer_path`，例如本地模型目录。实验默认使用两个角色共享的模型配置；不同服务可以分别写
 high_api、low_api。配置和结果会记录两边的模型参数，API key 不写入冻结配置。
+
+若同一 API 域名解析出的地址响应差异明显，可在 `api` 中设置 `connect_ip` 选择连接地址。
+URL、HTTP Host 和 TLS 证书校验仍使用原域名，不修改系统 DNS，也不会把 IP 作为模型参数发送。
+成功响应的 `_client_transport` 记录实际 `peer_ip`、TLS 主机名及服务端 trace ID，供审计。
+这只控制连接路线，不能保证后端不再繁忙或超时。
 
 原 ReMemR1 评测脚本增加了 `--api v51`，沿用 `_id / input / context / answers` 数据格式、
 既有 tokenizer 和 boxed 答案提取器。`nocallback` 条件只关闭历史候选回查，仍保存 DEFER；

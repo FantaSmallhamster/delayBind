@@ -1,7 +1,10 @@
 # 2Wiki 128 题 × 50 文档：seed=4 数据
 
 按用户要求，题目抽样与干扰文档采样 seed 从 42 改为 4，文档排列 seed 保持 4。
-本次只生成数据、更新配置和执行离线预检，模型 API 测试保持暂停。
+最初只生成数据并执行离线预检；现在已完成 protocol-v4 的 128 题完整评测，
+使用 Qwen/Qwen3.5-9B，API 最多重试 5 次，128 题均生成答案。
+EM 为 52.34%，F1 为 59.21%。[完整报告与轨迹](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/README.md)
+和冻结输入随仓库归档。
 模型请求的 `model_seed` 仍为 `null`；它与 benchmark 的采样 seed 是两个参数。
 
 ## 冻结文件
@@ -35,7 +38,8 @@ python3 scripts/build_2wiki_benchmark.py \
 ## 更新后的 8 题冒烟
 
 配置仍为 `configs/v51_2wiki50_smoke8.json`，现在指向 seed4 新文件和独立输出目录
-`results/v51-2wiki50-seed4-smoke8/`。仍取新 128 题集合的前 8 题。
+`results/v51-2wiki50-seed4-smoke8-node199-protocol-v4/`。仍取新 128 题集合的前 8 题。
+完整 128 题配置为 `configs/v51_2wiki50_full128_retry5.json`。
 
 | 题目 ID | Qwen3.5 tokenizer tokens | 5000-token 窗口数 |
 | --- | ---: | ---: |
@@ -48,7 +52,7 @@ python3 scripts/build_2wiki_benchmark.py \
 | dev_2539 | 6273 | 2 |
 | dev_1476 | 5435 | 2 |
 
-本次仅执行以下预检，实际模型请求为 0：
+初次生成数据时仅执行以下预检，没有模型请求：
 
 ```bash
 /tmp/delaybind-subqueries-venv/bin/python scripts/run_v51_smoke.py --prepare-only

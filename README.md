@@ -119,6 +119,13 @@ It includes components from [MemAgent](https://github.com/BytedTsinghua-SIA/MemA
 
 ## V5 Design and Implementation
 
+The completed V5.1 protocol-v4 experiment on 128 seed-4 2Wiki questions (50 documents each)
+is archived with **52.34% EM and 59.21% F1**. See the
+[report](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/REPORT.md),
+[all 128 question trajectories](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/TRAJECTORIES.md),
+and [artifact guide](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/README.md).
+This is a standalone evaluation of the current V5.1 runtime; it is not an exact reproduction of the paper's main experiment.
+
 The default V5.1 runner uses a high-level planning/memory agent and a low-level
 reading/deferred-review agent, natural-language subqueries, and source-fact memory.
 ReMemR1-style `input`/`context` records can be passed directly, without preparing a
