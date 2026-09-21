@@ -1,9 +1,18 @@
 """Raw-backed per-query review contexts and effective-only reader/answer views."""
 
-from .schema_v52 import EvidencePackV52, digest
+from .member_graph_r2 import enabled, member_projection
+from .navigation_r2 import (
+    binding_effective,
+    current_uses,
+    proof_facts,
+    query,
+    query_projection,
+    query_ready,
+    use_effective,
+)
 from .schema_r2 import MemoryContextR2
-from .navigation_r2 import (query, query_projection, use_effective, current_uses, binding_effective,
-                            proof_facts, query_ready)
+from .schema_v52 import EvidencePackV52, digest
+from .text_views_v52 import memory_view
 
 
 def evidence_pack(runtime, *, qid=None, fact_ids=None, extra_refs=(), final=False):
@@ -42,7 +51,12 @@ def evidence_pack(runtime, *, qid=None, fact_ids=None, extra_refs=(), final=Fals
         for q in s.plan.queries:
             ex = s.executions[q.id]
             if not binding_effective(s, ex.current_binding_id):
-                diagnostics.append(dict(query_id=q.id, status=ex.status, review_pending=bool(ex.blocking_review_ids), effective=False))
+                diagnostics.append(dict(
+                    query_id=q.id,
+                    status=ex.status,
+                    review_pending=bool(ex.blocking_review_ids),
+                    effective=False,
+                ))
         # Only actually reviewed records qualify as diagnostic evidence. Pending
         # candidates and old blocked binding values are never promoted to navigation.
         for u in s.uses.values():
@@ -61,7 +75,6 @@ def evidence_pack(runtime, *, qid=None, fact_ids=None, extra_refs=(), final=Fals
     nav = dict(facts=nodes, binding_ports=[p for p in s.binding_ports if p["effective"]],
                links=[l for l in s.navigation_links if l["target_fact_id"] in selected
                       and set(l["source_use_ids"]) <= {n.get("use_id") for n in nodes}])
-    from .member_graph_r2 import enabled, member_projection
     if enabled(s):
         nav["members"], nav["member_edges"] = member_projection(s)
         nav["collection_scope_closed"] = s.scope_closed
@@ -85,13 +98,14 @@ def evidence_pack(runtime, *, qid=None, fact_ids=None, extra_refs=(), final=Fals
 
 def budgeted_evidence_pack(runtime, counter):
     """Deterministic view-only eviction; proofs and diagnostics are never cut."""
-    from .text_views_v52 import memory_view
     pack = evidence_pack(runtime)
     cfg, state = runtime.config, runtime.state
     def fits():
         text = memory_view(pack.model_dump(mode="json"), include_raw=not state.fact_only,
                            include_sources=not state.fact_only)
-        return counter.count(text) <= cfg.memory_token_budget if cfg.memory_token_budget is not None else len(text) <= cfg.memory_char_budget
+        if cfg.memory_token_budget is not None:
+            return counter.count(text) <= cfg.memory_token_budget
+        return len(text) <= cfg.memory_char_budget
     if fits():
         return pack
     pinned = {fid for bid in state.binding_store if binding_effective(state, bid) for fid in proof_facts(state, bid)}
@@ -130,20 +144,37 @@ def budgeted_evidence_pack(runtime, counter):
 
 
 def build_update_context(runtime, question, refs, *, counter=None):
-    wm = (budgeted_evidence_pack(runtime, counter) if counter else evidence_pack(runtime)).model_dump(mode="json")
+    pack = budgeted_evidence_pack(runtime, counter) if counter else evidence_pack(runtime)
+    wm = pack.model_dump(mode="json")
     sources = [r.model_dump(mode="json") for r in runtime.archive.fetch_sentences(refs)]
     current = set(refs)
     fact_only = runtime.state.fact_only
-    wm["raw_evidence"] = ([] if fact_only else
-                          [r for r in wm["raw_evidence"] if r["source_ref"] not in current])
-    payload = dict(question=question, state_revision=runtime.state.state_revision,
-                   query_graph=query_projection(runtime.state), working_memory=wm,
-                   visible_sources=[] if fact_only else sorted(current | {r["source_ref"] for r in wm["raw_evidence"]}),
-                   window_sources=sources, fact_only=fact_only)
-    from .member_graph_r2 import enabled
+    wm["raw_evidence"] = (
+        []
+        if fact_only
+        else [r for r in wm["raw_evidence"] if r["source_ref"] not in current]
+    )
+    visible_sources = (
+        []
+        if fact_only
+        else sorted(current | {r["source_ref"] for r in wm["raw_evidence"]})
+    )
+    payload = dict(
+        question=question,
+        state_revision=runtime.state.state_revision,
+        query_graph=query_projection(runtime.state, instantiate_members=True),
+        working_memory=wm,
+        visible_sources=visible_sources,
+        window_sources=sources,
+        fact_only=fact_only,
+    )
     payload["member_bindings"] = enabled(runtime.state)
     payload["context_id"] = "UC" + digest([runtime.run_id, payload])
-    runtime.store.save_context_manifest(runtime.run_id, payload["context_id"], {"interface": "UPDATE_SNAPSHOT", **payload})
+    runtime.store.save_context_manifest(
+        runtime.run_id,
+        payload["context_id"],
+        {"interface": "UPDATE_SNAPSHOT", **payload},
+    )
     return payload
 
 
@@ -179,7 +210,6 @@ def build_memory_context(runtime, review_id, *, batch_size=None):
     allowed_reviews = [] if fact_only else sorted({u.fact_id for u in current if u.fact_id in selected})
     scanning = any(j.target_query == r.query_id and j.kind == "RECALL" and j.status not in {"DONE", "CANCELLED"}
                    for j in s.jobs.values())
-    from .member_graph_r2 import enabled
     dynamic = enabled(s)
     collection_ready = dynamic or not query(s, r.query_id).requires_complete_set or s.scope_closed
     branch = next((b for b in r.branches if b.branch_id not in r.branch_results), None) if phase == "FINAL" else None

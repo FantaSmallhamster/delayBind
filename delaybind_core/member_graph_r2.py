@@ -4,9 +4,16 @@ Query bindings are atomic publication snapshots. Members, not snapshots, are
 the entity nodes; every member has its own facts and precise parent edges.
 """
 
+import json
+
+from .schema_r2 import (
+    BindingMemberR2,
+    BindingResult,
+    EvidencePlanR2,
+    MemberBranchR2,
+    MemberResult,
+)
 from .schema_v52 import digest
-from .schema_r2 import (EvidencePlanR2, BindingMemberR2, MemberBranchR2,
-                        BindingResult, MemberResult)
 
 
 class MemberBranchLimit(ValueError):
@@ -23,7 +30,6 @@ def scalar_value(value):
                                        {"NONE", "UNKNOWN", "NULL"} or value.lstrip().startswith("?"))):
         raise ValueError("MEMBER_REQUIRES_ONE_CONCRETE_VALUE:use_one_BOUND_line_per_member")
     # Also rejects NaN/Infinity, including values supplied by internal callers.
-    import json
     json.dumps(value, allow_nan=False)
     return value
 
@@ -34,14 +40,20 @@ def projected_value(members):
     return ordered[0] if len(ordered) == 1 else ordered
 
 
-def branches_for(state, qid, *, limit=1024):
-    """Natural join of upstream member lineages; never flatten entity values."""
+def branches_for(state, qid, *, limit=1024, allow_partial=False):
+    """Natural join of upstream member lineages; never flatten entity values.
+
+    UPDATE may project partial inputs for extraction; MEMORY still requires
+    every upstream binding to be effective before a branch can be evaluated.
+    """
     from .navigation_r2 import query, binding_effective
     q = query(state, qid)
     rows = [dict(bound_inputs={}, parent_member_ids=[], lineage={})]
     for slot, parent in sorted(q.inputs.items()):
         bid = state.executions[parent].current_binding_id
         if not binding_effective(state, bid):
+            if allow_partial:
+                continue
             return []
         members = state.binding_store[bid].members
         next_rows = []

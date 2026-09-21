@@ -1,8 +1,13 @@
 """One binding authority, shared effective predicates and dual-graph projections."""
 
 import re
-from .schema_v52 import digest
+
+from .member_graph_r2 import branches_for, enabled
 from .schema_r2 import use_key
+from .schema_v52 import digest
+
+
+VARIABLE_PATTERN = re.compile(r"\?[A-Za-z_][A-Za-z_0-9]*")
 
 
 def query(state, qid):
@@ -11,6 +16,7 @@ def query(state, qid):
 
 def topological(state):
     ordered, seen = [], set()
+
     def visit(qid):
         if qid in seen:
             return
@@ -93,22 +99,68 @@ def refresh(state):
     rebuild(state)
 
 
-def query_projection(state):
+def render_query(template, bound_inputs):
+    """Render known variables without altering unresolved placeholders."""
+    return VARIABLE_PATTERN.sub(
+        lambda match: str(bound_inputs.get(match[0], match[0])),
+        template,
+    )
+
+
+def _effective_bound_inputs(state, planned_query):
+    bound_inputs = {}
+    for slot, parent in planned_query.inputs.items():
+        binding_id = state.executions[parent].current_binding_id
+        if binding_effective(state, binding_id):
+            bound_inputs[slot] = state.binding_store[binding_id].value
+    return bound_inputs
+
+
+def _member_extraction_instances(state, planned_query):
+    return [
+        {
+            **branch.model_dump(),
+            "rendered_query": render_query(planned_query.template, branch.bound_inputs),
+        }
+        for branch in branches_for(state, planned_query.id, allow_partial=True)
+    ]
+
+
+def query_projection(state, *, instantiate_members=False):
+    """Project graph templates or compatible concrete member instances."""
     rows = []
-    for q in state.plan.queries:
-        ex = state.executions[q.id]
-        bound = {slot: state.binding_store[state.executions[parent].current_binding_id].value
-                 for slot, parent in q.inputs.items() if binding_effective(state, state.executions[parent].current_binding_id)}
-        row = {**q.model_dump(), **ex.model_dump(),
-                     "rendered_query": re.sub(r"\?[A-Za-z_][A-Za-z_0-9]*", lambda m: str(bound.get(m[0], m[0])), q.template),
-                     "bound_inputs": bound, "review_pending": bool(ex.blocking_review_ids),
-                     "effective": binding_effective(state, ex.current_binding_id),
-                     "current_value": state.binding_store[ex.current_binding_id].value if ex.current_binding_id else None}
-        from .member_graph_r2 import enabled
+    for planned_query in state.plan.queries:
+        execution = state.executions[planned_query.id]
+        bound_inputs = _effective_bound_inputs(state, planned_query)
+        row = {
+            **planned_query.model_dump(),
+            **execution.model_dump(),
+            "rendered_query": render_query(planned_query.template, bound_inputs),
+            "bound_inputs": bound_inputs,
+            "review_pending": bool(execution.blocking_review_ids),
+            "effective": binding_effective(state, execution.current_binding_id),
+            "current_value": (
+                state.binding_store[execution.current_binding_id].value
+                if execution.current_binding_id
+                else None
+            ),
+        }
         if enabled(state):
-            # Extraction/recall see the demand template, not a list pasted into
-            # an entity slot. MEMORY gets one fully instantiated branch later.
-            row.update(member_bindings=True, rendered_query=q.template, bound_inputs={})
+            # Default graph views keep the plan template. Extraction interfaces
+            # opt into compatible member instances without flattening values.
+            row.update(
+                member_bindings=True,
+                rendered_query=planned_query.template,
+                bound_inputs={},
+            )
+            if instantiate_members:
+                instances = _member_extraction_instances(state, planned_query)
+                row["extraction_instances"] = instances
+                if len(instances) == 1:
+                    row.update(
+                        rendered_query=instances[0]["rendered_query"],
+                        bound_inputs=instances[0]["bound_inputs"],
+                    )
         rows.append(row)
     return {"queries": rows, "edges": state.query_edges}
 
@@ -131,7 +183,6 @@ def rebuild(state):
             links.append(dict(binding_id=bid, target_use_id=u.use_id, target_fact_id=u.fact_id,
                               source_use_ids=b.direct_use_ids, support_group=bid,
                               query_id=u.query_id, input_signature=u.input_signature))
-    from .member_graph_r2 import enabled
     if enabled(state):
         # Aggregate query ports are routing metadata, not entity proof edges.
         # Never attach every member of a parent query to each child's fact.
@@ -153,7 +204,15 @@ def rebuild(state):
                                 source_member_id=parent_id, target_member_id=m.member_id))
     state.query_edges = edges
     state.binding_ports = [dict(e) for e in edges]
-    state.navigation_links = sorted(links, key=lambda x: (x["target_use_id"], x["binding_id"], x.get("target_member_id", ""), x.get("source_member_id", "")))
+    state.navigation_links = sorted(
+        links,
+        key=lambda item: (
+            item["target_use_id"],
+            item["binding_id"],
+            item.get("target_member_id", ""),
+            item.get("source_member_id", ""),
+        ),
+    )
     reverse = {}
     for key, u in state.uses.items():
         reverse.setdefault(u.fact_id, []).append(key)
@@ -161,7 +220,8 @@ def rebuild(state):
 
 
 def assert_invariants(state):
-    from .member_graph_r2 import enabled, assert_member_invariants
+    from .member_graph_r2 import assert_member_invariants
+
     if enabled(state):
         assert_member_invariants(state)
     projected = state.model_copy(deep=True)
@@ -182,7 +242,11 @@ def assert_invariants(state):
         if not b.valid:
             continue
         ex = state.executions[b.producer_query_id]
-        if ex.current_binding_id != b.binding_id or ex.version != b.query_version or ex.input_signature != b.input_signature:
+        if (
+            ex.current_binding_id != b.binding_id
+            or ex.version != b.query_version
+            or ex.input_signature != b.input_signature
+        ):
             raise ValueError("STALE_BINDING")
         parents = [state.executions[p].current_binding_id for p in query(state, b.producer_query_id).depends_on]
         if sorted(parents) != sorted(b.parent_binding_ids):
@@ -192,7 +256,11 @@ def assert_invariants(state):
             u = state.uses[key]
             if key != use_key(u.query_id, u.query_version, u.input_signature, u.fact_id) or u.status != "ACCEPTED":
                 raise ValueError("BINDING_SUPPORT_NOT_ACCEPTED")
-            if u.query_id != b.producer_query_id or u.query_version != b.query_version or u.input_signature != b.input_signature:
+            if (
+                u.query_id != b.producer_query_id
+                or u.query_version != b.query_version
+                or u.input_signature != b.input_signature
+            ):
                 raise ValueError("BINDING_USE_VERSION_MISMATCH")
             fact = state.facts[u.fact_id]
             if not set(fact.source_refs) <= set(u.reviewed_source_refs):

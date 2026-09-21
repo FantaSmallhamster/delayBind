@@ -384,6 +384,13 @@ def test_full_text_runner_fans_out_and_answer_receives_graph_not_flattened_names
             if interface == "UPDATE":
                 return "Q1 | Jane leads Team Red.\nQ2 | Team Red includes Alice.\nQ2 | Team Red includes Bob.\nQ3 | Alice was born in Paris.\nQ3 | Bob was born in Rome."
             if interface == "RECALL":
+                if data["query_id"] == "Q2":
+                    assert "Who are the members of Team Red?" in data["body"]
+                    assert "Who are the members of ?team?" not in data["body"]
+                if data["query_id"] == "Q3":
+                    assert "Where was Alice born?" in data["body"]
+                    assert "Where was Bob born?" in data["body"]
+                    assert "Where was ?person born?" not in data["body"]
                 return "SELECT " + ",".join(data["selectable"])
             if interface == "MEMORY":
                 assert "cardinality=" not in messages[-1]["content"]
@@ -398,7 +405,9 @@ def test_full_text_runner_fans_out_and_answer_receives_graph_not_flattened_names
                 person, city = ("Alice", "Paris") if "Alice" in q else ("Bob", "Rome")
                 return f"BOUND | {city} | " + by_text[f"{person} was born in {city}."]
             if interface == "ANSWER":
-                assert "Binding member nodes:" in data["body"] and "source_member_id=" in data["body"]
+                assert "Binding member nodes:" in data["body"] and " | parents=M" in data["body"]
+                assert "source_member_id=" not in data["body"]
+                assert " | facts=F" in data["body"]
                 return r"\boxed{Paris and Rome}"
             raise AssertionError(interface)
     client = Client()

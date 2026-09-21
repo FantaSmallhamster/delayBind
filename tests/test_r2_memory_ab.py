@@ -105,11 +105,20 @@ def test_transport_retry_never_selects_among_multiple_model_answers():
 
 
 def test_runner_records_member_version_for_new_architecture():
-    from delaybind_core.prompts_r2 import MEMBER_PROMPT_VERSION
+    from delaybind_core.prompts_r2 import (MEMBER_PROMPT_VERSION, MEMBER_UPDATE_PROMPT_VERSION,
+                                           MEMBER_RECALL_PROMPT_VERSION)
+    from delaybind_core.member_memory_view_r2 import MEMBER_MEMORY_VIEW_VERSION
     result = asyncio.run(run_smoke(outcome="replace", config=RunnerConfig(
         protocol_version="v5.2-r2", sentence_splitting=False, chunk_size=3, max_model_calls=200)))
     assert result["status"] == "ANSWERED"
     assert result["config"]["memory_bind_prompt_version"] == MEMBER_PROMPT_VERSION
+    assert result["config"]["update_prompt_version"] == MEMBER_UPDATE_PROMPT_VERSION
+    assert result["config"]["recall_prompt_version"] == MEMBER_RECALL_PROMPT_VERSION
+    assert result["config"]["memory_view_version"] == MEMBER_MEMORY_VIEW_VERSION
     requests = [m for m in result["context_manifests"] if m.get("kind") == "MODEL_REQUEST"]
     for m in requests:
-        assert m["prompt_version"] == MEMBER_PROMPT_VERSION
+        expected = (MEMBER_UPDATE_PROMPT_VERSION if m["interface"] in {"UPDATE", "UPDATE_REPAIR"}
+                    else MEMBER_RECALL_PROMPT_VERSION if m["interface"] == "RECALL"
+                    else MEMBER_PROMPT_VERSION)
+        assert m["prompt_version"] == expected
+    assert next(m for m in requests if m["interface"] == "ANSWER")["memory_view_version"] == MEMBER_MEMORY_VIEW_VERSION

@@ -1,14 +1,57 @@
 """R2 text-only prompts. Context IDs are runtime-owned local audit metadata."""
 
-from .agent_prompts_v52 import SYSTEM, RECALL, ANSWER, UPDATE as OLD_UPDATE, messages as old_messages
+from .agent_prompts_v52 import (
+    ANSWER,
+    RECALL,
+    SYSTEM,
+    UPDATE as OLD_UPDATE,
+    messages as old_messages,
+)
 from .protocol_r2 import fact_alias_map
-from .text_views_v52 import (queries_view, extraction_targets_view, update_routing_view, memory_view, raw_view,
-                             plain_text_view, facts_view, ids, display, escaped)
+from .text_views_v52 import (
+    display,
+    escaped,
+    extraction_targets_view,
+    facts_view,
+    ids,
+    memory_view,
+    plain_text_view,
+    queries_view,
+    raw_view,
+    update_routing_view,
+)
+from .update_prompt_styles import (
+    MEM0_STYLE as UPDATE_FACT_ONLY_MEM0_STYLE,
+    MEM0_STYLE_VERSION,
+)
 
 PROMPT_VERSION = "v5.2-r2-bind-rebind-text-15-high-recall-update"
 # Version only the changed interface; UPDATE and REBIND remain text-15.
 MEMORY_BIND_PROMPT_VERSION = "v5.2-r2-memory-bind-text-16-query-answer"
 MEMBER_PROMPT_VERSION = "v5.2-r2-member-graph-text-18"
+MEMBER_UPDATE_PROMPT_VERSION = "v5.2-r2-member-graph-text-19-instantiated-update"
+MEMBER_RECALL_PROMPT_VERSION = "v5.2-r2-member-graph-text-20-instantiated-recall"
+
+MEMBER_UPDATE_ROUTING_INSTRUCTION = (
+    "\nA query ID may appear on multiple target lines: each is a compatible upstream-member branch. "
+    "Match facts against any displayed branch and output the original query ID, not a new branch ID. "
+    "Concrete entities are fixed constraints for that branch; only remaining ?variables are unknown. "
+    "Do not combine inputs from different target lines or repeat an identical fact for the same query ID."
+)
+
+MEMBER_RECALL_SELECTION_INSTRUCTION = (
+    "\nCurrent query lists every compatible concrete upstream-member branch. "
+    "Treat every displayed concrete entity as a fixed constraint. Select every candidate fact "
+    "that may support, contradict, or clarify at least one displayed query; a fact need not match "
+    "all branches. Do not select a fact that matches only a different entity. MEMORY makes the "
+    "final decision separately for each branch."
+)
+
+MEMBER_INTERFACE_PROMPT_VERSIONS = {
+    "RECALL": MEMBER_RECALL_PROMPT_VERSION,
+    "UPDATE": MEMBER_UPDATE_PROMPT_VERSION,
+    "UPDATE_REPAIR": MEMBER_UPDATE_PROMPT_VERSION,
+}
 
 MEMORY_MEMBERS = """Interface MEMORY. Answer only Current query for the displayed upstream branch.
 Use Eligible facts and Effective upstream bindings. Facts must match the entity,
@@ -465,7 +508,7 @@ def _member_request_view(interface, payload):
 def prompt_version_for(interface, payload):
     original = payload.get("original_memory_request", payload)
     if original.get("member_bindings"):
-        return MEMBER_PROMPT_VERSION
+        return MEMBER_INTERFACE_PROMPT_VERSIONS.get(interface, MEMBER_PROMPT_VERSION)
     if (interface in {"MEMORY", "MEMORY_REPAIR"} and original.get("fact_only")
             and original.get("allowed_mode") == "BIND"):
         return MEMORY_BIND_PROMPT_VERSION
@@ -491,6 +534,7 @@ def messages(interface, payload):
     bind_only = fact_only and original.get("allowed_mode") == "BIND"
     memory = MEMORY_FACT_ONLY_BIND if bind_only else MEMORY_FACT_ONLY if fact_only else MEMORY
     if dynamic:
+        update += MEMBER_UPDATE_ROUTING_INSTRUCTION
         if fact_only:
             memory = MEMORY_MEMBERS
         elif original.get("phase") == "FINAL":
@@ -525,7 +569,7 @@ def messages(interface, payload):
         instruction = instruction.replace("可使用 cardinality: SET 和 requires_complete_set: true。",
             "不要输出 cardinality，也不要预定义结果数量。可用 requires_complete_set: true 标记完整枚举需求。")
     if dynamic and interface == "RECALL":
-        instruction += "\n当前可能是多成员查询模板；选择所有可能匹配该模板的具名事实，不只挑一个成员。具体分支匹配由 MEMORY 完成。"
+        instruction += MEMBER_RECALL_SELECTION_INSTRUCTION
     system = (SYSTEM_FACT_ONLY_UPDATE if fact_only and interface in {"UPDATE", "UPDATE_REPAIR"}
               else SYSTEM_FACT_ONLY_BIND if bind_only and not dynamic and interface in {"MEMORY", "MEMORY_REPAIR"}
               else SYSTEM_FACT_ONLY if fact_only else SYSTEM)

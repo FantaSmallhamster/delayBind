@@ -2,27 +2,55 @@
 
 from collections import Counter
 from dataclasses import asdict, replace
-from uuid import uuid4
 import sqlite3
+from uuid import uuid4
 
 from .agents_v52 import HighLevelAgentV52, LowLevelAgentV52
 from .archive import SentenceArchive
+from .context_r2 import (
+    budgeted_evidence_pack,
+    build_memory_context,
+    build_update_context,
+    evidence_pack,
+    persist_memory_context,
+)
 from .cursor_v52 import SentenceReadCursor
-from .schema_v52 import QueryPlanV3, digest
-from .schema_r2 import PROTOCOL, CONTRACT, UpdateResponseR2, EvidencePlanR2, member_plan, StateR2
-from .runtime_r2 import RuntimeR2
-from .navigation_r2 import query_projection
-from .context_r2 import build_update_context, build_memory_context, persist_memory_context, evidence_pack, budgeted_evidence_pack
+from .member_graph_r2 import MemberBranchLimit, projected_value
+from .member_memory_view_r2 import MEMBER_MEMORY_VIEW_VERSION
 from .memory_r2 import apply_memory
-from .review_jobs_r2 import next_job
-from .protocol_r2 import parse_update, parse_memory, RepairScope
-from .plan_repair_r2 import build_repair_context, apply_repair
-from .prompts_r2 import messages, PROMPT_VERSION, MEMORY_BIND_PROMPT_VERSION, MEMBER_PROMPT_VERSION, prompt_version_for
-from .text_protocol_v52 import parse_plan, parse_selection
-from .text_views_v52 import memory_view, raw_view, plain_text_view
-from .subquery_runner_v52 import extract_boxed, V52ResourceLimit, V52ProtocolError
-from .token_budget import TokenCounter
+from .navigation_r2 import query_projection, render_query
 from .plan_goal_r2 import normalize_evidence_collection_plan
+from .plan_repair_r2 import build_repair_context, apply_repair
+from .prompts_r2 import (
+    MEMBER_PROMPT_VERSION,
+    MEMBER_RECALL_PROMPT_VERSION,
+    MEMBER_UPDATE_PROMPT_VERSION,
+    MEMORY_BIND_PROMPT_VERSION,
+    PROMPT_VERSION,
+    messages,
+    prompt_version_for,
+)
+from .protocol_r2 import RepairScope, parse_memory, parse_update
+from .review_jobs_r2 import next_job
+from .runtime_r2 import RuntimeR2
+from .schema_r2 import (
+    CONTRACT,
+    PROTOCOL,
+    EvidencePlanR2,
+    StateR2,
+    UpdateResponseR2,
+    member_plan,
+)
+from .schema_v52 import QueryPlanV3, digest
+from .subquery_runner_v52 import extract_boxed, V52ResourceLimit, V52ProtocolError
+from .text_protocol_v52 import parse_plan, parse_selection
+from .text_views_v52 import memory_view, plain_text_view, raw_view
+from .token_budget import TokenCounter
+
+
+def _query_projection_row(state, query_id, *, instantiate_members=False):
+    graph = query_projection(state, instantiate_members=instantiate_members)
+    return next(row for row in graph["queries"] if row["id"] == query_id)
 
 
 async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=None):
@@ -84,6 +112,8 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         store.save_context_manifest(run_id, call_id, {"kind": "MODEL_REQUEST", "interface": interface,
             **audit, "plan_mode": original.get("mode", "INITIAL") if interface == "PLAN" else None,
             "prompt_version": prompt_version_for(interface, payload), "prompt_hash": digest(msg), "input_tokens": tokens,
+            "memory_view_version": (MEMBER_MEMORY_VIEW_VERSION if not cfg.sentence_splitting
+                                    and "members" in (wm or {}).get("navigation", {}) else None),
             "output_token_budget": output, "tokenizer": counter.identity,
             "raw_input_tokens": counter.count(plain_text_view(raws) if not cfg.sentence_splitting else raw_view(raws)) if raws else 0,
             "visible_source_refs": [] if not cfg.sentence_splitting else [r["source_ref"] for r in raws]})
@@ -113,7 +143,11 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         metadata["memory_bind_prompt_version"] = MEMBER_PROMPT_VERSION if isinstance(plan, EvidencePlanR2) else MEMORY_BIND_PROMPT_VERSION
     if isinstance(plan, EvidencePlanR2):
         metadata["prompt_version"] = MEMBER_PROMPT_VERSION
+        metadata["update_prompt_version"] = MEMBER_UPDATE_PROMPT_VERSION
+        metadata["recall_prompt_version"] = MEMBER_RECALL_PROMPT_VERSION
         metadata["binding_graph_contract"] = "r2-members-1"
+        if not cfg.sentence_splitting:
+            metadata["memory_view_version"] = MEMBER_MEMORY_VIEW_VERSION
     if runtime.state.run_metadata and runtime.state.run_metadata != metadata:
         raise ValueError("RESUME_CONFIGURATION_CHANGED")
     if not runtime.state.run_metadata:
@@ -176,17 +210,32 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         if old_binding is not None and ctx.fact_only:
             old_binding.pop("source_refs", None)
             old_binding.pop("decision_source_refs", None)
-        instance = next(q for q in query_projection(s)["queries"] if q["id"] == ctx.query_id)
-        display_branch = ctx.branch or (session.branches[0] if ctx.member_bindings and len(session.branches) == 1 else None)
+        instance = _query_projection_row(s, ctx.query_id)
+        display_branch = ctx.branch or (
+            session.branches[0]
+            if ctx.member_bindings and len(session.branches) == 1
+            else None
+        )
         if display_branch:
-            import re
             instance["bound_inputs"] = display_branch.bound_inputs
-            instance["rendered_query"] = re.sub(r"\?[A-Za-z_][A-Za-z_0-9]*",
-                lambda m: str(display_branch.bound_inputs.get(m[0], m[0])), instance["template"])
+            instance["rendered_query"] = render_query(
+                instance["template"], display_branch.bound_inputs
+            )
             if old_binding and ctx.branch:
-                selected = [m for m in s.binding_store[ctx.expected_binding_id].members if m.branch_id == ctx.branch.branch_id]
-                from .member_graph_r2 import projected_value
-                old_binding = {**old_binding, "value": projected_value(selected), "members": [m.model_dump() for m in selected]} if selected else None
+                selected = [
+                    member
+                    for member in s.binding_store[ctx.expected_binding_id].members
+                    if member.branch_id == ctx.branch.branch_id
+                ]
+                old_binding = (
+                    {
+                        **old_binding,
+                        "value": projected_value(selected),
+                        "members": [member.model_dump() for member in selected],
+                    }
+                    if selected
+                    else None
+                )
         return {"question": sample.question, **ctx.model_dump(mode="json"),
                 "query_instance": instance,
                 "old_binding": old_binding,
@@ -212,7 +261,6 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
                 return
             except ValueError as exc:
                 error = str(exc)
-                from .member_graph_r2 import MemberBranchLimit
                 if isinstance(exc, MemberBranchLimit):
                     raise
                 if "STALE" in error or "CONTEXT_CONSUMED" in error:
@@ -226,8 +274,17 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
             raise V52ResourceLimit("RECALL_CANDIDATE_BUDGET")
         start = job.payload["offset"]
         batch = job.payload["candidates"][start:start + cfg.candidate_batch_size]
-        payload = dict(question=sample.question, query_instance=next(q for q in query_projection(runtime.state)["queries"]
-            if q["id"] == job.target_query), candidate_batch=[], selectable_fact_ids=batch,
+        # A deferred fact is recalled against the effective member instances,
+        # not the unresolved plan template. The job itself is only runnable
+        # when every upstream dependency is effective, so these targets are
+        # fully concrete (possibly one per compatible member branch).
+        query_instance = _query_projection_row(
+            runtime.state,
+            job.target_query,
+            instantiate_members=True,
+        )
+        payload = dict(question=sample.question, query_instance=query_instance,
+            candidate_batch=[], selectable_fact_ids=batch,
             fact_only=runtime.state.fact_only,
             member_bindings=isinstance(runtime.state.plan, EvidencePlanR2),
             context_id="RC" + digest([job.job_id, start, runtime.state.state_revision]))
@@ -303,7 +360,6 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
                 runtime.state = StateR2.model_validate(store.latest_v52_state(run_id))
                 staged = runtime.state.model_copy(deep=True)
                 runtime.commit(staged, [("STALE_RESULT_REJECTED", {"reason": str(exc), "job_id": active_job})])
-            from .member_graph_r2 import MemberBranchLimit
             runtime.fail(str(exc), job_id=active_job, resource=isinstance(exc, (V52ResourceLimit, MemberBranchLimit)))
 
     pack = None

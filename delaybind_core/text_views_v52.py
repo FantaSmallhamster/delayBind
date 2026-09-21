@@ -53,17 +53,37 @@ def plain_text_view(sources):
     return "".join(rows)
 
 
+def query_targets(query):
+    """Return distinct rendered targets without merging their graph proofs.
+
+    An explicitly empty natural join is not an unresolved wildcard template.
+    Only projections without instances use the legacy single-query fallback.
+    """
+    if "extraction_instances" in query:
+        return list(dict.fromkeys(i["rendered_query"] for i in query["extraction_instances"]))
+    return [query.get("rendered_query", query.get("template", ""))]
+
+
+# Compatibility alias for callers using the original UPDATE-oriented name.
+extraction_queries = query_targets
+
+
 def queries_view(graph):
     rows = []
     for q in graph.get("queries", []):
-        rendered = q.get('rendered_query', q.get('template', ''))
-        template = q.get('template', rendered)
-        rows.append(f"{q['id']} [{q.get('status', 'ACTIVE')}] {rendered}")
-        if template != rendered:
+        rendered = q.get("rendered_query", q.get("template", ""))
+        template = q.get("template", rendered)
+        targets = query_targets(q)
+        rows.extend(f"{q['id']} [{q.get('status', 'ACTIVE')}] {target}"
+                    for target in targets or ["No compatible upstream branch."])
+        if template != rendered and "extraction_instances" not in q:
             rows.append(f"  query: {template}")
         rows += [f"  output: {q['output']}; depends_on: {ids(q.get('inputs', {}).values())}"]
         if not q.get("member_bindings"):
-            rows.append(f"  cardinality: {q.get('cardinality', 'SINGLE')}; requires_complete_set: {display(q.get('requires_complete_set', False))}")
+            rows.append(
+                f"  cardinality: {q.get('cardinality', 'SINGLE')}; "
+                f"requires_complete_set: {display(q.get('requires_complete_set', False))}"
+            )
         if q.get("bound_inputs"):
             rows.append("  bound inputs: " + display(q["bound_inputs"]))
         if q.get("current_binding_id"):
@@ -83,8 +103,7 @@ def extraction_targets_view(graph):
     """Render only extraction targets so runtime state cannot bias fact recall."""
     rows = []
     for q in graph.get("queries", []):
-        rendered = q.get("rendered_query", q.get("template", ""))
-        rows.append(f"{q['id']} | {rendered}")
+        rows.extend(f"{q['id']} | {rendered}" for rendered in query_targets(q))
     return "\n".join(rows) or "NONE"
 
 
@@ -93,8 +112,11 @@ def update_routing_view(graph):
     rows = []
     for q in queries:
         consumers = [child["id"] for child in queries if q["id"] in child.get("inputs", {}).values()]
-        rows.append(f"{q['id']} [{q.get('status', 'ACTIVE')}] evidence needed: "
-                    f"{q.get('rendered_query', q.get('template', ''))}")
+        targets = query_targets(q)
+        if not targets:
+            continue
+        rows.extend(f"{q['id']} [{q.get('status', 'ACTIVE')}] evidence needed: {target}"
+                    for target in targets)
         if consumers:
             rows.append(f"  Bridge producer for {ids(consumers)}: evidence establishing {q['output']} "
                         f"belongs to {q['id']}; do not report it only under downstream queries.")
@@ -105,6 +127,11 @@ def update_routing_view(graph):
 
 def memory_view(memory, *, include_raw=True, include_sources=True):
     nav = memory.get("navigation") or {}
+    if not include_raw and not include_sources and "members" in nav:
+        # Both prompt rendering and budget measurement use this same projection.
+        # Legacy plans and the raw-evidence protocol retain their original IDs.
+        from .member_memory_view_r2 import compact_member_memory_view
+        return compact_member_memory_view(memory)
     facts = nav.get("facts", []) if isinstance(nav, dict) else []
     rows = ["Fact navigation:", facts_view(facts, include_sources=include_sources), "", "Fact uses:"]
     rows.append("\n".join(f"{n['query_id']} | {n['fact_id']} | {n['use_status']} | {n['input_signature']}" for n in facts) or "NONE")
