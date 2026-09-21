@@ -33,6 +33,16 @@ class ENV:
     RECURRENT_MAX_CONTEXT_LEN: int = None
     RECURRENT_CHUNK_SIZE: int = None
     RECURRENT_MAX_NEW: int = None
+    V52_MEMORY_TOKENS: int = None
+    V52_MAX_REVIEW_INPUT_TOKENS: int = None
+    V52_MAX_RECALL_CANDIDATES: int = None
+    V52_MAX_CONTEXT_EXPANSIONS: int = None
+    V52_MAX_MEMORY_ROUNDS: int = None
+    V52_MAX_MODEL_CALLS: int = None
+    V52_WINDOW_MODE: str = None
+    V52_SENTENCE_SPLITTING: str = None
+    V52_R2_PLAN_REPAIR_MODE: str = None
+    V52_R2_MAX_REBIND_SESSIONS: int = None
 
     def setenv(self):
         if not hasattr(self, "_environ"):
@@ -294,6 +304,29 @@ ReMemR1_7B = Config(
     concur=256,
     env=ENV(RECURRENT_MAX_CONTEXT_LEN=100000000000, RECURRENT_CHUNK_SIZE=5000, RECURRENT_MAX_NEW=2048),
 )
+
+def v52_config(checkpoint, *, nocallback=False, concurrency=1):
+    """Construct an opt-in V5.2 evaluation without changing existing baselines."""
+    return Config(
+        name="DelayBind-v52" + ("-nocallback" if nocallback else ""),
+        ckpt=checkpoint, tp=4, method="v52", concur=concurrency,
+        env=ENV(RECURRENT_MAX_CONTEXT_LEN=32768, RECURRENT_CHUNK_SIZE=5000,
+                RECURRENT_MAX_NEW=4096, V52_WINDOW_MODE="sentence", V52_MEMORY_TOKENS=8192,
+                V52_MAX_REVIEW_INPUT_TOKENS=32768, V52_MAX_RECALL_CANDIDATES=1000,
+                V52_MAX_CONTEXT_EXPANSIONS=8, V52_MAX_MEMORY_ROUNDS=128),
+    )
+
+
+def v52_r2_config(checkpoint, *, nocallback=False, concurrency=1):
+    """Explicit R2 experiment; existing presets remain unchanged."""
+    return Config(
+        name="DelayBind-v52-r2" + ("-nocallback" if nocallback else ""),
+        ckpt=checkpoint, tp=4, method="v52_r2", concur=concurrency,
+        env=ENV(RECURRENT_MAX_CONTEXT_LEN=32768, RECURRENT_CHUNK_SIZE=5000,
+                RECURRENT_MAX_NEW=4096, V52_SENTENCE_SPLITTING="true", V52_MEMORY_TOKENS=8192,
+                V52_R2_PLAN_REPAIR_MODE="disabled"),
+    )
+
 
 CONFIGS = [
     R1_7B,

@@ -152,9 +152,18 @@ class OpenAICompatibleClient:
         response_schema: dict[str, Any] | None = None,
         extra: dict[str, Any] | None = None,
         agent_role: str | None = None,
+        local_metadata: dict[str, Any] | None = None,
     ) -> str:
+        if self.store is not None and self.store.connection.in_transaction:
+            raise RuntimeError("MODEL_CALL_DURING_RUNTIME_TRANSACTION")
+        if local_metadata is not None and set(local_metadata) - {
+                "protocol_version", "memory_mode", "review_phase", "context_id", "review_id", "raw_bundle_hash"}:
+            raise ValueError("UNKNOWN_LOCAL_AUDIT_FIELD")
         payload = self._request_payload(interface, messages, response_schema=response_schema, extra=extra)
-        serialized = json.dumps({"payload": payload, "agent_role": agent_role}, ensure_ascii=False, sort_keys=True)
+        cache_identity = {"payload": payload, "agent_role": agent_role}
+        if local_metadata:
+            cache_identity["local_metadata"] = local_metadata
+        serialized = json.dumps(cache_identity, ensure_ascii=False, sort_keys=True)
         request_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         prompt_hash = hashlib.sha256(
             json.dumps(messages, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -182,6 +191,7 @@ class OpenAICompatibleClient:
                     usage = response.get("usage") or {}
                     self.store.append_model_call(
                         ModelCall(
+                            **(local_metadata or {}),
                             call_id=call_id,
                             run_id=run_id,
                             interface=interface,  # type: ignore[arg-type]
@@ -205,6 +215,7 @@ class OpenAICompatibleClient:
                 if self.store is not None:
                     self.store.append_model_call(
                         ModelCall(
+                            **(local_metadata or {}),
                             call_id=call_id,
                             run_id=run_id,
                             interface=interface,  # type: ignore[arg-type]

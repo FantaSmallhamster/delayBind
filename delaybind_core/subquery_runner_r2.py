@@ -1,0 +1,348 @@
+"""Text-wire R2 streaming loop and durable per-query maintenance dispatcher."""
+
+from collections import Counter
+from dataclasses import asdict, replace
+from uuid import uuid4
+import sqlite3
+
+from .agents_v52 import HighLevelAgentV52, LowLevelAgentV52
+from .archive import SentenceArchive
+from .cursor_v52 import SentenceReadCursor
+from .schema_v52 import QueryPlanV3, digest
+from .schema_r2 import PROTOCOL, CONTRACT, UpdateResponseR2, EvidencePlanR2, member_plan, StateR2
+from .runtime_r2 import RuntimeR2
+from .navigation_r2 import query_projection
+from .context_r2 import build_update_context, build_memory_context, persist_memory_context, evidence_pack, budgeted_evidence_pack
+from .memory_r2 import apply_memory
+from .review_jobs_r2 import next_job
+from .protocol_r2 import parse_update, parse_memory, RepairScope
+from .plan_repair_r2 import build_repair_context, apply_repair
+from .prompts_r2 import messages, PROMPT_VERSION, MEMORY_BIND_PROMPT_VERSION, MEMBER_PROMPT_VERSION, prompt_version_for
+from .text_protocol_v52 import parse_plan, parse_selection
+from .text_views_v52 import memory_view, raw_view, plain_text_view
+from .subquery_runner_v52 import extract_boxed, V52ResourceLimit, V52ProtocolError
+from .token_budget import TokenCounter
+from .plan_goal_r2 import normalize_evidence_collection_plan
+
+
+async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=None):
+    cfg = runner.config
+    if cfg.answer_format == "auto":
+        cfg = replace(cfg, answer_format="boxed")
+    if manifest is None and (cfg.sentence_splitting or sample.context is None):
+        from .data import build_manifest
+        from .sentence_index import text_manifest
+        manifest = text_manifest(sample.context, sample_id=sample.sample_id) if sample.context is not None else build_manifest(sample)
+    if plan is not None and not isinstance(plan, (QueryPlanV3, EvidencePlanR2)):
+        raise ValueError("PLAN_PROTOCOL_MISMATCH:R2 requires QueryPlanV3 internally")
+    counter = TokenCounter(runner.tokenizer, encoding_name=cfg.tokenizer_encoding)
+    reader = runner.reader_client or runner.client
+    high, low = HighLevelAgentV52(runner.client), LowLevelAgentV52(reader)
+    archive = SentenceArchive(store, run_id)
+    saved = store.latest_v52_state(run_id)
+    if saved and plan is None:
+        plan = StateR2.model_validate(saved).plan
+    elif plan is not None and not saved:
+        plan = member_plan(plan)
+    logical_calls = sum(m.get("kind") == "MODEL_REQUEST" for m in store.list_context_manifests(run_id))
+
+    def request(interface, payload):
+        msg = messages(interface, payload)
+        return msg, counter.serialized({"messages": msg})
+
+    def memory_fits(wm):
+        rendered = memory_view(wm, include_raw=cfg.sentence_splitting,
+                               include_sources=cfg.sentence_splitting)
+        return (counter.count(rendered) <= cfg.memory_token_budget if cfg.memory_token_budget is not None
+                else len(rendered) <= cfg.memory_char_budget)
+
+    async def complete(interface, payload):
+        nonlocal logical_calls
+        reserve = 0 if interface == "ANSWER" else cfg.answer_reserve_calls
+        if logical_calls >= cfg.max_model_calls - reserve:
+            raise V52ResourceLimit("MODEL_CALL_BUDGET")
+        original = payload.get("original_memory_request", payload)
+        msg, tokens = request(interface, payload)
+        wm = original.get("working_memory")
+        final = interface == "ANSWER" or original.get("phase") == "FINAL"
+        budget_error = ("FINAL_RAW_MEMORY_BUDGET" if cfg.sentence_splitting else "FINAL_FACT_MEMORY_BUDGET") if final else "REVIEW_INPUT_BUDGET" if interface.startswith("MEMORY") else interface + "_INPUT_BUDGET"
+        if wm is not None and not memory_fits(wm):
+            raise V52ResourceLimit(budget_error)
+        limit = cfg.max_answer_input_tokens if interface == "ANSWER" else cfg.max_review_input_tokens if interface.startswith("MEMORY") else cfg.max_input_tokens
+        agent = high if interface in high.interfaces else low
+        output = getattr(getattr(agent.client, "config", None), "max_tokens", cfg.answer_reserve_tokens)
+        if interface == "ANSWER":
+            output = max(output, cfg.answer_reserve_tokens)
+        if tokens > limit or tokens + output > cfg.max_context_tokens:
+            raise V52ResourceLimit(budget_error)
+        raws = (wm or {}).get("raw_evidence", []) + original.get("window_sources", [])
+        audit = dict(protocol_version=PROTOCOL, memory_mode=original.get("allowed_mode"),
+                     review_phase=original.get("phase"), context_id=original.get("context_id"),
+                     review_id=original.get("review_id"), raw_bundle_hash=digest(raws))
+        logical_calls += 1
+        call_id = "R2CALL-" + str(uuid4())
+        store.save_context_manifest(run_id, call_id, {"kind": "MODEL_REQUEST", "interface": interface,
+            **audit, "plan_mode": original.get("mode", "INITIAL") if interface == "PLAN" else None,
+            "prompt_version": prompt_version_for(interface, payload), "prompt_hash": digest(msg), "input_tokens": tokens,
+            "output_token_budget": output, "tokenizer": counter.identity,
+            "raw_input_tokens": counter.count(plain_text_view(raws) if not cfg.sentence_splitting else raw_view(raws)) if raws else 0,
+            "visible_source_refs": [] if not cfg.sentence_splitting else [r["source_ref"] for r in raws]})
+        return await agent.call(interface, run_id=run_id, messages=msg, response_schema=None,
+                                extra={"max_tokens": output}, local_metadata=audit)
+
+    if plan is None:
+        error = None
+        for _ in range(cfg.max_plan_retries + 1):
+            try:
+                raw = await complete("PLAN", {"question": sample.question, "validation_errors": error,
+                                              "fact_only": not cfg.sentence_splitting, "member_bindings": True})
+                plan = member_plan(normalize_evidence_collection_plan(parse_plan(raw), sample.question))
+                break
+            except (ValueError, TimeoutError) as exc:
+                error = str(exc)
+        if plan is None:
+            raise V52ProtocolError("PLAN_PROTOCOL_ERROR:" + str(error))
+    runtime = RuntimeR2(run_id=run_id, plan=plan, archive=archive, store=store, config=cfg)
+    metadata = dict(protocol_version=PROTOCOL, memory_contract=CONTRACT, prompt_version=PROMPT_VERSION,
+                    question_hash=digest(sample.question),
+                    manifest_hash=digest(manifest.model_dump(mode="json") if manifest is not None else sample.context),
+                    config=asdict(cfg), tokenizer=counter.identity,
+                    high_model=getattr(getattr(runner.client, "config", None), "model", type(runner.client).__name__),
+                    low_model=getattr(getattr(reader, "config", None), "model", type(reader).__name__))
+    if not cfg.sentence_splitting:
+        metadata["memory_bind_prompt_version"] = MEMBER_PROMPT_VERSION if isinstance(plan, EvidencePlanR2) else MEMORY_BIND_PROMPT_VERSION
+    if isinstance(plan, EvidencePlanR2):
+        metadata["prompt_version"] = MEMBER_PROMPT_VERSION
+        metadata["binding_graph_contract"] = "r2-members-1"
+    if runtime.state.run_metadata and runtime.state.run_metadata != metadata:
+        raise ValueError("RESUME_CONFIGURATION_CHANGED")
+    if not runtime.state.run_metadata:
+        staged = runtime.state.model_copy(deep=True)
+        staged.run_metadata = metadata
+        runtime.commit(staged, [("RUN_CONFIGURED", metadata)])
+    if cfg.sentence_splitting:
+        cursor = SentenceReadCursor(manifest, archive, counter=counter, window_mode=cfg.window_mode,
+                                    state=runtime.state.cursor_state or None)
+    else:
+        from .cursor_legacy_v52 import LegacyReadCursor
+        cursor = LegacyReadCursor(archive, text=sample.context, sample_id=sample.sample_id, manifest=manifest,
+                                  tokenizer=runner.tokenizer, state=runtime.state.cursor_state or None)
+
+    async def update(refs):
+        payload = build_update_context(runtime, sample.question, refs, counter=counter)
+        scope, original_rejected, retained, error = None, [], [], []
+        for attempt in range(cfg.max_protocol_retries + 1):
+            data = payload if attempt == 0 else {**payload, "rejected_items": original_rejected,
+                "retained_items": retained, "repair_targets": scope.targets, "validation_errors": error}
+            raw = await complete("UPDATE" if attempt == 0 else "UPDATE_REPAIR", data)
+            try:
+                observations, rejected = parse_update(raw, payload)
+            except ValueError as exc:
+                observations, rejected = UpdateResponseR2(context_id=payload["context_id"]), [{"item": raw, "error": str(exc)}]
+            if scope is not None:
+                observations, scope_errors = scope.restrict(observations)
+                rejected.extend(scope_errors)
+            elif rejected:
+                original_rejected = rejected
+                scope = RepairScope(rejected, observations)
+            runtime.ingest(observations, payload, rejected=rejected)
+            retained.extend(f.model_dump() for f in [*observations.facts, *observations.hints])
+            if not rejected:
+                runtime.finish_window()
+                return
+            error = rejected
+        raise V52ProtocolError("UPDATE_REPAIR_EXHAUSTED")
+
+    async def repair_plan():
+        if cfg.plan_repair_mode != "on_hint" or not set(runtime.state.hints) - set(runtime.state.processed_hints):
+            return
+        ctx = build_repair_context(runtime, sample.question)
+        data = dict(ctx)
+        for _ in range(cfg.max_protocol_retries + 1):
+            raw = await complete("PLAN", data)
+            try:
+                apply_repair(runtime, raw, ctx)
+                return
+            except ValueError as exc:
+                if "STALE" in str(exc):
+                    raise
+                data["validation_errors"] = str(exc)
+        raise V52ProtocolError("PLAN_REPAIR_EXHAUSTED")
+
+    def memory_payload(ctx):
+        s = runtime.state
+        session = s.reviews[ctx.review_id]
+        old_binding = s.binding_store[ctx.expected_binding_id].model_dump() if ctx.expected_binding_id else None
+        if old_binding is not None and ctx.fact_only:
+            old_binding.pop("source_refs", None)
+            old_binding.pop("decision_source_refs", None)
+        instance = next(q for q in query_projection(s)["queries"] if q["id"] == ctx.query_id)
+        display_branch = ctx.branch or (session.branches[0] if ctx.member_bindings and len(session.branches) == 1 else None)
+        if display_branch:
+            import re
+            instance["bound_inputs"] = display_branch.bound_inputs
+            instance["rendered_query"] = re.sub(r"\?[A-Za-z_][A-Za-z_0-9]*",
+                lambda m: str(display_branch.bound_inputs.get(m[0], m[0])), instance["template"])
+            if old_binding and ctx.branch:
+                selected = [m for m in s.binding_store[ctx.expected_binding_id].members if m.branch_id == ctx.branch.branch_id]
+                from .member_graph_r2 import projected_value
+                old_binding = {**old_binding, "value": projected_value(selected), "members": [m.model_dump() for m in selected]} if selected else None
+        return {"question": sample.question, **ctx.model_dump(mode="json"),
+                "query_instance": instance,
+                "old_binding": old_binding,
+                "staged_reviews": [{**s.review_records[key].review.model_dump(),
+                    "corrected_fact_id": s.review_records[key].corrected_fact_id,
+                    "record_hash": s.review_records[key].record_hash} for key in session.staged_review_ids.values()]}
+
+    async def review(job):
+        size = cfg.candidate_batch_size
+        while True:
+            ctx = build_memory_context(runtime, job.review_id, batch_size=size)
+            payload = memory_payload(ctx)
+            if ctx.phase == "FINAL" or size == 1 or (request("MEMORY", payload)[1] <= cfg.max_review_input_tokens
+                                                    and memory_fits(payload["working_memory"])):
+                break
+            size = max(1, size // 2)
+        persist_memory_context(runtime, ctx)
+        data = payload
+        for attempt in range(cfg.max_protocol_retries + 1):
+            raw = await complete("MEMORY" if attempt == 0 else "MEMORY_REPAIR", data)
+            try:
+                apply_memory(runtime, parse_memory(raw, ctx), ctx)
+                return
+            except ValueError as exc:
+                error = str(exc)
+                from .member_graph_r2 import MemberBranchLimit
+                if isinstance(exc, MemberBranchLimit):
+                    raise
+                if "STALE" in error or "CONTEXT_CONSUMED" in error:
+                    # A repair has no power to make a stale snapshot authoritative.
+                    raise
+                data = dict(original_memory_request=payload, validation_errors=error, rejected_response=raw)
+        raise V52ProtocolError("MEMORY_PROTOCOL_ERROR:" + error)
+
+    async def recall(job):
+        if len(job.payload["candidates"]) > cfg.max_recall_candidates:
+            raise V52ResourceLimit("RECALL_CANDIDATE_BUDGET")
+        start = job.payload["offset"]
+        batch = job.payload["candidates"][start:start + cfg.candidate_batch_size]
+        payload = dict(question=sample.question, query_instance=next(q for q in query_projection(runtime.state)["queries"]
+            if q["id"] == job.target_query), candidate_batch=[], selectable_fact_ids=batch,
+            fact_only=runtime.state.fact_only,
+            member_bindings=isinstance(runtime.state.plan, EvidencePlanR2),
+            context_id="RC" + digest([job.job_id, start, runtime.state.state_revision]))
+        while True:
+            payload["candidate_batch"] = [runtime.state.facts[f].model_dump() for f in batch]
+            payload["selectable_fact_ids"] = batch
+            if len(batch) <= 1 or request("RECALL", payload)[1] <= cfg.max_input_tokens:
+                break
+            batch = batch[:max(1, len(batch) // 2)]
+        for _ in range(cfg.max_protocol_retries + 1):
+            raw = await complete("RECALL", payload)
+            try:
+                selected = parse_selection(raw).selected_fact_ids
+                if not set(selected) <= set(batch):
+                    raise ValueError("RECALL_ID_NOT_SELECTABLE")
+                runtime.finish_recall_batch(job.job_id, selected, batch_size=len(batch), expected_offset=start)
+                return
+            except ValueError as exc:
+                if "STALE" in str(exc):
+                    raise
+                payload["validation_errors"] = str(exc)
+        raise V52ProtocolError("SCAN_INCOMPLETE")
+
+    active_job = None
+
+    async def drain():
+        nonlocal active_job
+        rounds, sessions = 0, set()
+        while (job := next_job(runtime.state)) is not None:
+            if rounds >= cfg.max_memory_rounds_per_window:
+                raise V52ResourceLimit("MEMORY_ROUND_BUDGET")
+            if job.review_id and runtime.state.reviews[job.review_id].mode == "REBIND":
+                sessions.add(job.review_id)
+                if len(sessions) > cfg.max_rebind_sessions_per_window:
+                    raise V52ResourceLimit("REBIND_SESSION_BUDGET")
+            active_job = job.job_id
+            job = runtime.claim(active_job)
+            if job.kind == "CONTEXT_EXPAND":
+                try:
+                    runtime.expand_context(job.job_id)
+                except ValueError as exc:
+                    if str(exc) == "CONTEXT_EXPANSION_BUDGET":
+                        raise V52ResourceLimit(str(exc)) from exc
+                    raise
+            elif job.kind == "RECALL":
+                await recall(job)
+            else:
+                await review(job)
+            rounds += 1
+            active_job = None
+
+    if runtime.state.status == "RUNNING":
+        try:
+            if runtime.state.pending_window:
+                await update(runtime.state.pending_window)
+            await repair_plan()
+            await drain()
+            while not cursor.exhausted:
+                if cursor.window_index >= cfg.max_windows:
+                    raise V52ResourceLimit("WINDOW_BUDGET")
+                window = cursor.next_anchored_window(cfg.chunk_size)
+                runtime.record_window(window, cursor.state())
+                await update(list(window.source_refs))
+                await repair_plan()
+                await drain()
+            runtime.close_scope()
+            await drain()
+        except sqlite3.Error:
+            raise
+        except Exception as exc:
+            if "STALE" in str(exc):
+                # Reload the winner before writing diagnostics after a CAS race.
+                runtime.state = StateR2.model_validate(store.latest_v52_state(run_id))
+                staged = runtime.state.model_copy(deep=True)
+                runtime.commit(staged, [("STALE_RESULT_REJECTED", {"reason": str(exc), "job_id": active_job})])
+            from .member_graph_r2 import MemberBranchLimit
+            runtime.fail(str(exc), job_id=active_job, resource=isinstance(exc, (V52ResourceLimit, MemberBranchLimit)))
+
+    pack = None
+    try:
+        pack = budgeted_evidence_pack(runtime, counter)
+        # ANSWER still reasons over the complete working-memory view.  It is
+        # never used as a recovery shortcut after an unfinished runtime flow.
+        if runtime.state.answer is None and runtime.state.status == "RUNNING":
+            raw = await complete("ANSWER", dict(question=sample.question, working_memory=pack.model_dump(mode="json"),
+                                                 answer_contract=cfg.answer_format,
+                                                 fact_only=runtime.state.fact_only,
+                                                 member_bindings=isinstance(runtime.state.plan, EvidencePlanR2)))
+            value = extract_boxed(raw) if cfg.answer_format == "boxed" else raw.strip()
+            if not value:
+                raise ValueError("EMPTY_ANSWER")
+            answer = dict(answer=None if value == "UNKNOWN" else value, answer_type=None, source_refs=[], raw_response=raw)
+            staged = runtime.state.model_copy(deep=True)
+            staged.answer = answer
+            if staged.status == "RUNNING":
+                staged.status = "INSUFFICIENT" if answer["answer"] is None else "ANSWERED"
+            runtime.commit(staged, [("ANSWER_GENERATED", {"answer": answer})])
+    except sqlite3.Error:
+        raise
+    except Exception as exc:
+        runtime.fail(str(exc), resource=isinstance(exc, V52ResourceLimit))
+    events = store.list_runtime_events(run_id)
+    manifests = store.list_context_manifests(run_id)
+    requests = [m for m in manifests if m.get("kind") == "MODEL_REQUEST"]
+    from .replay import replay_events
+    result = dict(run_id=run_id, protocol_version=PROTOCOL, memory_contract=CONTRACT, plan_format="subqueries",
+        state=runtime.export(), status=runtime.state.status, reason_codes=runtime.state.reason_codes, answer=runtime.state.answer,
+        raw_answer=(runtime.state.answer or {}).get("raw_response"), windows_processed=cursor.window_index, windows=cursor.window_index,
+        streaming_protocol_valid=runtime.state.status in {"ANSWERED", "INSUFFICIENT"},
+        evidence_pack=pack.model_dump(mode="json") if pack else None,
+        answer_context_source_refs=[r.source_ref for r in pack.raw_evidence] if pack else [],
+        source_ref_map={r.source_ref: archive.anchor(r.source_ref).original_source_ref for r in pack.raw_evidence} if pack else {},
+        events=[e.model_dump(mode="json") for e in events], context_manifests=manifests,
+        logical_model_calls=logical_calls, interface_calls=dict(Counter(m["interface"] for m in requests)), config=metadata)
+    from .metrics_r2 import r2_metrics
+    result["r2_metrics"] = r2_metrics(runtime.state, pack, result["events"], requests)
+    result["r2_metrics"]["transaction_replay_consistency"] = float(replay_events(events).export() == runtime.export())
+    return result

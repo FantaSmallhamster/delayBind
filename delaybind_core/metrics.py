@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from .data import CanonicalSample
-from .schema import GraphQueryPlan, QueryPlan
+from .schema import GraphQueryPlan, QueryPlan, QueryPlanV3
 
 
 _PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
@@ -97,7 +97,8 @@ def triple_f1(
 def plan_relation_recall(
     predicted: QueryPlan | GraphQueryPlan | None, oracle: GraphQueryPlan | None,
 ) -> float | None:
-    if oracle is None or isinstance(predicted, QueryPlan):
+    from .schema_r2 import EvidencePlanR2
+    if oracle is None or isinstance(predicted, (QueryPlan, QueryPlanV3, EvidencePlanR2)):
         return None
     gold = {normalize_answer(pattern.relation_key) for pattern in oracle.patterns}
     if not gold:
@@ -233,6 +234,25 @@ def verifier_metrics(
 
 def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, Any]:
     """Score one method result while preserving diagnostic fields."""
+    if result.get("protocol_version") in {"v5.2", "v5.2-r2"}:
+        answer = result.get("answer") or {}
+        prediction = answer.get("answer")
+        gold = sample.answers or ([sample.answer] if sample.answer is not None else [])
+        mapping = result.get("source_ref_map", {})
+        refs = {mapping[r] for r in answer.get("source_refs", []) if r in mapping}
+        precision, recall, f1 = source_ref_f1(refs, gold_source_refs(sample))
+        return {**result, "prediction": prediction, "gold_answers": gold,
+                "answer_exact": answer_exact(prediction, gold), "answer_token_f1": answer_token_f1(prediction, gold),
+                "abstained": prediction is None, "predicted_source_refs": sorted(refs),
+                "gold_source_refs": sorted(gold_source_refs(sample)),
+                "supporting_precision": precision if sample.supporting_facts else None,
+                "supporting_recall": recall if sample.supporting_facts else None,
+                "supporting_f1": f1 if sample.supporting_facts else None,
+                "runtime_status": result.get("state", {}).get("status", result.get("status")),
+                "run_success": result.get("state", {}).get("status") in {"ANSWERED", "INSUFFICIENT"},
+                "windows_processed": result.get("windows"), **result.get("v52_metrics", {}), **result.get("r2_metrics", {}),
+                "verifier_precision": None, "verifier_recall": None, "verifier_f1": None,
+                "graph_triple_f1": None, "triple_event_f1": None}
     method = str(result.get("method", "v5"))
     prediction = _direct_predicted_answer(result) if method.startswith("direct") else _v5_predicted_answer(result)
     gold = sample.answers or ([sample.answer] if sample.answer is not None else [])
@@ -438,6 +458,10 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "unsupported_rate": status_counts.get("UNSUPPORTED", 0) / len(items),
                 "resource_limit_rate": status_counts.get("RESOURCE_LIMIT", 0) / len(items),
                 "runtime_status_counts": dict(sorted(status_counts.items())),
+                **{key: mean(items, key) for key in (
+                    "anchor_valid_rate", "raw_coverage_of_accepted_facts", "raw_coverage_of_binding_support",
+                    "recall_scan_completion", "source_review_acceptance", "dual_graph_consistency",
+                    "stale_binding_rate", "transaction_replay_consistency")},
             }
         )
     gaps: dict[str, float] = {}

@@ -119,6 +119,12 @@ It includes components from [MemAgent](https://github.com/BytedTsinghua-SIA/MemA
 
 ## V5 Design and Implementation
 
+V5.2 is available as an opt-in extension on the V5.1 `solitary-dingo` baseline
+(`81dc262`). It adds raw-first MEMORY review, scoped fact uses, atomic dual-graph
+bindings, sentence anchors and replayable transactions. The default V5.1 path
+and its published results remain unchanged. See [`V52_RUNTIME.md`](V52_RUNTIME.md)
+for configuration, recovery, budgets, acceptance tests and evaluation limits.
+
 The completed V5.1 protocol-v4 experiment on 128 seed-4 2Wiki questions (50 documents each)
 is archived with **52.34% EM and 59.21% F1**. See the
 [report](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/REPORT.md),
@@ -154,6 +160,12 @@ This project includes a `.claude/` directory with structured guidance for AI cod
 - **`.claude/skills/add-new-task.md`** — Guide for adding new tasks and datasets
 
 These files help AI agents understand the codebase structure and make targeted modifications without extensive context exploration.
+
+DelayBind's opt-in R2 binding/rebinding runtime, text protocol, segmentation switch
+and validation commands are documented in [V52_R2_RUNTIME.md](V52_R2_RUNTIME.md).
+Historical V5.1 / graph and V5.2 paths remain separately available.
+For R2, `sentence_splitting=true` keeps raw-backed review, while
+`sentence_splitting=false` selects the source-free fact-only UPDATE/MEMORY/ANSWER path.
 
 ## Citation
 

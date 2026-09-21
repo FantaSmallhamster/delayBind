@@ -286,3 +286,12 @@ URL、HTTP Host 和 TLS 证书校验仍使用原域名，不修改系统 DNS，�
 
 历史图实验仍显式使用 `plan_format="graph"`；本页说明的是默认 V5.1 路径。
 测试覆盖流程正确性，不代表已经用真实模型证明准确率或成本改善。
+# V5.2 extension
+
+This document describes the retained V5.1 runtime. For the opt-in raw-first
+V5.2 protocol, see [V52_RUNTIME.md](V52_RUNTIME.md). V5.2 uses separate versioned
+modules and does not silently reinterpret V5.1 plans or recorded runs.
+
+The separately versioned `v5.2-r2` path uses text BIND/REBIND blocks and durable
+downstream invalidation. Its segmentation switch selects either staged raw review
+or a source-free fact-only path. See [V52_R2_RUNTIME.md](V52_R2_RUNTIME.md).

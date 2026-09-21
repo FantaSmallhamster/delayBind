@@ -27,6 +27,7 @@ async def async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95, s
         top_p=top_p, seed=None, max_tokens=RECURRENT_MAX_NEW,
     ), store=store)
     runner = V5Runner(client, tokenizer=tokenizer, config=RunnerConfig(
+        protocol_version="v5.1",
         chunk_size=RECURRENT_CHUNK_SIZE, answer_format="boxed",
         max_model_calls=int(os.environ.get("V51_MAX_MODEL_CALLS", "1000")),
         memory_token_budget=int(os.environ.get("V51_MEMORY_TOKENS", "8192")),

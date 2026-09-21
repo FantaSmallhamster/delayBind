@@ -85,9 +85,18 @@ def _api_config(config: dict[str, Any], *, default_seed: int = 4) -> APIConfig:
     )
 
 
-def _run_from_config(config_path: str | Path) -> dict[str, Any]:
+def _with_sentence_splitting(config: dict[str, Any], enabled: bool | None) -> dict[str, Any]:
+    if enabled is None:
+        return config
+    if config.get("runner"):
+        return {**config, "runner": {**config["runner"], "sentence_splitting": enabled}}
+    return {**config, "sentence_splitting": enabled}
+
+
+def _run_from_config(config_path: str | Path, *, sentence_splitting: bool | None = None, protocol_version: str | None = None) -> dict[str, Any]:
     _load_env_file()
-    config = _load_config(config_path)
+    config = _with_sentence_splitting(_load_config(config_path), sentence_splitting)
+    config = _with_protocol(config, protocol_version)
     dataset_id = str(config.get("dataset_id", "2wiki"))
     if config.get("item") is not None:
         samples = [canonicalize_record(config["item"], dataset_id=dataset_id)]
@@ -132,39 +141,18 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
     if config.get("plan") or config.get("plan_path"):
         plan_path = config.get("plan") or config.get("plan_path")
         plan_text = Path(plan_path).read_text(encoding="utf-8")
-        plan = parse_query_plan(json.loads(plan_text)) if plan_text.lstrip().startswith("{") else parse_plan(plan_text)
+        if plan_text.lstrip().startswith("{"):
+            plan = parse_query_plan(json.loads(plan_text))
+        elif (config.get("runner") or config).get("protocol_version") in {"v5.2", "v5.2-r2"}:
+            from .text_protocol_v52 import parse_plan as parse_v3_text_plan
+            plan = parse_v3_text_plan(plan_text)
+        else:
+            plan = parse_plan(plan_text)
     runner = V5Runner(
         client,
         reader_client=reader_client,
         tokenizer=tokenizer,
-        config=RunnerConfig(
-            plan_format=str(config.get("plan_format", "subqueries")),
-            chunk_size=int(config.get("chunk_size", 5000)),
-            answer_mode=str(config.get("answer_mode", "runtime")),
-            max_windows=int(config.get("max_windows", 100000)),
-            max_verify_candidates=int(config.get("max_verify_candidates", 1000)),
-            max_plan_retries=int(config.get("max_plan_retries", 1)),
-            max_model_calls=int(config.get("max_model_calls", 1000)),
-            snapshot_every_windows=int(config.get("snapshot_every_windows", 1)),
-            verify_committed=bool(config.get("verify_committed", True)),
-            max_graph_claims=int(config.get("max_graph_claims", 128)),
-            defer_unbound=bool(config.get("defer_unbound", True)),
-            max_verify_expansions=int(config.get("max_verify_expansions", 1)),
-            verify_expansion_limit=int(config.get("verify_expansion_limit", 32)),
-            require_evidence_sources=bool(config.get("require_evidence_sources", True)),
-            min_streaming_windows=int(config.get("min_streaming_windows", 0)),
-            query_graph_mode=str(config.get("query_graph_mode", "open")),
-            require_source_span=bool(config.get("require_source_span", True)),
-            callback_retrieval_limit=int(config.get("callback_retrieval_limit", 16)),
-            max_targeted_updates=int(config.get("max_targeted_updates", 16)),
-            candidate_batch_size=int(config.get("candidate_batch_size", 32)),
-            verify_source_neighborhood=int(config.get("verify_source_neighborhood", 0)),
-            max_response_retries=int(config.get("max_response_retries", 1)),
-            memory_token_budget=(int(config["memory_token_budget"]) if config.get("memory_token_budget") is not None else None),
-            memory_char_budget=int(config.get("memory_char_budget", 24000)),
-            answer_format=str(config.get("answer_format", "auto")),
-            enable_defer_callback=bool(config.get("enable_defer_callback", True)),
-        ),
+        config=RunnerConfig.from_mapping(config.get("runner") or config),
     )
     run_id = str(config.get("run_id") or f"{sample.sample_id}-{manifest.manifest_id if manifest else 'text'}")
     result = asyncio.run(
@@ -177,6 +165,14 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     store.close()
     return result
+
+
+def _with_protocol(config, version):
+    if version is None:
+        return config
+    if config.get("runner"):
+        return {**config, "runner": {**config["runner"], "protocol_version": version}}
+    return {**config, "protocol_version": version}
 
 
 def _load_tokenizer(path: str | None):
@@ -223,6 +219,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     experiment = sub.add_parser("experiment")
     experiment.add_argument("--config", required=True)
+    for command in (run, experiment):
+        command.add_argument("--protocol-version", choices=["v5", "v5.1", "v5.2", "v5.2-r2"], default=None)
+        command.add_argument("--sentence-splitting", action=argparse.BooleanOptionalAction, default=None,
+                             help="V5.2: enable sentence indexing (default), or --no-sentence-splitting for V5.1 windows")
 
     oracle = sub.add_parser("compile-oracle-plans")
     oracle.add_argument("--input", required=True)
@@ -257,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.output).write_text(json.dumps(state.export(), ensure_ascii=False, indent=2), encoding="utf-8")
         return 0
     if args.command == "run":
-        result = _run_from_config(args.config)
+        result = _run_from_config(args.config, sentence_splitting=args.sentence_splitting, protocol_version=args.protocol_version)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "compile-oracle-plans":
@@ -272,7 +272,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "experiment":
         _load_env_file()
-        raw_config = _load_config(args.config)
+        raw_config = _with_sentence_splitting(_load_config(args.config), args.sentence_splitting)
+        raw_config = _with_protocol(raw_config, args.protocol_version)
         config = ExperimentConfig.from_mapping(raw_config)
         summary = asyncio.run(
             run_experiment(

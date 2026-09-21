@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -25,6 +25,7 @@ class ManifestEntry(BaseModel):
     char_end: int | None = None
     text_sha256: str | None = None
     context_only: bool = False
+    coordinate_space: Literal["dataset_sentence", "document"] = "dataset_sentence"
 
     @model_validator(mode="after")
     def ensure_hash(self) -> "ManifestEntry":
@@ -90,3 +91,22 @@ class Manifest(BaseModel):
             entries=list(entries),
             metadata=metadata or {},
         )
+
+class SentenceAnchor(BaseModel):
+    """Immutable index metadata; original characters live in raw_blocks."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    source_ref: str
+    source_version: str
+    document_id: str
+    sentence_id: int
+    kind: Literal["sentence", "fragment", "heading", "chunk"] = "sentence"
+    coordinate_space: Literal["dataset_sentence", "document", "document_title", "context"]
+    original_char_start: int
+    original_char_end: int
+    raw_block_refs: tuple[str, ...]
+    text_sha256: str
+    first_seen_window: int
+    segmentation_version: str
+    complete: bool = True
+    original_source_ref: str | None = None

@@ -49,8 +49,18 @@ from .schema import (
     VerifyStatus,
 )
 from .storage import SQLiteEventStore
+from .archive import SentenceArchive
+from .cursor_v52 import TextReadCursor as TextReadCursorV52
+from .subqueries_v52 import SubqueryRuntime as SubqueryRuntimeV52
+from .schema_v52 import QueryPlanV3, BindingRecord, EvidencePackV52, MemoryContext, RawEvidence
+
+from .runtime_r2 import RuntimeR2
+from .schema_r2 import StateR2, MemoryResponseR2, UpdateResponseR2
 
 __all__ = [
+    "RuntimeR2", "StateR2", "MemoryResponseR2", "UpdateResponseR2",
+    "SentenceArchive", "TextReadCursorV52", "SubqueryRuntimeV52", "QueryPlanV3",
+    "BindingRecord", "EvidencePackV52", "MemoryContext", "RawEvidence",
     "Action",
     "HighLevelAgent",
     "LowLevelAgent",

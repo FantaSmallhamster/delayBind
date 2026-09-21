@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from .schema import GraphQueryPlan, QueryPlan
+from .schema import GraphQueryPlan, QueryPlan, QueryPlanV3
 
 
 _VARIABLE = re.compile(r"^\?[A-Za-z_][A-Za-z0-9_]*$")
@@ -57,6 +57,14 @@ def validate_plan(
     require_answer_contract: bool = True,
     require_answer_target: bool = True,
 ) -> list[PlanIssue]:
+    from .schema_r2 import EvidencePlanR2
+    if isinstance(plan, EvidencePlanR2):
+        EvidencePlanR2.model_validate(plan.model_dump())
+        return []
+    if isinstance(plan, QueryPlanV3):
+        # V3 enforces inputs, producers, cardinality and DAG invariants in its schema.
+        QueryPlanV3.model_validate(plan.model_dump())
+        return []
     if isinstance(plan, QueryPlan):
         return validate_subquery_plan(plan)
     issues: list[PlanIssue] = []

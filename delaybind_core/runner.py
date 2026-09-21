@@ -34,6 +34,7 @@ from .schema import (
     EdgeFillResponse,
     GraphQueryPlan,
     QueryPlan,
+    QueryPlanV3,
     TripleEvent,
     VerifyDecision,
     UpdateResponse,
@@ -47,6 +48,7 @@ from .text_match import contains_normalized_span
 
 @dataclass(frozen=True)
 class RunnerConfig:
+    protocol_version: str = "v5.1"
     plan_format: str = "subqueries"
     chunk_size: int = 5000
     answer_mode: str = "runtime"
@@ -73,8 +75,64 @@ class RunnerConfig:
     memory_char_budget: int = 24000
     answer_format: str = "auto"
     enable_defer_callback: bool = True
+    sentence_splitting: bool = True
+    window_mode: str = "sentence"
+    tokenizer_encoding: str = "cl100k_base"
+    max_recall_candidates: int = 1000
+    max_review_input_tokens: int = 32768
+    max_input_tokens: int = 32768
+    max_answer_input_tokens: int = 32768
+    max_context_tokens: int = 65536
+    max_memory_rounds_per_window: int = 128
+    max_context_expansions: int = 8
+    source_context_before: int = 1
+    source_context_after: int = 1
+    answer_reserve_calls: int = 1
+    answer_reserve_tokens: int = 512
+    max_protocol_retries: int = 1
+    memory_contract: str = "bind-rebind-1"
+    rebind_policy: str = "raw_review"
+    memory_batching: str = "query_scoped"
+    proof_change_policy: str = "invalidate_descendants"
+    plan_repair_mode: str = "disabled"
+    max_rebind_sessions_per_window: int = 64
+
+    def protocol_mapping(self, *, include_r2=False):
+        """Do not perturb historical fingerprints with unused R2-only defaults."""
+        from dataclasses import asdict
+        result = asdict(self)
+        if self.protocol_version != "v5.2-r2" and not include_r2:
+            for key in ("memory_contract", "rebind_policy", "memory_batching", "proof_change_policy",
+                        "plan_repair_mode", "max_rebind_sessions_per_window"):
+                result.pop(key)
+        return result
 
     def __post_init__(self) -> None:
+        if not isinstance(self.sentence_splitting, bool):
+            raise ValueError("sentence_splitting must be a boolean")
+        if self.protocol_version not in {"v5", "v5.1", "v5.2", "v5.2-r2"}:
+            raise ValueError("unknown protocol_version")
+        if self.protocol_version in {"v5.2", "v5.2-r2"} and self.plan_format != "subqueries":
+            raise ValueError("v5.2 requires plan_format=subqueries")
+        if self.protocol_version in {"v5.2", "v5.2-r2"}:
+            if self.window_mode not in {"sentence", "fragment"}:
+                raise ValueError("invalid window_mode")
+            for name in ("max_recall_candidates", "max_review_input_tokens", "max_input_tokens",
+                         "max_answer_input_tokens", "max_context_tokens", "max_memory_rounds_per_window",
+                         "answer_reserve_calls", "answer_reserve_tokens"):
+                if getattr(self, name) <= 0:
+                    raise ValueError(f"{name} must be positive")
+            for name in ("max_context_expansions", "source_context_before", "source_context_after", "max_protocol_retries"):
+                if getattr(self, name) < 0:
+                    raise ValueError(f"{name} must be nonnegative")
+        if self.protocol_version == "v5.2-r2":
+            if (self.memory_contract, self.rebind_policy, self.memory_batching, self.proof_change_policy) != (
+                    "bind-rebind-1", "raw_review", "query_scoped", "invalidate_descendants"):
+                raise ValueError("unsupported R2 contract or policy")
+            if self.plan_repair_mode not in {"disabled", "on_hint"} or self.max_rebind_sessions_per_window <= 0:
+                raise ValueError("invalid R2 repair mode or review session budget")
+            if self.answer_format == "json":
+                raise ValueError("R2 uses text model I/O; choose auto, boxed, or text")
         if self.candidate_batch_size <= 0 or self.chunk_size <= 0:
             raise ValueError("candidate_batch_size and chunk_size must be positive")
         if self.answer_format not in {"auto", "boxed", "text", "json"}:
@@ -83,6 +141,28 @@ class RunnerConfig:
             raise ValueError("retry and source neighborhood limits must be nonnegative")
         if self.memory_char_budget <= 0 or self.memory_token_budget is not None and self.memory_token_budget <= 0:
             raise ValueError("memory budgets must be positive")
+
+    @classmethod
+    def from_mapping(cls, value):
+        from dataclasses import fields
+        values = {}
+        for field in fields(cls):
+            if field.name not in value:
+                continue
+            raw = value[field.name]
+            if field.name == "sentence_splitting":
+                if isinstance(raw, str) and raw.lower() in {"true", "false", "1", "0", "on", "off"}:
+                    raw = raw.lower() in {"true", "1", "on"}
+                if not isinstance(raw, bool):
+                    raise ValueError("sentence_splitting must be true or false")
+                values[field.name] = raw
+                continue
+            if str(field.type) == "int | None":
+                values[field.name] = int(raw) if raw is not None else None
+            else:
+                convert = {"int": int, "bool": bool, "str": str}.get(str(field.type))
+                values[field.name] = convert(raw) if convert else raw
+        return cls(**values)
 
 
 class ModelBudgetExceeded(RuntimeError):
@@ -110,7 +190,7 @@ class V5Runner:
         sample: CanonicalSample | None = None,
         manifest: Manifest | None = None,
         store: SQLiteEventStore,
-        plan: QueryPlan | GraphQueryPlan | None = None,
+        plan: QueryPlan | GraphQueryPlan | QueryPlanV3 | None = None,
         item: dict[str, Any] | None = None,
         question: str | None = None,
         context: str | None = None,
@@ -126,6 +206,20 @@ class V5Runner:
                 raise ValueError("provide sample, a ReMemR1 item, or question and context")
         elif item is not None or question is not None or context is not None:
             raise ValueError("choose one input form")
+        expected_event_schema = self.config.protocol_version if self.config.protocol_version in {"v5.2", "v5.2-r2"} else "v1"
+        if any(e.schema_version != expected_event_schema for e in store.list_runtime_events(run_id)):
+            raise ValueError("RUN_PROTOCOL_VERSION_MISMATCH: use a new run_id for a new protocol")
+        if self.config.protocol_version == "v5.2-r2":
+            from .subquery_runner_r2 import run_subqueries_r2
+            return await run_subqueries_r2(self, run_id=run_id, sample=sample, manifest=manifest, store=store, plan=plan)
+        from .schema_r2 import EvidencePlanR2
+        if isinstance(plan, EvidencePlanR2):
+            raise ValueError("PLAN_PROTOCOL_MISMATCH: member graphs require protocol_version=v5.2-r2")
+        if self.config.protocol_version == "v5.2":
+            from .subquery_runner_v52 import run_subqueries_v52
+            return await run_subqueries_v52(self, run_id=run_id, sample=sample, manifest=manifest, store=store, plan=plan)
+        if isinstance(plan, QueryPlanV3):
+            raise ValueError("PLAN_PROTOCOL_MISMATCH: v3 requires protocol_version=v5.2")
         if self.config.plan_format not in {"subqueries", "graph"}:
             raise ValueError("plan_format must be 'subqueries' or 'graph'")
         if isinstance(plan, QueryPlan) or (plan is None and self.config.plan_format == "subqueries"):

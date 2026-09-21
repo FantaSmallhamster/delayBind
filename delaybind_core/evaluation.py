@@ -25,6 +25,8 @@ from .storage import SQLiteEventStore
 
 
 SUPPORTED_METHODS = {
+    "v52_predicted", "v52_no_callback", "v52_no_defer",
+    "v52_r2_predicted", "v52_r2_no_callback", "v52_r2_no_defer",
     "direct_full_context",
     "v5_predicted",
     "v5_oracle",
@@ -65,34 +67,7 @@ class ExperimentConfig:
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ExperimentConfig":
         runner_raw = value.get("runner") or value
-        runner = RunnerConfig(
-            plan_format=str(runner_raw.get("plan_format", "subqueries")),
-            chunk_size=int(runner_raw.get("chunk_size", 5000)),
-            answer_mode=str(runner_raw.get("answer_mode", "runtime")),
-            max_windows=int(runner_raw.get("max_windows", 100000)),
-            max_verify_candidates=int(runner_raw.get("max_verify_candidates", 1000)),
-            max_plan_retries=int(runner_raw.get("max_plan_retries", 1)),
-            max_model_calls=int(runner_raw.get("max_model_calls", 1000)),
-            snapshot_every_windows=int(runner_raw.get("snapshot_every_windows", 1)),
-            verify_committed=bool(runner_raw.get("verify_committed", True)),
-            max_graph_claims=int(runner_raw.get("max_graph_claims", 128)),
-            defer_unbound=bool(runner_raw.get("defer_unbound", True)),
-            max_verify_expansions=int(runner_raw.get("max_verify_expansions", 1)),
-            verify_expansion_limit=int(runner_raw.get("verify_expansion_limit", 32)),
-            require_evidence_sources=bool(runner_raw.get("require_evidence_sources", True)),
-            min_streaming_windows=int(runner_raw.get("min_streaming_windows", 0)),
-            query_graph_mode=str(runner_raw.get("query_graph_mode", "open")),
-            require_source_span=bool(runner_raw.get("require_source_span", True)),
-            callback_retrieval_limit=int(runner_raw.get("callback_retrieval_limit", 16)),
-            max_targeted_updates=int(runner_raw.get("max_targeted_updates", 16)),
-            candidate_batch_size=int(runner_raw.get("candidate_batch_size", 32)),
-            verify_source_neighborhood=int(runner_raw.get("verify_source_neighborhood", 0)),
-            max_response_retries=int(runner_raw.get("max_response_retries", 1)),
-            memory_token_budget=(int(runner_raw["memory_token_budget"]) if runner_raw.get("memory_token_budget") is not None else None),
-            memory_char_budget=int(runner_raw.get("memory_char_budget", 24000)),
-            answer_format=str(runner_raw.get("answer_format", "auto")),
-            enable_defer_callback=bool(runner_raw.get("enable_defer_callback", True)),
-        )
+        runner = RunnerConfig.from_mapping(runner_raw)
         methods = tuple(str(item) for item in value.get("methods", cls.methods))
         orders = tuple(str(item) for item in value.get("orders", cls.orders))
         unknown_methods = set(methods) - SUPPORTED_METHODS
@@ -211,7 +186,7 @@ class ExperimentHarness:
 
     def _resolved_config(self) -> dict[str, Any]:
         resolved = asdict(self.config)
-        resolved["runner"] = asdict(self.config.runner)
+        resolved["runner"] = self.config.runner.protocol_mapping(include_r2=any(m.startswith("v52_r2_") for m in self.config.methods))
         resolved["api"] = self.api_metadata
         resolved["reader_api"] = (
             {key: value for key, value in asdict(self.reader_api_config).items() if key != "api_key"}
@@ -401,6 +376,9 @@ class ExperimentHarness:
                     plan_valid = True
                 runner_config = replace(
                     self.config.runner,
+                    protocol_version="v5.2-r2" if method.startswith("v52_r2_") else "v5.2" if method.startswith("v52_") else self.config.runner.protocol_version,
+                    plan_format="subqueries" if method.startswith("v52_") else self.config.runner.plan_format,
+                    enable_defer_callback=False if method in {"v52_no_callback", "v52_r2_no_callback"} else self.config.runner.enable_defer_callback,
                     defer_unbound=not method.endswith("no_defer"),
                     query_graph_mode=("flat" if "_flat" in method else self.config.runner.query_graph_mode),
                 )
@@ -423,7 +401,7 @@ class ExperimentHarness:
                     "order": order,
                     "manifest_id": manifest.manifest_id,
                     "plan_valid": plan_valid,
-                    "status": "OK",
+                    "status": "ERROR" if result.get("status") in {"RESOURCE_LIMIT", "RUNTIME_ERROR"} else "OK",
                 }
             )
         except Exception as exc:
@@ -497,6 +475,8 @@ class ExperimentHarness:
                     "method": method,
                     "order": order,
                     "manifest_path": str(manifest_path),
+                    "protocol_version": result.get("protocol_version", self.config.runner.protocol_version),
+                    "context_manifests": result.get("context_manifests", []),
                     "events": events,
                     "model_calls": calls,
                     "state": result.get("state"),
