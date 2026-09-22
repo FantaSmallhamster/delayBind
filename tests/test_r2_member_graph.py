@@ -15,7 +15,7 @@ from delaybind_core.memory_r2 import apply_memory
 from delaybind_core.member_graph_r2 import branches_for, MemberBranchLimit
 from delaybind_core.navigation_r2 import assert_invariants
 from delaybind_core.replay import replay_events
-from delaybind_core.prompts_r2 import messages, MEMBER_PROMPT_VERSION
+from delaybind_core.prompts_r2 import messages, MEMBER_MEMORY_PROMPT_VERSION
 from test_r2_core import fixture, context, recall_all, review_all
 
 
@@ -206,7 +206,31 @@ def test_prompts_no_fixed_cardinality_and_parser_preserves_legacy_only_for_old_p
     payload = dict(question="Test?", **ctx.model_dump(), query_instance=query_projection(r.state)["queries"][0], old_binding=None)
     text = messages("MEMORY", payload)[1]["content"]
     assert "cardinality=" not in text and "SINGLE" not in text
-    assert MEMBER_PROMPT_VERSION in text and "one line per result" in text
+    assert MEMBER_MEMORY_PROMPT_VERSION in text and "one line per result" in text
+
+
+def test_member_plan_prompt_matches_v51_request_and_retry():
+    from delaybind_core.agent_prompts import EVIDENCE_ONLY_PLAN_VERSION, plan_prompt
+    from delaybind_core.prompts_r2 import prompt_version_for
+
+    payload = {"question": "Who directed Film Aspen?", "fact_only": True, "member_bindings": True}
+    expected = plan_prompt(payload["question"], evidence_only=True)
+    assert messages("PLAN", payload) == [{"role": "user", "content": expected}]
+    assert prompt_version_for("PLAN", payload) == EVIDENCE_ONLY_PLAN_VERSION
+    assert "Do not add intermediate reasoning or calculation queries." in expected
+    assert "comparison, collect the relevant facts" in expected
+    assert "For a final count, collect the members" in expected
+    assert "depends_on must list exactly the producer query IDs" in expected
+    assert "ordering-only dependencies" in expected
+    assert "requires_complete_set" not in expected
+    assert "Add an intermediate reasoning query only" in plan_prompt(payload["question"])
+    assert "requires_complete_set: true" in plan_prompt(payload["question"])
+    repair = messages("PLAN", {**payload, "validation_errors": ["bad dependency"]})
+    assert repair[0]["content"] == (
+        expected
+        + "\nYour previous output was invalid: bad dependency"
+          "\nReturn a corrected complete response in the specified format."
+    )
 
 
 def test_branch_budget_is_explicit_not_silent_truncation():

@@ -137,6 +137,7 @@ class MemoryResponseR2(Strict):
     review_id: str
     operations: list[MemoryAction] = Field(min_length=1, max_length=1)
     ignored_lines: list[dict[str, str]] = Field(default_factory=list)
+    format_normalizations: list[dict[str, str]] = Field(default_factory=list)
 
 
 class Route(Strict):

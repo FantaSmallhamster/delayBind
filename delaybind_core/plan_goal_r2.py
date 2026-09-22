@@ -1,71 +1,47 @@
-"""Keep R2 plans as evidence-collection plans, matching the V5.1 contract."""
+"""Validate V5.1 PLAN structure and adapt it to R2 member inputs."""
 
 from __future__ import annotations
 
 import re
 
-
-def _normalized(text: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
-
-
-def _intent(text: str) -> str | None:
-    value = _normalized(text)
-    if ((value.startswith("where ") and " born" in value) or "birthplace" in value
-            or "place of birth" in value):
-        return "BIRTHPLACE"
-    if ((value.startswith("when ") and " born" in value) or "date of birth" in value
-            or "birth date" in value):
-        return "BIRTH_DATE"
-    if value.startswith("where ") and (" die" in value or "death place" in value):
-        return "DEATH_PLACE"
-    if value.startswith("when ") and (" die" in value or "death date" in value):
-        return "DEATH_DATE"
-    if value.startswith("where ") and (" work" in value or "employed" in value):
-        return "WORKPLACE"
-    if value.startswith("how many ") or "number of" in value:
-        return "COUNT"
-    if re.match(r"^(are|is|do|does|did|was|were|can|could|has|have|had|will|would|should)\b", value):
-        return "YES_NO"
-    return None
+from .fact_protocol import parse_plan as parse_v51_plan
+from .plan_validation import ensure_valid_plan
+from .schema_r2 import EvidencePlanR2
 
 
-def _terminal_computation_ids(plan, question: str) -> set[str]:
-    """Find model-added terminal comparison/count nodes.
+def _dependency_ids(values: set[str]) -> str:
+    return ",".join(sorted(values)) or "NONE"
 
-    The original V5.1 PLAN contract collects evidence and delegates a final
-    comparison or calculation to ANSWER.  A terminal node is safe to remove
-    only when its inputs are already produced by upstream evidence queries;
-    those upstream queries (including their cardinalities) remain untouched.
+
+def parse_v51_member_plan(raw: str, question: str) -> EvidencePlanR2:
+    """Use V5.1 PLAN parsing/validation, then adapt evidence hops to R2.
+
+    R2's member graph substitutes only variables explicitly present in a
+    query. Dependencies must match those producer inputs exactly; reject
+    mismatches with a specific repair error instead of rewriting them.
+    No query is classified, removed, or rewritten by semantic heuristics.
     """
-    parents = {parent for q in plan.queries for parent in q.depends_on}
-    leaves = [q for q in plan.queries if q.id not in parents]
-    expected = _intent(question)
-    if expected not in {"YES_NO", "COUNT"}:
-        return set()
-    found = set()
-    for leaf in leaves:
-        if _intent(leaf.template) != expected or not leaf.depends_on:
-            continue
-        # Counting an already-collected set is always a final calculation.
-        # A yes/no node with two or more produced inputs is a final comparison.
-        if expected == "COUNT" or len(leaf.depends_on) >= 2:
-            found.add(leaf.id)
-    return found
-
-
-def normalize_evidence_collection_plan(plan, question: str):
-    """Drop only redundant final computation leaves; never rewrite upstream."""
-    removable = _terminal_computation_ids(plan, question)
-    if not removable:
-        return plan
-    queries = [q for q in plan.queries if q.id not in removable]
-    if not queries:
-        raise ValueError("PLAN_HAS_NO_EVIDENCE_QUERY")
-    return plan.model_copy(update={"queries": queries})
-
-
-# Compatibility name for callers/tests created during R2 development.  Its
-# behavior now follows the original V5.1 evidence-plan responsibility.
-def ensure_plan_answers_question(plan, question: str):
-    return normalize_evidence_collection_plan(plan, question)
+    legacy = ensure_valid_plan(parse_v51_plan(raw))
+    producers = {query.output: query.id for query in legacy.queries}
+    ids = {query.id: f"Q{index}" for index, query in enumerate(legacy.queries, start=1)}
+    queries = []
+    for query in legacy.queries:
+        variables = set(re.findall(r"\?[A-Za-z_][A-Za-z_0-9]*", query.template))
+        inputs = {var: producers[var] for var in sorted(variables)}
+        declared = set(query.depends_on)
+        expected = set(inputs.values())
+        if declared != expected:
+            sources = ", ".join(f"{var} from {inputs[var]}" for var in sorted(inputs)) or "NONE"
+            raise ValueError(
+                f"PLAN_DEPENDENCY_TEMPLATE_MISMATCH:{query.id}: "
+                f"query variables and producers: {sources}; "
+                f"declared depends_on: {_dependency_ids(declared)}; "
+                f"expected depends_on: {_dependency_ids(expected)}; "
+                f"unused dependencies: {_dependency_ids(declared - expected)}; "
+                f"missing direct dependencies: {_dependency_ids(expected - declared)}. "
+                f"Set depends_on to {_dependency_ids(expected)}."
+            )
+        queries.append(dict(id=ids[query.id], template=query.template, output=query.output,
+                            inputs={var: ids[parent] for var, parent in inputs.items()},
+                            requires_complete_set=query.requires_complete_set))
+    return EvidencePlanR2(plan_id=legacy.plan_id, queries=queries)

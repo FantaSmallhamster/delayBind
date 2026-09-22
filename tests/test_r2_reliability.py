@@ -162,7 +162,7 @@ def test_r12_plan_repair_can_add_query_but_not_create_cycles():
     assert r.export() == before
 
 
-def test_plan_repair_cannot_add_final_comparison_node():
+def test_plan_repair_does_not_semantically_remove_structurally_valid_query():
     r = fixture(config=RunnerConfig(protocol_version="v5.2-r2", plan_repair_mode="on_hint"))
     a = ingest(r, [("Q1", "D0:S0")])[0]
     ctx = build_repair_context(r, "Are Cindy's teacher and the teacher's mother the same person?")
@@ -171,10 +171,9 @@ def test_plan_repair_cannot_add_final_comparison_node():
            "output: ?same\n"
            "depends_on: Q1,Q2\n"
            "END UPSERT\nEND REPAIR")
-    before = r.export()
-    with pytest.raises(ValueError, match="PLAN_REPAIR_FINAL_COMPUTATION_FORBIDDEN"):
-        apply_repair(r, raw, ctx)
-    assert r.export() == before
+    apply_repair(r, raw, ctx)
+    assert [q.id for q in r.state.plan.queries] == ["Q1", "Q2", "Q3", "Q4"]
+    assert r.state.plan.queries[-1].template == "Are ?teacher and ?mother the same person?"
 
 
 def test_d09_d10_multi_parent_diamond_waits_and_invalidates_each_descendant_once():

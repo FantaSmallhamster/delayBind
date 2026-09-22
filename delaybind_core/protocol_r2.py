@@ -98,6 +98,13 @@ def _review_reason(verdict):
 
 
 def parse_memory(raw, context):
+    # This alias applies to the entire fact-only FINAL reply, never to a
+    # support field or an individual line within a multi-member response.
+    if context.fact_only and context.phase == "FINAL" and isinstance(raw, str) and raw.strip() == "NONE":
+        response = parse_memory("NOOP", context)
+        response.format_normalizations.append(dict(
+            reason="STANDALONE_NONE_AS_NOOP", original_response=raw, normalized_response="NOOP"))
+        return response
     rows = strict_lines(raw)
     if context.member_bindings and context.phase == "FINAL":
         return _parse_member_memory(rows, context)
@@ -229,6 +236,8 @@ def _parse_member_memory(rows, context):
     """One text BOUND line per entity, each with its own proof; no arrays."""
     from .schema_r2 import MemberResult
     from .member_graph_r2 import scalar_value, projected_value
+    if context.fact_only and "NONE" in rows:
+        raise ValueError("STANDALONE_NONE_CANNOT_BE_MIXED_WITH_OTHER_MEMORY_LINES")
     legacy = context.model_copy(update={"member_bindings": False, "expected_cardinality": None})
     decisions, ignored = [], []
     for row in rows:

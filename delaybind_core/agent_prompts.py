@@ -7,6 +7,7 @@ from typing import Any
 from .source_refs import source_label
 
 VERSION = "v5.1-two-agent-protocol-v4"
+EVIDENCE_ONLY_PLAN_VERSION = "v5.1-plan-evidence-only-v3"
 
 
 def query_view(queries: list[dict[str, Any]]) -> str:
@@ -36,16 +37,39 @@ def facts_view(facts: list[dict[str, Any]]) -> str:
     return "\n".join(f"{fact['fact_id']} | {','.join(fact['source_refs'])} | {fact['text']}" for fact in facts) or "NONE"
 
 
-def plan_prompt(question: str, *, correction: str | None = None, schema: Any = None) -> str:
-    return f"""<PLAN role=HIGH version={VERSION}>
+def plan_prompt(question: str, *, correction: str | None = None, schema: Any = None,
+                evidence_only: bool = False) -> str:
+    if evidence_only:
+        version = EVIDENCE_ONLY_PLAN_VERSION
+        continuation = "\n"
+        enumeration_rule = ""
+        plan_scope = """Independent queries may run in parallel. Every query must ask for a
+source-retrievable fact, including when its subject is an upstream ?variable.
+Keep factual lookup hops needed to identify an entity or attribute. Do not add
+queries whose answer requires comparing, counting, sorting, aggregating,
+intersecting, or otherwise reasoning over collected facts. For a final
+comparison, collect the relevant facts for each candidate (such as dates), not
+which candidate wins. For a final count, collect the members or facts to be
+counted, not the number. ANSWER performs all final inference and computation.
+Do not add intermediate reasoning or calculation queries.
+For each query, depends_on must list exactly the producer query IDs of the
+?variables literally used in that query. Do not add transitive ancestors or
+ordering-only dependencies. If the query has no ?variables, use NONE. If it
+uses ?director from Q1 but not ?start from Q2, depend on Q1 only; if it uses
+both variables, depend on Q1,Q2."""
+    else:
+        version = VERSION
+        continuation = " "
+        enumeration_rule = "Mark full enumeration needs\nwith requires_complete_set: true. "
+        plan_scope = """Independent queries may run in parallel. Do not add a comparison or computation
+query used only by the final answer. Add an intermediate reasoning query only
+when its result determines what to look for next."""
+    return f"""<PLAN role=HIGH version={version}>
 Create a small natural-language evidence collection plan using ONLY the question.
 Do not answer it or fill in entities that require reading documents. Use shared
 ?variables for unknown inputs, an output variable per query, and dependencies.
 Preserve relation direction, negation, time, identity and scope constraints.
-Independent queries may run in parallel. Do not add a comparison or computation
-query used only by the final answer. Add an intermediate reasoning query only
-when its result determines what to look for next. Mark full enumeration needs
-with requires_complete_set: true. Do not output triples, relation families,
+{plan_scope}{continuation}{enumeration_rule}Do not output triples, relation families,
 operators, a fact graph, results, or query statuses. Runtime owns status.
 
 Question:

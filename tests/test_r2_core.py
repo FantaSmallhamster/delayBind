@@ -18,7 +18,6 @@ from delaybind_core.review_jobs_r2 import next_job, ensure_review
 from delaybind_core.storage import SQLiteEventStore
 from delaybind_core.token_budget import TokenCounter
 from delaybind_core.replay import replay_events
-from delaybind_core.plan_goal_r2 import ensure_plan_answers_question
 from delaybind_core.prompts_r2 import messages
 from test_v52_sources import CharacterTokenizer
 
@@ -362,40 +361,6 @@ def test_binding_activates_child_and_schedules_recall_from_saved_candidates():
     assert job.kind == "RECALL" and job.target_query == "Q2" and child in job.payload["candidates"]
     activation = next(e for e in r.store.list_runtime_events("r") if e.event_type == "QUERY_ACTIVATED")
     assert activation.payload["query_id"] == "Q2"
-
-
-def test_evidence_plan_keeps_non_computation_queries_unchanged():
-    question = "When was Mary, Crown Princess Of Denmark's husband born?"
-    complete = QueryPlanV3(plan_id="p", queries=[
-        dict(id="Q1", template="Who is Mary, Crown Princess Of Denmark's husband?", output="?husband"),
-        dict(id="Q2", template="When was ?husband born?", output="?birth_date", inputs={"?husband": "Q1"})])
-    assert ensure_plan_answers_question(complete, question) is complete
-
-
-def test_yes_no_final_comparison_leaf_is_removed_without_changing_upstream_cardinality():
-    original = QueryPlanV3(plan_id="p", queries=[
-        dict(id="Q1", template="What nationalities does A have?", output="?a", cardinality="SET"),
-        dict(id="Q2", template="What nationalities does B have?", output="?b", cardinality="SET"),
-        dict(id="Q3", template="Are ?a and ?b the same?", output="?same",
-             inputs={"?a": "Q1", "?b": "Q2"}, cardinality="SET", requires_complete_set=True),
-    ])
-    normalized = ensure_plan_answers_question(original, "Are A and B of the same nationality?")
-    assert [(q.id, q.cardinality, q.requires_complete_set) for q in normalized.queries] == [
-        ("Q1", "SET", False), ("Q2", "SET", False)]
-    assert [q.id for q in original.queries] == ["Q1", "Q2", "Q3"]
-
-
-def test_count_leaf_is_removed_and_collection_query_is_preserved():
-    original = QueryPlanV3(plan_id="p", queries=[
-        dict(id="Q1", template="Which films did A direct?", output="?films",
-             cardinality="SET", requires_complete_set=True),
-        dict(id="Q2", template="How many films are in ?films?", output="?count", inputs={"?films": "Q1"}),
-    ])
-    normalized = ensure_plan_answers_question(original, "How many films did A direct?")
-    assert len(normalized.queries) == 1
-    assert normalized.queries[0].id == "Q1"
-    assert normalized.queries[0].cardinality == "SET"
-    assert normalized.queries[0].requires_complete_set is True
 
 
 @pytest.mark.parametrize("verdict,suffix,code", [

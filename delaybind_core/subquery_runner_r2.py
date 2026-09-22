@@ -19,9 +19,10 @@ from .member_graph_r2 import MemberBranchLimit, projected_value
 from .member_memory_view_r2 import MEMBER_MEMORY_VIEW_VERSION
 from .memory_r2 import apply_memory
 from .navigation_r2 import query_projection, render_query
-from .plan_goal_r2 import normalize_evidence_collection_plan
+from .plan_goal_r2 import parse_v51_member_plan
 from .plan_repair_r2 import build_repair_context, apply_repair
 from .prompts_r2 import (
+    MEMBER_MEMORY_PROMPT_VERSION,
     MEMBER_PROMPT_VERSION,
     MEMBER_RECALL_PROMPT_VERSION,
     MEMBER_UPDATE_PROMPT_VERSION,
@@ -43,7 +44,7 @@ from .schema_r2 import (
 )
 from .schema_v52 import QueryPlanV3, digest
 from .subquery_runner_v52 import extract_boxed, V52ResourceLimit, V52ProtocolError
-from .text_protocol_v52 import parse_plan, parse_selection
+from .text_protocol_v52 import parse_selection
 from .text_views_v52 import memory_view, plain_text_view, raw_view
 from .token_budget import TokenCounter
 
@@ -122,14 +123,17 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
 
     if plan is None:
         error = None
+        validation_errors = []
         for _ in range(cfg.max_plan_retries + 1):
             try:
-                raw = await complete("PLAN", {"question": sample.question, "validation_errors": error,
+                raw = await complete("PLAN", {"question": sample.question, "validation_errors": validation_errors,
                                               "fact_only": not cfg.sentence_splitting, "member_bindings": True})
-                plan = member_plan(normalize_evidence_collection_plan(parse_plan(raw), sample.question))
+                plan = parse_v51_member_plan(raw, sample.question)
                 break
             except (ValueError, TimeoutError) as exc:
                 error = str(exc)
+                if isinstance(exc, ValueError):
+                    validation_errors.append(error)
         if plan is None:
             raise V52ProtocolError("PLAN_PROTOCOL_ERROR:" + str(error))
     runtime = RuntimeR2(run_id=run_id, plan=plan, archive=archive, store=store, config=cfg)
@@ -140,7 +144,7 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
                     high_model=getattr(getattr(runner.client, "config", None), "model", type(runner.client).__name__),
                     low_model=getattr(getattr(reader, "config", None), "model", type(reader).__name__))
     if not cfg.sentence_splitting:
-        metadata["memory_bind_prompt_version"] = MEMBER_PROMPT_VERSION if isinstance(plan, EvidencePlanR2) else MEMORY_BIND_PROMPT_VERSION
+        metadata["memory_bind_prompt_version"] = MEMBER_MEMORY_PROMPT_VERSION if isinstance(plan, EvidencePlanR2) else MEMORY_BIND_PROMPT_VERSION
     if isinstance(plan, EvidencePlanR2):
         metadata["prompt_version"] = MEMBER_PROMPT_VERSION
         metadata["update_prompt_version"] = MEMBER_UPDATE_PROMPT_VERSION

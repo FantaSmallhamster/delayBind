@@ -8,7 +8,6 @@ from .navigation_r2 import descendants, refresh, topological, query_projection
 from .runtime_r2 import invalidate_closure
 from .review_jobs_r2 import ensure_use, schedule_ready, event
 from .context_r2 import evidence_pack
-from .plan_goal_r2 import normalize_evidence_collection_plan
 
 
 def build_repair_context(runtime, question):
@@ -84,9 +83,6 @@ def apply_repair(runtime, raw, ctx):
                 roots.add(qid)
             queries[qid] = updated
     proposed = type(s.plan)(plan_id=s.plan.plan_id, queries=list(queries.values()))
-    normalized = normalize_evidence_collection_plan(proposed, ctx["question"])
-    if [q.model_dump() for q in normalized.queries] != [q.model_dump() for q in proposed.queries]:
-        raise ValueError("PLAN_REPAIR_FINAL_COMPUTATION_FORBIDDEN")
     new_projection = s.model_copy(deep=True)
     new_projection.plan = proposed
     old_roots = roots & s.executions.keys()

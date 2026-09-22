@@ -10,6 +10,10 @@ from .source_refs_v52 import SentenceRefResolver
 
 def apply_memory(runtime, response, ctx):
     encoded = response.model_dump(mode="json")
+    if not response.format_normalizations:
+        # Preserve hashes of responses written before normalization metadata
+        # was introduced, so their durable receipts remain replayable.
+        encoded.pop("format_normalizations", None)
     receipt = runtime.store.r2_receipt(runtime.run_id, ctx.context_id, digest(encoded))
     if receipt:
         return receipt
@@ -45,6 +49,9 @@ def apply_memory(runtime, response, ctx):
             if runtime.archive.fetch_sentence(ref).text_sha256 != expected:
                 raise ValueError("RAW_INTEGRITY_ERROR")
     s, events, aliases = s0.model_copy(deep=True), [], {}
+    for normalization in response.format_normalizations:
+        event(events, "MEMORY_FORMAT_NORMALIZED", query_id=ctx.query_id, review_id=ctx.review_id,
+              context_id=ctx.context_id, phase=ctx.phase, **normalization)
     if response.ignored_lines:
         event(events, "MEMORY_LINES_IGNORED", query_id=ctx.query_id, review_id=ctx.review_id,
               phase=ctx.phase, ignored_lines=response.ignored_lines)
