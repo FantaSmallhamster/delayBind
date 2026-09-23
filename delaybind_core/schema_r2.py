@@ -16,6 +16,7 @@ class EvidenceQueryR2(Strict):
     output: str = Field(pattern=r"^\?[A-Za-z_][A-Za-z_0-9]*$")
     inputs: dict[str, str] = Field(default_factory=dict)
     requires_complete_set: bool = False
+    allow_upstream_only: bool = False
 
     @property
     def depends_on(self):
@@ -32,7 +33,10 @@ class EvidencePlanR2(Strict):
         # Reuse only the existing DAG/variable validator. Cardinality is absent
         # from this schema and from the persisted/model-visible R2 plan.
         QueryPlanV3(plan_id=self.plan_id, queries=[
-            {**q.model_dump(), "cardinality": "SET"} for q in self.queries])
+            {**q.model_dump(exclude={"allow_upstream_only"}), "cardinality": "SET"} for q in self.queries])
+        for q in self.queries:
+            if q.allow_upstream_only and (not q.inputs or not any(q.id in child.depends_on for child in self.queries)):
+                raise ValueError("UPSTREAM_ONLY_REQUIRES_INTERMEDIATE_DEPENDENCY:" + q.id)
         return self
 
 
@@ -189,6 +193,9 @@ class FactUseR2(Strict):
     acceptance_origin: str = "UPDATE"
     reason_code: str | None = None
     evidence_context_signature: str | None = None
+    admission_origin: Literal["UPDATE", "RECALL"] | None = None
+    admission_token: str | None = None
+    consumed_admission_token: str | None = None
 
 
 class BindingR2(Strict):
@@ -259,6 +266,9 @@ class ReviewSession(Strict):
     branch_results: dict[str, list[BindingMemberR2]] = Field(default_factory=dict)
     branch_decisions: dict[str, str] = Field(default_factory=dict)
     completed_revision: int | None = None
+    admitted_use_tokens: dict[str, str] = Field(default_factory=dict)
+    prior_support_use_ids: list[str] = Field(default_factory=list)
+    completion_reason: str | None = None
 
 
 class DurableJob(Strict):
@@ -303,6 +313,9 @@ class MemoryContextR2(Strict):
     fact_only: bool = False
     member_bindings: bool = False
     branch: MemberBranchR2 | None = None
+    admission_policy: str = "legacy"
+    admission_digest: str = ""
+    upstream_only_allowed: bool = False
 
 
 class StateR2(Strict):
@@ -310,6 +323,7 @@ class StateR2(Strict):
     # Persist the evidence contract so proof invariants remain deterministic
     # across commits, replay and resume.
     fact_only: bool = False
+    admission_policy: str = "legacy"
     plan: EvidencePlanR2 | QueryPlanV3
     executions: dict[str, Execution] = Field(default_factory=dict)
     binding_store: dict[str, BindingR2] = Field(default_factory=dict)

@@ -5,7 +5,7 @@ from dataclasses import asdict, replace
 import sqlite3
 from uuid import uuid4
 
-from .agents_v52 import HighLevelAgentV52, LowLevelAgentV52
+from .agents_r2 import HighLevelAgentR2, LowLevelAgentR2
 from .archive import SentenceArchive
 from .context_r2 import (
     budgeted_evidence_pack,
@@ -18,6 +18,7 @@ from .cursor_v52 import SentenceReadCursor
 from .member_graph_r2 import MemberBranchLimit, projected_value
 from .member_memory_view_r2 import MEMBER_MEMORY_VIEW_VERSION
 from .memory_r2 import apply_memory
+from .memory_admission_r2 import strict
 from .navigation_r2 import query_projection, render_query
 from .plan_goal_r2 import parse_v51_member_plan
 from .plan_repair_r2 import build_repair_context, apply_repair
@@ -66,7 +67,7 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         raise ValueError("PLAN_PROTOCOL_MISMATCH:R2 requires QueryPlanV3 internally")
     counter = TokenCounter(runner.tokenizer, encoding_name=cfg.tokenizer_encoding)
     reader = runner.reader_client or runner.client
-    high, low = HighLevelAgentV52(runner.client), LowLevelAgentV52(reader)
+    high, low = HighLevelAgentR2(runner.client), LowLevelAgentR2(reader)
     archive = SentenceArchive(store, run_id)
     saved = store.latest_v52_state(run_id)
     if saved and plan is None:
@@ -98,7 +99,12 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         if wm is not None and not memory_fits(wm):
             raise V52ResourceLimit(budget_error)
         limit = cfg.max_answer_input_tokens if interface == "ANSWER" else cfg.max_review_input_tokens if interface.startswith("MEMORY") else cfg.max_input_tokens
-        agent = high if interface in high.interfaces else low
+        if interface in high.interfaces:
+            agent = high
+        elif interface in low.interfaces:
+            agent = low
+        else:
+            raise PermissionError(f"R2_INTERFACE_UNKNOWN:{interface}")
         output = getattr(getattr(agent.client, "config", None), "max_tokens", cfg.answer_reserve_tokens)
         if interface == "ANSWER":
             output = max(output, cfg.answer_reserve_tokens)
@@ -107,7 +113,18 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         raws = (wm or {}).get("raw_evidence", []) + original.get("window_sources", [])
         audit = dict(protocol_version=PROTOCOL, memory_mode=original.get("allowed_mode"),
                      review_phase=original.get("phase"), context_id=original.get("context_id"),
-                     review_id=original.get("review_id"), raw_bundle_hash=digest(raws))
+                     review_id=original.get("review_id"), raw_bundle_hash=digest(raws),
+                     agent_role=agent.role,
+                     client_model=getattr(getattr(agent.client, "config", None), "model", type(agent.client).__name__))
+        if interface in {"MEMORY", "MEMORY_REPAIR"} and original.get("review_id"):
+            session = runtime.state.reviews[original["review_id"]]
+            audit.update(authorized_fact_count=len(original.get("allowed_fact_ids", [])),
+                         update_admission_count=sum(runtime.state.uses[key].admission_origin == "UPDATE"
+                                                    for key in session.admitted_use_tokens),
+                         recall_admission_count=sum(runtime.state.uses[key].admission_origin == "RECALL"
+                                                    for key in session.admitted_use_tokens),
+                         prior_support_count=len(session.prior_support_use_ids),
+                         admission_digest=original.get("admission_digest", ""))
         logical_calls += 1
         call_id = "R2CALL-" + str(uuid4())
         store.save_context_manifest(run_id, call_id, {"kind": "MODEL_REQUEST", "interface": interface,
@@ -119,7 +136,10 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
             "raw_input_tokens": counter.count(plain_text_view(raws) if not cfg.sentence_splitting else raw_view(raws)) if raws else 0,
             "visible_source_refs": [] if not cfg.sentence_splitting else [r["source_ref"] for r in raws]})
         return await agent.call(interface, run_id=run_id, messages=msg, response_schema=None,
-                                extra={"max_tokens": output}, local_metadata=audit)
+                                extra={"max_tokens": output},
+                                local_metadata={key: audit[key] for key in (
+                                    "protocol_version", "memory_mode", "review_phase", "context_id",
+                                    "review_id", "raw_bundle_hash")})
 
     if plan is None:
         error = None
@@ -138,6 +158,13 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
             raise V52ProtocolError("PLAN_PROTOCOL_ERROR:" + str(error))
     runtime = RuntimeR2(run_id=run_id, plan=plan, archive=archive, store=store, config=cfg)
     metadata = dict(protocol_version=PROTOCOL, memory_contract=CONTRACT, prompt_version=PROMPT_VERSION,
+                    execution_policy_version=("r2-low-answer-strict-recall-v1" if runtime.state.fact_only
+                                              else "r2-low-answer-raw-v1"),
+                    admission_policy=runtime.state.admission_policy,
+                    answer_agent_role="LOW",
+                    answer_model=getattr(getattr(reader, "config", None), "model", type(reader).__name__),
+                    empty_memory_policy=("evidence-or-explicit-upstream-v1" if runtime.state.fact_only
+                                         else "legacy"),
                     question_hash=digest(sample.question),
                     manifest_hash=digest(manifest.model_dump(mode="json") if manifest is not None else sample.context),
                     config=asdict(cfg), tokenizer=counter.identity,
@@ -251,6 +278,8 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         size = cfg.candidate_batch_size
         while True:
             ctx = build_memory_context(runtime, job.review_id, batch_size=size)
+            if strict(runtime.state) and not ctx.allowed_fact_ids and not ctx.upstream_only_allowed:
+                raise ValueError("EMPTY_MEMORY_NOT_AUTHORIZED")
             payload = memory_payload(ctx)
             if ctx.phase == "FINAL" or size == 1 or (request("MEMORY", payload)[1] <= cfg.max_review_input_tokens
                                                     and memory_fits(payload["working_memory"])):

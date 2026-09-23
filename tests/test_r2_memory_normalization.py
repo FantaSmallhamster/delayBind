@@ -53,7 +53,13 @@ def test_none_preserves_facts_candidates_and_existing_binding(member_bindings, h
     receipt = apply_memory(r, response, ctx)
 
     assert receipt["changed"] is False
-    assert retained_state(r) == before
+    after = retained_state(r)
+    assert {key: after[key] for key in ("facts", "routes", "bindings")} == {
+        key: before[key] for key in ("facts", "routes", "bindings")}
+    for key, use in r.state.uses.items():
+        assert use.status == ("ACCEPTED" if before["uses"][key]["status"] == "ACCEPTED" else "CANDIDATE")
+        if use.admission_token:
+            assert use.consumed_admission_token == use.admission_token
     assert r.state.executions["Q1"].current_binding_id == binding_id
     assert not any(event.event_type == "BINDING_RETIRED"
                    for event in r.store.list_runtime_events(r.run_id))

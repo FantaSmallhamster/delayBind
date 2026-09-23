@@ -112,6 +112,10 @@ def test_partial_branch_commit_is_not_published_and_resume_replays_exactly():
     value, fid = values[first]
     ctx, response, receipt = decide(r, "Q3", (value, [fid]))
     assert receipt["branch_staged"] and not receipt["review_complete"]
+    session = r.state.reviews[ctx.review_id]
+    assert session.admitted_use_tokens
+    assert all(r.state.uses[key].consumed_admission_token != token
+               for key, token in session.admitted_use_tokens.items())
     assert r.state.executions["Q3"].current_binding_id is None
     assert apply_memory(r, response, ctx) == receipt  # exact retry is idempotent
     restored = RuntimeR2(run_id=r.run_id, plan=r.state.plan, archive=r.archive, store=r.store, config=r.config)
@@ -120,6 +124,8 @@ def test_partial_branch_commit_is_not_published_and_resume_replays_exactly():
     value, fid = values[other]
     decide(restored, "Q3", (value, [fid]))
     assert len(current(restored, "Q3").members) == 2
+    assert all(restored.state.uses[key].consumed_admission_token == token
+               for key, token in restored.state.reviews[ctx.review_id].admitted_use_tokens.items())
     assert replay_events(r.store.list_runtime_events(r.run_id)).export() == restored.export()
 
 
@@ -198,7 +204,7 @@ def test_single_named_entity_with_and_is_not_split_and_duplicate_proofs_merge():
 
 def test_prompts_no_fixed_cardinality_and_parser_preserves_legacy_only_for_old_plans():
     legacy = QueryPlanV3(plan_id="old", queries=[dict(id="Q1", template="Members?", output="?person")])
-    assert member_plan(legacy).model_dump()["queries"][0].keys() == {"id", "template", "output", "inputs", "requires_complete_set"}
+    assert member_plan(legacy).model_dump()["queries"][0].keys() == {"id", "template", "output", "inputs", "requires_complete_set", "allow_upstream_only"}
     r = runtime()
     ingest(r, ("Q1", "Jane leads Team Red."))
     ctx = context(r, "Q1")
@@ -206,17 +212,18 @@ def test_prompts_no_fixed_cardinality_and_parser_preserves_legacy_only_for_old_p
     payload = dict(question="Test?", **ctx.model_dump(), query_instance=query_projection(r.state)["queries"][0], old_binding=None)
     text = messages("MEMORY", payload)[1]["content"]
     assert "cardinality=" not in text and "SINGLE" not in text
-    assert MEMBER_MEMORY_PROMPT_VERSION in text and "one line per result" in text
+    assert MEMBER_MEMORY_PROMPT_VERSION in text and "one line per value" in text
 
 
 def test_member_plan_prompt_matches_v51_request_and_retry():
-    from delaybind_core.agent_prompts import EVIDENCE_ONLY_PLAN_VERSION, plan_prompt
-    from delaybind_core.prompts_r2 import prompt_version_for
+    from delaybind_core.agent_prompts import plan_prompt
+    from delaybind_core.prompts_r2 import prompt_version_for, STRICT_PLAN_PROMPT_VERSION
 
     payload = {"question": "Who directed Film Aspen?", "fact_only": True, "member_bindings": True}
     expected = plan_prompt(payload["question"], evidence_only=True)
-    assert messages("PLAN", payload) == [{"role": "user", "content": expected}]
-    assert prompt_version_for("PLAN", payload) == EVIDENCE_ONLY_PLAN_VERSION
+    assert messages("PLAN", payload)[0]["content"].startswith(expected)
+    assert "allow_upstream_only: true" in messages("PLAN", payload)[0]["content"]
+    assert prompt_version_for("PLAN", payload) == STRICT_PLAN_PROMPT_VERSION
     assert "Do not add intermediate reasoning or calculation queries." in expected
     assert "comparison, collect the relevant facts" in expected
     assert "For a final count, collect the members" in expected
@@ -226,11 +233,10 @@ def test_member_plan_prompt_matches_v51_request_and_retry():
     assert "Add an intermediate reasoning query only" in plan_prompt(payload["question"])
     assert "requires_complete_set: true" in plan_prompt(payload["question"])
     repair = messages("PLAN", {**payload, "validation_errors": ["bad dependency"]})
-    assert repair[0]["content"] == (
-        expected
-        + "\nYour previous output was invalid: bad dependency"
-          "\nReturn a corrected complete response in the specified format."
-    )
+    assert repair[0]["content"].startswith(expected)
+    assert repair[0]["content"].endswith(
+        "\nYour previous output was invalid: bad dependency"
+        "\nReturn a corrected complete response in the specified format.")
 
 
 def test_branch_budget_is_explicit_not_silent_truncation():
@@ -313,7 +319,8 @@ def test_all_noop_preserves_fact_uses_and_wakes_child_inbox_after_barrier():
     ingest(r, ("Q1", "Unrelated account mentions Team Red."), ("Q2", "Team Red includes Charlie."))
     old_uses = {k: u.model_dump() for k, u in r.state.uses.items() if u.query_id == "Q1"}
     decide(r, "Q1", raw="NOOP")
-    assert {k: u.model_dump() for k, u in r.state.uses.items() if u.query_id == "Q1"} == old_uses
+    assert all(u.status == ("ACCEPTED" if old_uses[k]["status"] == "ACCEPTED" else "CANDIDATE")
+               for k, u in r.state.uses.items() if u.query_id == "Q1")
     assert current(r, "Q2").binding_id == q2_id
     ctx = context(r, "Q2")
     assert ctx.allowed_mode == "REBIND"

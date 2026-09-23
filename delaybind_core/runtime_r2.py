@@ -7,12 +7,14 @@ from .schema_r2 import StateR2, Execution, InboxEntry, fact_id
 from .navigation_r2 import (query, query_ready, current_uses, descendants, refresh, assert_invariants,
                             query_projection, binding_effective)
 from .review_jobs_r2 import (event, ensure_use, ensure_review, schedule_ready, cancel_reviews,
-                             evidence_signature, TERMINAL, enqueue)
+                             evidence_signature, TERMINAL, enqueue, finish_strict_work)
+from .memory_admission_r2 import strict, STRICT_POLICY, grant_admission
 
 
 class RuntimeR2:
     def __init__(self, *, run_id, plan, archive, store, config):
         self.run_id, self.archive, self.store, self.config = run_id, archive, store, config
+        policy = STRICT_POLICY if not config.sentence_splitting else "legacy"
         saved = store.latest_v52_state(run_id)
         if saved:
             self.state = StateR2.model_validate(saved)
@@ -20,10 +22,13 @@ class RuntimeR2:
                 raise ValueError("RESUME_PLAN_CHANGED")
             if self.state.fact_only != (not config.sentence_splitting):
                 raise ValueError("RESUME_FACT_MODE_CHANGED")
+            if self.state.admission_policy != policy:
+                raise ValueError("RESUME_ADMISSION_POLICY_CHANGED")
             self.archive.watermark = self.state.read_watermark
             assert_invariants(self.state)
         else:
             self.state = StateR2(plan=plan, fact_only=not config.sentence_splitting,
+                                 admission_policy=policy,
                                  executions={q.id: Execution() for q in plan.queries})
             refresh(self.state)
             self.commit(self.state.model_copy(deep=True), [("PLAN_CREATED", {"plan": plan.model_dump()})])
@@ -129,18 +134,30 @@ class RuntimeR2:
                 if not self.config.defer_unbound and route.observed_status == "DORMANT":
                     continue
                 bucket = s.route_index.setdefault(qid, [])
-                if fid in bucket:
+                newly_routed = fid not in bucket
+                if fid in bucket and not strict(s):
                     continue
-                bucket.append(fid)
-                bucket.sort()
-                changed.add(qid)
-                ex.evidence_revision += 1
-                event(events, "FACT_ROUTED", query_id=qid, fact_id=fid, observed_status=route.observed_status)
+                if newly_routed:
+                    bucket.append(fid)
+                    bucket.sort()
+                    changed.add(qid)
+                    ex.evidence_revision += 1
+                    event(events, "FACT_ROUTED", query_id=qid, fact_id=fid, observed_status=route.observed_status)
                 status = "CANDIDATE" if route.observed_status == "DORMANT" else "PENDING"
                 u = ensure_use(s, qid, fid, status=status)
                 if status == "PENDING":
                     lane = "REBIND" if ex.current_binding_id else "BIND"
                     iid = "IN" + digest([u.use_id, update.context_id])
+                    if iid in s.inbox:
+                        continue
+                    if strict(s):
+                        if not grant_admission(s, u, "UPDATE", update.context_id):
+                            continue
+                        if u.status not in {"ACCEPTED", "PENDING"}:
+                            u.status = "PENDING"
+                        if not newly_routed:
+                            ex.evidence_revision += 1
+                        changed.add(qid)
                     s.inbox[iid] = InboxEntry(entry_id=iid, fact_id=fid, use_key=u.use_id, query_id=qid, lane=lane,
                                               update_context_id=update.context_id, observed_status=route.observed_status,
                                               source_refs=list(observation.source_refs), evidence_revision=ex.evidence_revision)
@@ -161,7 +178,10 @@ class RuntimeR2:
         from .navigation_r2 import topological
         for qid in topological(s):
             if qid in changed and snapshot[qid]["status"] != "DORMANT":
-                ensure_review(s, qid, "UPDATE", events)
+                if strict(s):
+                    schedule_ready(s, qid, "UPDATE", events, callback=self.config.enable_defer_callback)
+                else:
+                    ensure_review(s, qid, "UPDATE", events)
         s.update_receipts[update.context_id] = self.state.state_revision + 1
         self.commit(s, events)
         return {"changed_query_ids": sorted(changed), "enqueued_job_ids": [p["job_id"] for e, p in events if e == "JOB_ENQUEUED"]}
@@ -205,9 +225,18 @@ class RuntimeR2:
         if p["offset"] == len(p["candidates"]):
             j.status = "DONE"
             for fid in p["selected"]:
-                ensure_use(s, j.target_query, fid, status="CANDIDATE", origin="RECALL").status = "PENDING"
+                use = ensure_use(s, j.target_query, fid, status="CANDIDATE", origin="RECALL")
+                if strict(s):
+                    grant_admission(s, use, "RECALL", job_id)
+                    if use.status != "ACCEPTED":
+                        use.status = "PENDING"
+                else:
+                    use.status = "PENDING"
             ex.evidence_revision += 1
-            ensure_review(s, j.target_query, "RECALL", events)
+            if strict(s):
+                finish_strict_work(s, j.target_query, "RECALL", events)
+            else:
+                ensure_review(s, j.target_query, "RECALL", events)
             event(events, "JOB_COMPLETED", job_id=job_id)
         event(events, "RECALL_BATCH_SCANNED", job_id=job_id, selected=selected, batch=batch)
         self.commit(s, events)
@@ -234,7 +263,11 @@ class RuntimeR2:
         for q in s.plan.queries:
             if (q.id not in resumed and query_ready(s, q.id)
                     and (q.requires_complete_set or any(u.status == "HELD" for u in current_uses(s, q.id)))):
-                ensure_review(s, q.id, "SCOPE_CLOSED", events)
+                if strict(s):
+                    schedule_ready(s, q.id, "SCOPE_CLOSED", events,
+                                   callback=self.config.enable_defer_callback, force_review=True)
+                else:
+                    ensure_review(s, q.id, "SCOPE_CLOSED", events)
         self.commit(s, events)
 
     def fail(self, reason, *, job_id=None, resource=False):

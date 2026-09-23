@@ -8,7 +8,7 @@
 新运行须显式设置 `protocol_version="v5.2-r2"`，使用新的 run ID / 输出目录。
 不得把旧轨迹或原来的八题结果重新标成 R2。
 
-## 当前默认：无基数预设的成员依赖图（text-18）
+## 当前默认：无基数预设的成员依赖图
 
 新建 R2 运行默认采用成员图；PLAN 不定义 SINGLE/SET。`EvidencePlanR2` 中只有查询、输出变量、输入依赖及可选的完整枚举需求。
 传入旧 V3 计划创建新运行时，runner 转换为新计划；恢复已有旧轨迹则保持其旧合同，不原地改写历史。
@@ -49,7 +49,17 @@ Alice、Bob 都依赖同一个 Team Red 节点及其证明；Paris 只继承 Ali
 缺证据的分支标为 `UNRESOLVED_MEMBER_BRANCH`，不是空集合。计数、全部成员、否定等结论仍需完整性依据；不能因 query RESOLVED 就假定成员已穷尽。
 
 单查询分支展开上限 1024，超过则明确 `MEMBER_BRANCH_BUDGET`，不静默截断；仍受既有调用次数、轮数、token 预算限制。
-新版本提示词审计标识为 `v5.2-r2-member-graph-text-18`。历史 B/P17 提示词、快照及测试结果保留，不等于当前默认提示词。
+新建 fact-only 运行使用 `strict-recall-v1` 准入策略和 `v5.2-r2-member-graph-text-23-strict-admission` MEMORY 提示词。历史 B/P17 提示词、快照及测试结果保留，不等于当前默认提示词。
+
+## 新运行的事实准入与空工作规则
+
+fact-only 的事实保存、获准进入当前 MEMORY、被绑定接受分别记录。ACTIVE/RESOLVED 的新 UPDATE 事件为当前 `(query_id, query_version, input_signature)` 授予一次待审准入；DORMANT 只入候选桶。RECALL 扫完全部批次且成功提交后，仅选中事实获得准入。未选候选留在桶中，不显示给 MEMORY，也不进入直接引用白名单。后续新证据到来时可重新回查历史候选。
+
+MEMORY 的直接白名单由本会话未消费的 UPDATE/RECALL 准入和当前绑定必要旧支持构成。旧支持在 REBIND 屏障期间仍可用于复查。多成员分支共用查询级冻结授权集合，全部分支完成后才消费令牌并原子发布。NOOP 保留旧绑定及证明，将未采纳的新待审事实留作候选。API 或协议失败不会消费令牌或解除真实的重绑定屏障。
+
+无候选可扫、无直接准入和旧支持、且没有合法纯上游推理资格时，Runtime 记录 `MEMORY_SKIPPED`，继续其他任务，不发模型 NOOP 请求。仅被下游消费、有有效父成员、且 PLAN 明确声明 `allow_upstream_only: true` 的中间查询可在无直接事实时尝试 MEMORY；提交无直接支持的 BOUND 仍需通过该资格校验。普通下游仅有 `inputs` 不满足资格。
+
+新 fact-only 状态拒绝按旧策略恢复。旧记录仍可读取和离线审计；新运行需使用新 run ID。原文模式保留 REVIEW、HOLD、CONTEXT 和 UNBOUND 证据合同，不使用 fact-only 空工作门控。
 
 ## 各部分职责
 
@@ -60,7 +70,7 @@ Alice、Bob 都依赖同一个 Team Red 节点及其证明；Paris 只继承 Ali
 | LOW RECALL | 扫完冻结桶所有批次，选择潜在线索 | 不核验；失败不等于空选择 |
 | HIGH MEMORY | 单 query 的 BIND / REBIND；分句模式审阅原文，事实模式直接选择事实证明 | 不 PATCH / ROUTE / FOCUS，不修改下游 |
 | Runtime | 版本、权限、事务、双图、失效范围、补取和调度 | 不代替模型判断自然语言蕴含 |
-| HIGH ANSWER | 仅根据 question + working memory 作答 | 不读完整计划、Archive 或候选桶 |
+| LOW ANSWER | 仅根据 question + 有效 working memory 作答 | 不读完整计划、Archive 或候选桶；有独立 Reader 客户端时走该客户端 |
 
 LOW 新路径不能调用 VERIFY。`enable_defer_callback=false` 只关闭历史候选回查，不关闭 REBIND。
 

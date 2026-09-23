@@ -6,6 +6,7 @@ from .navigation_r2 import (query, query_ready, current_uses, proof_refs, refres
 from .review_jobs_r2 import ensure_use, ensure_review, schedule_ready, event, evidence_signature, enqueue
 from .runtime_r2 import invalidate_closure
 from .source_refs_v52 import SentenceRefResolver
+from .memory_admission_r2 import strict, build_admission_snapshot
 
 
 def apply_memory(runtime, response, ctx):
@@ -58,6 +59,13 @@ def apply_memory(runtime, response, ctx):
     ready_before = {q.id: query_ready(s0, q.id) for q in s0.plan.queries}
     signatures_before = {qid: ex.input_signature for qid, ex in s0.executions.items()}
     session = s.reviews[ctx.review_id]
+    strict_fact_only = strict(s)
+    if strict_fact_only:
+        frozen = set(session.admitted_use_tokens) | set(session.prior_support_use_ids)
+        if (set(ctx.allowed_fact_ids) != {s.uses[key].fact_id for key in frozen}
+                or ctx.admission_digest != build_admission_snapshot(s, ctx.query_id, session.target_binding_id)["digest"]
+                or any(s.uses[key].admission_token != token for key, token in session.admitted_use_tokens.items())):
+            raise ValueError("ADMISSION_PERMISSION_MISMATCH")
     session.sent = True
     if ctx.context_id not in session.context_ids:
         session.context_ids.append(ctx.context_id)
@@ -161,7 +169,9 @@ def apply_memory(runtime, response, ctx):
         if result.decision_source_refs:
             raise ValueError("FACT_ONLY_RESULT_HAS_SOURCE_REFS")
         allowed = set(ctx.allowed_fact_ids)
-        current = current_uses(s, ctx.query_id)
+        current = ([s.uses[key] for key in sorted(set(session.admitted_use_tokens) |
+                                                 set(session.prior_support_use_ids))]
+                   if strict_fact_only else current_uses(s, ctx.query_id))
         current_by_fact = {u.fact_id: u for u in current}
         if not set(support) <= allowed or not set(support) <= set(current_by_fact):
             raise ValueError("SUPPORT_NOT_VISIBLE")
@@ -170,6 +180,10 @@ def apply_memory(runtime, response, ctx):
             # for a later evidence revision and an existing proof stays intact.
             event(events, "FACT_ONLY_DECISION_NOOP", query_id=ctx.query_id,
                   review_id=session.review_id, preserved_binding_id=session.target_binding_id)
+            if strict_fact_only:
+                for key in session.admitted_use_tokens:
+                    if s.uses[key].status == "PENDING":
+                        s.uses[key].status = "CANDIDATE"
         else:
             # Only selected facts become the effective proof. Non-selected facts
             # remain candidates; lack of selection is not evidence of falsity.
@@ -189,7 +203,8 @@ def apply_memory(runtime, response, ctx):
     parent_ids = [s.executions[p].current_binding_id for p in query(s, ctx.query_id).depends_on]
     use_ids, raw_refs = [], set()
     if result.state == "BOUND":
-        if not ctx.member_bindings and any(u.status in {"PENDING", "HELD", "CONFLICT"} for u in current_uses(s, ctx.query_id)):
+        unresolved = (current if ctx.fact_only and strict_fact_only else current_uses(s, ctx.query_id))
+        if not ctx.member_bindings and any(u.status in {"PENDING", "HELD", "CONFLICT"} for u in unresolved):
             raise ValueError("UNRESOLVED_REVIEW_BLOCKS_BOUND")
         q = query(s, ctx.query_id)
         if not ctx.member_bindings and q.requires_complete_set and not s.scope_closed:
@@ -198,6 +213,8 @@ def apply_memory(runtime, response, ctx):
             raise ValueError("BINDING_CARDINALITY_MISMATCH")
         if not support and (result.kind == "DIRECT" or not parent_ids):
             raise ValueError("MISSING_BINDING_PROOF")
+        if strict_fact_only and not support and not ctx.upstream_only_allowed:
+            raise ValueError("UPSTREAM_ONLY_NOT_AUTHORIZED")
         if result.kind == "INFERRED" and not any(ctx.query_id in child.depends_on for child in s.plan.queries):
             raise ValueError("INFERRED_ONLY_FOR_INTERMEDIATE_QUERY")
         if result.value == [] and (not s.scope_closed or not support):
@@ -245,6 +262,9 @@ def apply_memory(runtime, response, ctx):
                                   source_refs=result.decision_source_refs, review_id=session.review_id,
                                   query_version=ctx.query_version, input_signature=ctx.input_signature))
     session.status = "DONE"
+    if strict_fact_only:
+        for key, token in session.admitted_use_tokens.items():
+            s.uses[key].consumed_admission_token = token
     session.completed_revision = s.state_revision + 1
     ex = s.executions[ctx.query_id]
     if session.review_id in ex.blocking_review_ids:
@@ -278,7 +298,8 @@ def apply_memory(runtime, response, ctx):
     if unchanged or (fact_only_noop and old is not None):
         for child in s.plan.queries:
             if any(u.status == "PENDING" for u in current_uses(s, child.id)) and query_ready(s, child.id):
-                ensure_review(s, child.id, "UPSTREAM_REAFFIRMED", events)
+                schedule_ready(s, child.id, "UPSTREAM_REAFFIRMED", events,
+                               callback=runtime.config.enable_defer_callback)
             elif not ready_before[child.id] and query_ready(s, child.id) and not s.executions[child.id].current_binding_id:
                 schedule_ready(s, child.id, "UPSTREAM_REAFFIRMED", events, callback=runtime.config.enable_defer_callback)
     for old_fid, new_fid in corrected_notifications:

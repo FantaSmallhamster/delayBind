@@ -32,18 +32,44 @@ def parse_repair(raw, plan):
         raise ValueError("EXPECTED_PLAN_REPAIR_BLOCK")
     evidence = refs(head[1])
     translated = []
+    upstream_flags = {}
+    current_upsert = None
+    upsert_has_legacy_fields = False
     for line in rows[1:-1]:
         f = fields(line)
         if f[0] == "UPSERT" and len(f) == 2:
+            current_upsert = f[1]
+            upsert_has_legacy_fields = False
             translated.append("PATCH | " + f[1] + " | " + (",".join(evidence) or "NONE"))
         elif line == "END UPSERT":
+            if not upsert_has_legacy_fields and current_upsert in upstream_flags:
+                existing = next((q for q in plan.queries if q.id == current_upsert), None)
+                if existing is None:
+                    raise ValueError("UPSTREAM_ONLY_PATCH_REQUIRES_EXISTING_QUERY")
+                translated.append("query: " + existing.template)
+            current_upsert = None
             translated.append("END PATCH")
+        elif line.startswith("allow_upstream_only:"):
+            value = line.split(":", 1)[1].strip().lower()
+            if current_upsert is None or current_upsert in upstream_flags or value not in {"true", "false"}:
+                raise ValueError("INVALID_OR_DUPLICATE_UPSTREAM_ONLY_FIELD")
+            upstream_flags[current_upsert] = value == "true"
         elif f[0] in {"PATCH", "BIND", "REBIND", "ASSESS", "KEEP", "UNBIND", "FOCUS"}:
             raise ValueError("PLAN_REPAIR_FORBIDDEN_ACTION")
         else:
+            if current_upsert is not None:
+                upsert_has_legacy_fields = True
             translated.append(line)
     proposal = parse_legacy_patch("\n".join(translated), "plan-repair", plan=plan)
     ops = [op.model_dump(exclude_none=True) for op in proposal.operations]
+    for op in ops:
+        if op["op"] == "PATCH":
+            if not isinstance(plan, EvidencePlanR2) and op["query_id"] in upstream_flags:
+                raise ValueError("UPSTREAM_ONLY_REQUIRES_R2_MEMBER_PLAN")
+            if op["query_id"] in upstream_flags:
+                op["patch"]["allow_upstream_only"] = upstream_flags[op["query_id"]]
+            elif isinstance(plan, EvidencePlanR2) and set(op["patch"]) & {"template", "output", "inputs", "depends_on"}:
+                op["patch"]["allow_upstream_only"] = False
     if not ops or any(op["op"] not in {"PATCH", "ROUTE"} for op in ops):
         raise ValueError("PLAN_REPAIR_FORBIDDEN_ACTION")
     return ops, evidence

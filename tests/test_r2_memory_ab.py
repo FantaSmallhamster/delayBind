@@ -52,7 +52,8 @@ def test_only_fact_only_bind_and_its_repair_switch_prompts():
     assert prompt_version_for("MEMORY_REPAIR", repair) == PROMPT_VERSION
     assert prompt_version_for("UPDATE", payload) == PROMPT_VERSION
     assert prompt_version_for("PLAN", payload) == PROMPT_VERSION
-    assert prompt_version_for("ANSWER", payload) == PROMPT_VERSION
+    from delaybind_core.prompts_r2 import ANSWER_PROMPT_VERSION
+    assert prompt_version_for("ANSWER", payload) == ANSWER_PROMPT_VERSION
     assert prompt_version_for("MEMORY", {**payload, "fact_only": False}) == PROMPT_VERSION
 
 
@@ -105,7 +106,7 @@ def test_transport_retry_never_selects_among_multiple_model_answers():
 
 
 def test_runner_records_member_version_for_new_architecture():
-    from delaybind_core.prompts_r2 import (EVIDENCE_ONLY_PLAN_VERSION, MEMBER_PROMPT_VERSION, MEMBER_MEMORY_PROMPT_VERSION,
+    from delaybind_core.prompts_r2 import (STRICT_PLAN_PROMPT_VERSION, ANSWER_PROMPT_VERSION, MEMBER_MEMORY_PROMPT_VERSION,
                                            MEMBER_UPDATE_PROMPT_VERSION, MEMBER_RECALL_PROMPT_VERSION)
     from delaybind_core.member_memory_view_r2 import MEMBER_MEMORY_VIEW_VERSION
     result = asyncio.run(run_smoke(outcome="replace", config=RunnerConfig(
@@ -120,7 +121,7 @@ def test_runner_records_member_version_for_new_architecture():
         expected = (MEMBER_UPDATE_PROMPT_VERSION if m["interface"] in {"UPDATE", "UPDATE_REPAIR"}
                     else MEMBER_MEMORY_PROMPT_VERSION if m["interface"] in {"MEMORY", "MEMORY_REPAIR"}
                     else MEMBER_RECALL_PROMPT_VERSION if m["interface"] == "RECALL"
-                    else EVIDENCE_ONLY_PLAN_VERSION if m["interface"] == "PLAN"
-                    else MEMBER_PROMPT_VERSION)
+                    else STRICT_PLAN_PROMPT_VERSION if m["interface"] == "PLAN"
+                    else ANSWER_PROMPT_VERSION)
         assert m["prompt_version"] == expected
     assert next(m for m in requests if m["interface"] == "ANSWER")["memory_view_version"] == MEMBER_MEMORY_VIEW_VERSION

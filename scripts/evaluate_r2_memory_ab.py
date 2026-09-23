@@ -109,6 +109,8 @@ def make_payload(state, ctx, question):
 def make_case(*, case_id, state, ctx, question, expected, old_output=None,
               source_messages=None, order=None, stage=1, parent=None, kind="exact", run_id=None):
     payload = make_payload(state, ctx, question)
+    # This offline A/B study replays its frozen historical prompt contract.
+    payload["admission_policy"] = "legacy"
     mapping = fact_alias_map(ctx.allowed_fact_ids)
     texts = {n["fact_id"]: n["text"] for n in ctx.working_memory.navigation["facts"]}
     candidates = [dict(short_id=alias, durable_id=fid, text=texts[fid]) for alias, fid in mapping.items()]
@@ -144,6 +146,7 @@ def make_case(*, case_id, state, ctx, question, expected, old_output=None,
 
 def perturb(base, kind, texts, support_texts, *, decision="BOUND", query_text=None):
     state = StateR2.model_validate(copy.deepcopy(base["state"]))
+    state.admission_policy = "legacy"
     original = MemoryContextR2.model_validate(base["context"])
     qid = original.query_id
     ex = state.executions[qid]
@@ -273,8 +276,11 @@ def disposable_runtime(case):
     with store.connection:
         store.connection.execute("INSERT INTO memory_transactions VALUES (?,?,?,?,?,?,?)", (
             run_id, "OFFLINE-SEED", None, revision - 1, revision, state.model_dump_json(), "null"))
-    runtime = RuntimeR2(run_id=run_id, plan=state.plan, archive=SentenceArchive(store, run_id),
-                        store=store, config=RunnerConfig(**state.run_metadata["config"]))
+    # Historical snapshots are evaluated in a disposable store. They must not
+    # pass production's strict-policy resume gate or be migrated in place.
+    runtime = RuntimeR2.__new__(RuntimeR2)
+    runtime.run_id, runtime.archive, runtime.store = run_id, SentenceArchive(store, run_id), store
+    runtime.config, runtime.state = RunnerConfig(**state.run_metadata["config"]), state
     ctx = MemoryContextR2.model_validate(case["context"])
     persist_memory_context(runtime, ctx)
     return runtime, ctx

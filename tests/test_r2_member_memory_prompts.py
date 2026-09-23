@@ -69,21 +69,21 @@ def test_new_version_changes_only_fact_only_member_memory():
         p = data if interface == "MEMORY" else repair("Alice | F1", "bad")
         assert prompt_version_for(interface, p) == MEMBER_MEMORY_PROMPT_VERSION
     assert prompt_version_for("UPDATE", data) == MEMBER_UPDATE_PROMPT_VERSION
-    assert prompt_version_for("ANSWER", data) == MEMBER_PROMPT_VERSION
+    from delaybind_core.prompts_r2 import ANSWER_PROMPT_VERSION
+    assert prompt_version_for("ANSWER", data) == ANSWER_PROMPT_VERSION
     assert prompt_version_for("MEMORY", {**data, "fact_only": False}) == MEMBER_PROMPT_VERSION
 
 
 def test_binding_contract_matches_current_hop_and_preserves_rebind():
     text = messages("MEMORY", payload())[1]["content"]
-    assert "In BIND, establish every supported result for this hop." in text
+    assert "BIND: Return all independently supported, compatible values for this hop." in text
     assert "Do not wait for later" in text
     assert "unambiguous paraphrases and inverse" in text
-    assert "Bob's mathematics teacher is Alice." in text
-    assert "Dan's music teacher is Alice." in text
-    assert "Output: BOUND | Clara | F2" in text
-    assert "Output: BOUND | Omar | F1" in text
-    assert "In REBIND, keep the old binding unless" in text
-    assert "NOOP neither rejects candidate facts nor removes an old binding." in text
+    assert "Query: Who is Mira's child?" in text
+    assert "F1 | Rowan's mother is Mira." in text
+    assert "BOUND | Rowan | F1" in text
+    assert "REBIND: Without an existing binding, use BIND." in text
+    assert "NOOP neither rejects candidates nor removes bindings." in text
 
 
 def test_missing_bound_prefix_gets_specific_feedback_but_is_not_auto_bound():
@@ -147,7 +147,7 @@ def test_unbound_branch_in_rebind_uses_initial_binding_rule():
             text = messages("MEMORY", data)[1]["content"]
             assert ctx.allowed_mode == "REBIND"
             assert "No existing binding" in text
-            assert "apply the BIND rule even when Mode is REBIND" in text
+            assert "REBIND: Without an existing binding, use BIND." in text
             decide(r, "Q3", ("Rome", [rome]))
         else:
             decide(r, "Q3", raw="NOOP")

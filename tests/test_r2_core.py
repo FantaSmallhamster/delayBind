@@ -254,7 +254,8 @@ def test_fact_only_noop_changes_neither_candidates_nor_binding_state():
     before = {key: use.status for key, use in r.state.uses.items()}
     receipt = apply_memory(r, parse_memory("NOOP", memory_ctx), memory_ctx)
     assert receipt["changed"] is False
-    assert {key: use.status for key, use in r.state.uses.items()} == before
+    assert all(use.status == "CANDIDATE" and use.consumed_admission_token == use.admission_token
+               for use in r.state.uses.values())
     assert r.state.executions["Q1"].current_binding_id is None
     assert r.state.diagnostics[-1]["state"] == "NOOP"
     assert not any(e.event_type == "BINDING_RETIRED" for e in r.store.list_runtime_events("r"))

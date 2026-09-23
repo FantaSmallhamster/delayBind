@@ -3,6 +3,8 @@
 from .schema_v52 import digest
 from .schema_r2 import DurableJob, ReviewSession, FactUseR2, use_key
 from .navigation_r2 import query, current_uses, query_ready, topological, refresh
+from .memory_admission_r2 import (strict, build_admission_snapshot, pending_admissions,
+                                  memory_work_decision)
 
 TERMINAL = {"DONE", "CANCELLED"}
 
@@ -57,7 +59,7 @@ def cancel_reviews(state, qids, events):
             event(events, "JOB_CANCELLED", job_id=j.job_id, query_id=j.target_query)
 
 
-def ensure_review(state, qid, trigger, events):
+def ensure_review(state, qid, trigger, events, *, enqueue_memory=True):
     ex = state.executions[qid]
     if not query_ready(state, qid):
         return None
@@ -65,11 +67,16 @@ def ensure_review(state, qid, trigger, events):
     if ex.retry_gate == signature:
         return None
     uses = current_uses(state, qid)
-    required = {u.use_id for u in uses if u.status in {"PENDING", "HELD", "CONFLICT"}}
-    if ex.current_binding_id:
+    snapshot = build_admission_snapshot(state, qid) if strict(state) else None
+    required = (set(snapshot["use_ids"]) if snapshot else
+                {u.use_id for u in uses if u.status in {"PENDING", "HELD", "CONFLICT"}})
+    if ex.current_binding_id and not snapshot:
         required.update(state.binding_store[ex.current_binding_id].direct_use_ids)
     active = next((r for r in state.reviews.values() if r.query_id == qid and r.status not in TERMINAL), None)
     if active and active.evidence_signature == signature:
+        if enqueue_memory and active.status == "WAITING_RECALL":
+            active.status = "PENDING"
+            enqueue(state, qid, "MEMORY", trigger, review_id=active.review_id, events=events)
         return active
     if active:
         cancel_reviews(state, {qid}, events)
@@ -81,7 +88,9 @@ def ensure_review(state, qid, trigger, events):
     r = ReviewSession(review_id=rid, query_id=qid, mode=mode, query_version=ex.version,
                       input_signature=ex.input_signature, target_binding_id=ex.current_binding_id,
                       inbox_revision=ex.evidence_revision, candidate_bucket_version=digest(sorted(state.route_index.get(qid, []))),
-                      evidence_signature=signature, required_use_ids=sorted(required), trigger=trigger)
+                      evidence_signature=signature, required_use_ids=sorted(required), trigger=trigger,
+                      admitted_use_tokens=snapshot["admitted_use_tokens"] if snapshot else {},
+                      prior_support_use_ids=snapshot["prior_support_use_ids"] if snapshot else [])
     from .member_graph_r2 import enabled, branches_for
     if enabled(state):
         r.branches = branches_for(state, qid)
@@ -94,6 +103,9 @@ def ensure_review(state, qid, trigger, events):
     for entry in state.inbox.values():
         if entry.query_id == qid and entry.status == "PENDING":
             entry.review_id = rid
+    if not enqueue_memory:
+        r.status = "WAITING_RECALL"
+        return r
     job = enqueue(state, qid, "MEMORY", trigger, review_id=rid, events=events)
     # Fact-only MEMORY has no intermediate raw-review call. Complete-set
     # queries therefore wait for EOF without spending a model call.
@@ -111,6 +123,28 @@ def schedule_ready(state, qid, trigger, events, *, callback=True, force_review=F
     if not query_ready(state, qid):
         return
     ex = state.executions[qid]
+    if strict(state):
+        if ex.retry_gate == evidence_signature(state, qid):
+            return
+        pending = pending_admissions(state, qid)
+        support = set(build_admission_snapshot(state, qid)["prior_support_use_ids"])
+        candidates = sorted(fid for fid in state.route_index.get(qid, []) if
+                            not any(u.fact_id == fid and (u.use_id in pending or u.use_id in support)
+                                    for u in current_uses(state, qid)))
+        active_scan = any(j.target_query == qid and j.kind == "RECALL" and j.status not in TERMINAL
+                          for j in state.jobs.values())
+        if active_scan:
+            return
+        if candidates and callback:
+            for fid in candidates:
+                ensure_use(state, qid, fid, status="CANDIDATE", origin="RECALL")
+            if ex.current_binding_id and (pending or force_review):
+                ensure_review(state, qid, trigger, events, enqueue_memory=False)
+            enqueue(state, qid, "RECALL", trigger,
+                    payload={"candidates": candidates, "selected": [], "offset": 0}, events=events)
+            return
+        finish_strict_work(state, qid, trigger, events, force_review=force_review)
+        return
     candidates = sorted(fid for fid in state.route_index.get(qid, []) if
                         not any(u.fact_id == fid and u.status not in {"CANDIDATE", "INVALIDATED"} for u in current_uses(state, qid)))
     if candidates and callback:
@@ -119,6 +153,37 @@ def schedule_ready(state, qid, trigger, events, *, callback=True, force_review=F
         enqueue(state, qid, "RECALL", trigger, payload={"candidates": candidates, "selected": [], "offset": 0}, events=events)
     elif force_review or any(u.status == "PENDING" for u in current_uses(state, qid)) or query(state, qid).inputs:
         ensure_review(state, qid, trigger, events)
+
+
+def finish_strict_work(state, qid, trigger, events, *, force_review=False):
+    """Decide after recall has finished; never rescan the same bucket here."""
+    decision = memory_work_decision(state, qid)
+    if decision == "CALL" and (force_review or pending_admissions(state, qid)
+                               or any(r.query_id == qid and r.status == "WAITING_RECALL" for r in state.reviews.values())
+                               or state.executions[qid].current_binding_id or
+                               query(state, qid).allow_upstream_only):
+        ensure_review(state, qid, trigger, events)
+    elif decision == "SKIP_NO_EVIDENCE":
+        active = next((r for r in state.reviews.values() if r.query_id == qid and r.status == "WAITING_RECALL"), None)
+        if active:
+            active.status, active.completion_reason = "DONE", "SKIPPED_NO_EVIDENCE"
+            active.completed_revision = state.state_revision + 1
+            ex = state.executions[qid]
+            if active.review_id in ex.blocking_review_ids:
+                ex.blocking_review_ids.remove(active.review_id)
+                event(events, "REVIEW_BARRIER_REMOVED", query_id=qid, review_id=active.review_id)
+            for job in state.jobs.values():
+                if job.review_id == active.review_id and job.status not in TERMINAL:
+                    job.status, job.lease = "DONE", None
+                    event(events, "JOB_COMPLETED", job_id=job.job_id)
+            for entry in state.inbox.values():
+                if entry.review_id == active.review_id and entry.status == "PENDING":
+                    entry.status = "DONE"
+            event(events, "REVIEW_COMPLETED", query_id=qid, review_id=active.review_id,
+                  mode=active.mode, reason=active.completion_reason)
+        state.executions[qid].retry_gate = evidence_signature(state, qid)
+        event(events, "MEMORY_SKIPPED", query_id=qid, reason="SKIPPED_NO_EVIDENCE",
+              evidence_signature=state.executions[qid].retry_gate, caused_by=trigger)
 
 
 def next_job(state):

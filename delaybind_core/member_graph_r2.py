@@ -101,6 +101,8 @@ def make_members(state, ctx, result):
             raise ValueError("MISSING_MEMBER_PROOF")
         if not item.support_fact_ids and not any(ctx.query_id in q.depends_on for q in state.plan.queries):
             raise ValueError("INFERRED_ONLY_FOR_INTERMEDIATE_QUERY")
+        if ctx.fact_only and ctx.admission_policy == "strict-recall-v1" and not item.support_fact_ids and not ctx.upstream_only_allowed:
+            raise ValueError("UPSTREAM_ONLY_NOT_AUTHORIZED")
         key = digest(item.value)
         if key not in grouped:
             grouped[key] = (item.value, set(), set())

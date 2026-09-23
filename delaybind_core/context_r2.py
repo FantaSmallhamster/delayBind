@@ -12,6 +12,7 @@ from .navigation_r2 import (
 )
 from .schema_r2 import MemoryContextR2
 from .schema_v52 import EvidencePackV52, digest
+from .memory_admission_r2 import strict, allow_upstream_inference, build_admission_snapshot
 from .text_views_v52 import memory_view
 
 
@@ -189,10 +190,21 @@ def build_memory_context(runtime, review_id, *, batch_size=None):
     required = [] if fact_only else [s.uses[k].fact_id for k in remaining[:batch_size or cfg.candidate_batch_size]]
     current = current_uses(s, r.query_id)
     eligible = [u for u in current if u.status in {"PENDING", "CANDIDATE", "ACCEPTED"}]
-    selected = ({u.fact_id for u in eligible} if fact_only else set(required))
+    strict_fact_only = strict(s)
+    if strict_fact_only:
+        frozen = set(r.admitted_use_tokens) | set(r.prior_support_use_ids)
+        selected = {s.uses[key].fact_id for key in frozen}
+        if any(key not in s.uses or s.uses[key].query_id != r.query_id or
+               s.uses[key].query_version != r.query_version or
+               s.uses[key].input_signature != r.input_signature or
+               s.uses[key].status == "INVALIDATED" for key in frozen):
+            raise ValueError("STALE_ADMISSION_SNAPSHOT")
+    else:
+        selected = ({u.fact_id for u in eligible} if fact_only else set(required))
     rejected_records = []
     if phase == "FINAL":
-        selected.update(u.fact_id for u in current if u.status in {"ACCEPTED", "HELD", "CONFLICT"})
+        if not strict_fact_only:
+            selected.update(u.fact_id for u in current if u.status in {"ACCEPTED", "HELD", "CONFLICT"})
         for record_id in r.staged_review_ids.values():
             record = s.review_records[record_id]
             if record.review.verdict != "REJECT":
@@ -202,11 +214,13 @@ def build_memory_context(runtime, review_id, *, batch_size=None):
             else:
                 rejected_records.append(dict(fact_id=record.review.fact_id, record_hash=record.record_hash))
     if r.target_binding_id:
-        selected.update(proof_facts(s, r.target_binding_id))
+        if not strict_fact_only:
+            selected.update(proof_facts(s, r.target_binding_id))
     pack = evidence_pack(runtime, qid=r.query_id, fact_ids=selected, extra_refs=r.extra_refs)
     # Parent proof facts remain visible in the working-memory pack, but a
     # binding_result may select only direct uses of this query instance.
-    allowed_support = sorted({u.fact_id for u in eligible}) if fact_only else sorted(selected)
+    allowed_support = (sorted(selected) if strict_fact_only else
+                       sorted({u.fact_id for u in eligible}) if fact_only else sorted(selected))
     allowed_reviews = [] if fact_only else sorted({u.fact_id for u in current if u.fact_id in selected})
     scanning = any(j.target_query == r.query_id and j.kind == "RECALL" and j.status not in {"DONE", "CANCELLED"}
                    for j in s.jobs.values())
@@ -215,6 +229,11 @@ def build_memory_context(runtime, review_id, *, batch_size=None):
     branch = next((b for b in r.branches if b.branch_id not in r.branch_results), None) if phase == "FINAL" else None
     if dynamic and phase == "FINAL" and branch is None:
         raise ValueError("MEMBER_BRANCHES_ALREADY_COMPLETED")
+    upstream_only = allow_upstream_inference(s, r.query_id, branch) if strict_fact_only else False
+    admission_digest = (digest([s.admission_policy, r.query_id, r.query_version, r.input_signature,
+                                sorted(r.admitted_use_tokens.items()), r.prior_support_use_ids,
+                                [(p, s.executions[p].current_binding_id) for p in query(s, r.query_id).depends_on]])
+                        if strict_fact_only else "")
     ctx = MemoryContextR2(context_id="", review_id=review_id, state_revision=s.state_revision,
                          allowed_mode=r.mode, phase=phase, query_id=r.query_id, query_version=r.query_version,
                          expected_cardinality=None if dynamic else query(s, r.query_id).cardinality,
@@ -229,7 +248,9 @@ def build_memory_context(runtime, review_id, *, batch_size=None):
                                        can_finalize=not scanning and not remaining and collection_ready,
                                        rejected_records=rejected_records),
                          scope_closed=s.scope_closed, context_limits=dict(before=cfg.source_context_before, after=cfg.source_context_after),
-                         fact_only=fact_only, member_bindings=dynamic, branch=branch)
+                         fact_only=fact_only, member_bindings=dynamic, branch=branch,
+                         admission_policy=s.admission_policy, admission_digest=admission_digest,
+                         upstream_only_allowed=upstream_only)
     ctx.context_id = "MC" + digest([runtime.run_id, ctx.model_dump(mode="json")])
     return ctx
 

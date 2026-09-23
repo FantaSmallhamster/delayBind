@@ -221,6 +221,7 @@ def rebuild(state):
 
 def assert_invariants(state):
     from .member_graph_r2 import assert_member_invariants
+    from .memory_admission_r2 import strict, current_support_uses
 
     if enabled(state):
         assert_member_invariants(state)
@@ -238,6 +239,24 @@ def assert_invariants(state):
         for rid in ex.blocking_review_ids:
             if rid not in state.reviews or state.reviews[rid].status in {"DONE", "CANCELLED"}:
                 raise ValueError("ORPHAN_REVIEW_BARRIER")
+    if strict(state):
+        for use in state.uses.values():
+            if use.admission_token and use.admission_origin not in {"UPDATE", "RECALL"}:
+                raise ValueError("INVALID_ADMISSION_ORIGIN")
+        for review in state.reviews.values():
+            if review.status in {"DONE", "CANCELLED", "WAITING_RECALL"}:
+                continue
+            ex = state.executions[review.query_id]
+            if (review.query_version, review.input_signature) != (ex.version, ex.input_signature):
+                raise ValueError("STALE_REVIEW_ADMISSION_INSTANCE")
+            if review.prior_support_use_ids != current_support_uses(state, review.query_id, review.target_binding_id):
+                raise ValueError("STALE_REVIEW_SUPPORT")
+            for key, token in review.admitted_use_tokens.items():
+                use = state.uses.get(key)
+                if (use is None or use.query_id != review.query_id or use.query_version != review.query_version
+                        or use.input_signature != review.input_signature or use.status == "INVALIDATED"
+                        or use.admission_token != token or use.consumed_admission_token == token):
+                    raise ValueError("INVALID_REVIEW_ADMISSION")
     for b in state.binding_store.values():
         if not b.valid:
             continue
