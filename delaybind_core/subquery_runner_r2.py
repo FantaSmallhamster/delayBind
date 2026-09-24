@@ -26,7 +26,6 @@ from .prompts_r2 import (
     MEMBER_MEMORY_PROMPT_VERSION,
     MEMBER_PROMPT_VERSION,
     MEMBER_RECALL_PROMPT_VERSION,
-    MEMBER_UPDATE_PROMPT_VERSION,
     MEMORY_BIND_PROMPT_VERSION,
     PROMPT_VERSION,
     messages,
@@ -174,7 +173,11 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         metadata["memory_bind_prompt_version"] = MEMBER_MEMORY_PROMPT_VERSION if isinstance(plan, EvidencePlanR2) else MEMORY_BIND_PROMPT_VERSION
     if isinstance(plan, EvidencePlanR2):
         metadata["prompt_version"] = MEMBER_PROMPT_VERSION
-        metadata["update_prompt_version"] = MEMBER_UPDATE_PROMPT_VERSION
+        metadata["update_prompt_version"] = prompt_version_for("UPDATE", {
+            "member_bindings": True,
+            "fact_only": runtime.state.fact_only,
+            "plan_hints_enabled": runtime.state.fact_only and cfg.plan_repair_mode == "on_hint",
+        })
         metadata["recall_prompt_version"] = MEMBER_RECALL_PROMPT_VERSION
         metadata["binding_graph_contract"] = "r2-members-1"
         if not cfg.sentence_splitting:

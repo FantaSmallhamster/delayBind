@@ -33,18 +33,28 @@ STRICT_PLAN_PROMPT_VERSION = "v5.2-r2-plan-upstream-only-v1"
 STRICT_PLAN_REPAIR_PROMPT_VERSION = "v5.2-r2-plan-repair-upstream-only-v1"
 STRICT_MEMORY_PROMPT_VERSION = "v5.2-r2-memory-strict-admission-v1"
 STRICT_RECALL_PROMPT_VERSION = "v5.2-r2-recall-strict-admission-v1"
-# Version only the changed interface; UPDATE and REBIND remain text-15.
+# Keep independent versions for each changed interface and the raw UPDATE route.
 MEMORY_BIND_PROMPT_VERSION = "v5.2-r2-memory-bind-text-16-query-answer"
 MEMBER_PROMPT_VERSION = "v5.2-r2-member-graph-text-18"
-MEMBER_UPDATE_PROMPT_VERSION = "v5.2-r2-member-graph-text-19-instantiated-update"
+MEMBER_UPDATE_RAW_PROMPT_VERSION = "v5.2-r2-member-graph-text-19-instantiated-update"
+MEMBER_UPDATE_PROMPT_VERSION = "v5.2-r2-member-graph-text-27-source-clause"
+MEMBER_UPDATE_HINT_PROMPT_VERSION = MEMBER_UPDATE_PROMPT_VERSION + "-on-hint"
 MEMBER_RECALL_PROMPT_VERSION = "v5.2-r2-member-graph-text-24-strict-recall"
-MEMBER_MEMORY_PROMPT_VERSION = "v5.2-r2-member-graph-text-23-strict-admission"
+MEMBER_MEMORY_PROMPT_VERSION = "v5.2-r2-member-graph-text-26-current-query-only"
 
 MEMBER_UPDATE_ROUTING_INSTRUCTION = (
     "\nA query ID may appear on multiple target lines: each is a compatible upstream-member branch. "
     "Match facts against any displayed branch and output the original query ID, not a new branch ID. "
     "Concrete entities are fixed constraints for that branch; only remaining ?variables are unknown. "
     "Do not combine inputs from different target lines or repeat an identical fact for the same query ID."
+)
+
+MEMBER_FACT_ONLY_UPDATE_ROUTING_INSTRUCTION = (
+    "\nA query ID may have concrete branch targets and an unbound template. "
+    "Match any displayed target and output its original query ID. Concrete entities remain fixed; "
+    "?variables in a template permit named candidates for upstream members not yet established. "
+    "Retaining such a fact does not bind a variable or replace an existing input. "
+    "Do not combine different concrete branches or repeat the same fact for the same query ID."
 )
 
 MEMBER_RECALL_SELECTION_INSTRUCTION = (
@@ -57,8 +67,8 @@ MEMBER_RECALL_SELECTION_INSTRUCTION = (
 
 MEMBER_INTERFACE_PROMPT_VERSIONS = {
     "RECALL": MEMBER_RECALL_PROMPT_VERSION,
-    "UPDATE": MEMBER_UPDATE_PROMPT_VERSION,
-    "UPDATE_REPAIR": MEMBER_UPDATE_PROMPT_VERSION,
+    "UPDATE": MEMBER_UPDATE_RAW_PROMPT_VERSION,
+    "UPDATE_REPAIR": MEMBER_UPDATE_RAW_PROMPT_VERSION,
 }
 
 # Preserve the raw-review route; the new contract below is fact-only.
@@ -247,6 +257,37 @@ Output contract:
 - Route one line to one query. If the same fact is relevant to multiple targets, repeat it once under each applicable query.
 - Output fact lines only, with no header, explanation, state, source ID, evidence index, or JSON.
 - Omit a target that has no supported fact. "Not mentioned", "not provided", and "cannot determine" are not facts.
+
+Before returning NONE, inspect every extraction target once more for direct statements, ordinary paraphrases, and unambiguous inverse relations. Return a single standalone NONE only when the current text contains no relevant fact for any target.
+"""
+
+UPDATE_FACT_ONLY_SOURCE_CLAUSE = """Interface UPDATE, role LOW. Read only the Current window and retain every source-supported fact relevant to any displayed extraction target. Favor recall; leave acceptance, uniqueness, binding, rebinding, and the final answer to runtime and MEMORY. Do not answer the full Question.
+
+Match the target by meaning:
+- Direct statements, unambiguous paraphrases, and inverse expressions can qualify. Keep the source's relationship and roles rather than rewriting them to mimic the target.
+- For a father target, source text "Georg is the son of Jobst" can be routed as Q1 | Georg is the son of Jobst. It does not by itself establish whether Jobst is the father.
+- For a husband target, source text "Anne was the child bride of Richard" can be routed as Q1 | Anne was the child bride of Richard. Do not silently replace bride with wife or add an unsupported time claim.
+- An unbound ?variable permits a concrete source candidate; a name already substituted into a target is fixed. Preserve relation direction, negation, time, identity, and scope. Do not combine different concrete branches or treat a retained candidate as a binding.
+
+Preserve the evidence:
+- Copy the smallest self-contained source sentence or clause that keeps the relevant relationship, named entities, necessary roles, negation, time, qualifiers, aliases, and location detail. Shorten or rephrase only as needed to make it self-contained or to separate independent members; never change its meaning.
+- A short compound clause is better than dropping a necessary qualifier. When a nearby sentence in the same document explicitly supplies a role or identity needed to understand the relationship, retain the minimum necessary clauses together. Resolve a pronoun or alias only when its referent is unambiguous within that document.
+- Preserve the source's precision. Do not turn a date into a place, nationality or "Russian-born" into a specific birthplace, a relative into a different family role, or plausible context into a stated fact. Do not invent a value to fill a target.
+- <DOCUMENT_BOUNDARY> separates independent documents. Never join an entity, pronoun, alias, relationship, or value across that boundary into one fact.
+
+Independent values:
+- Retain every independently supported member or value. Put independent values on separate complete lines when this can be done without losing their supporting meaning or qualifiers. Do not split a single proper name such as "Trinidad and Tobago".
+- Example: source "In 1999, Film X was directed by Ada and Bea" may yield:
+  Q1 | In 1999, Film X was directed by Ada.
+  Q1 | In 1999, Film X was directed by Bea.
+
+Output contract:
+- Output exactly two fields separated by |: query ID | complete source-supported fact.
+- Use only the Q1, Q2, ... IDs listed under Extraction targets.
+- Each fact must be self-contained and fit on one output line; it may retain multiple necessary source clauses. Never output only an answer value, an unsupported inference, or a whole document.
+- Route one line to one query. If the same fact is relevant to multiple targets, repeat it once under each applicable query.
+- Output fact lines only, with no header, explanation, state, source ID, evidence index, or JSON.
+- Omit targets with no supported fact. "Not mentioned", "not provided", and "cannot determine" are not facts.
 
 Before returning NONE, inspect every extraction target once more for direct statements, ordinary paraphrases, and unambiguous inverse relations. Return a single standalone NONE only when the current text contains no relevant fact for any target.
 """
@@ -615,7 +656,6 @@ def _member_fact_only_memory_view(payload):
         for member in previous.get("members", [])
     ]
     return "\n\n".join([
-        "Question:\n" + payload["question"],
         "Evidence mode:\nFACT_ONLY",
         "Current query:\n" + f"{instance['id']} | {rendered}\noutput={instance['output']}",
         "Mode:\n" + payload["allowed_mode"],
@@ -636,6 +676,17 @@ def _member_request_view(interface, payload):
                 + _member_request_view("MEMORY", original))
     if interface == "MEMORY" and payload.get("fact_only"):
         return _member_fact_only_memory_view(payload)
+    if interface in {"UPDATE", "UPDATE_REPAIR"} and payload.get("fact_only"):
+        rows = ["Question:", payload["question"], "Extraction targets:",
+                extraction_targets_view(payload["query_graph"], preserve_unbound_templates=True),
+                "Current window:", plain_text_view(payload["window_sources"])]
+        if interface == "UPDATE_REPAIR":
+            rows += ["Frozen repair targets:", display(payload["repair_targets"]),
+                     "Rejected items:", display(payload["rejected_items"]),
+                     "Retained items (do not repeat):", display(payload["retained_items"])]
+        if payload.get("validation_errors"):
+            rows += ["Validation errors:", str(payload["validation_errors"])]
+        return "\n\n".join(rows)
     return request_view(interface, payload)
 
 
@@ -653,6 +704,9 @@ def prompt_version_for(interface, payload):
     if interface in {"MEMORY", "MEMORY_REPAIR"} and original.get("fact_only") and not original.get("member_bindings") and original.get("admission_policy") == "strict-recall-v1":
         return STRICT_MEMORY_PROMPT_VERSION
     if original.get("member_bindings"):
+        if interface in {"UPDATE", "UPDATE_REPAIR"} and original.get("fact_only"):
+            return (MEMBER_UPDATE_HINT_PROMPT_VERSION if original.get("plan_hints_enabled")
+                    else MEMBER_UPDATE_PROMPT_VERSION)
         if interface in {"MEMORY", "MEMORY_REPAIR"} and original.get("fact_only"):
             return MEMBER_MEMORY_PROMPT_VERSION
         return MEMBER_INTERFACE_PROMPT_VERSIONS.get(interface, MEMBER_PROMPT_VERSION)
@@ -684,13 +738,35 @@ def messages(interface, payload):
     original = payload.get("original_memory_request", payload)
     fact_only = bool(original.get("fact_only"))
     dynamic = bool(original.get("member_bindings"))
-    update = UPDATE_FACT_ONLY if fact_only else UPDATE
+    update = (UPDATE_FACT_ONLY_SOURCE_CLAUSE if dynamic else UPDATE_FACT_ONLY) if fact_only else UPDATE
+    if fact_only and dynamic and original.get("plan_hints_enabled") and interface in {"UPDATE", "UPDATE_REPAIR"}:
+        update = update.replace(
+            "- Output exactly two fields separated by |: query ID | complete source-supported fact.",
+            "- Output two fields: query ID | complete source-supported fact, or the PLAN_HINT exception below.")
+        update = update.replace(
+            "- Use only the Q1, Q2, ... IDs listed under Extraction targets.",
+            "- Use only listed Q IDs for facts; PLAN_HINT is the exception below.")
+        update = update.replace(
+            "- Output fact lines only, with no header, explanation, state, source ID, evidence index, or JSON.",
+            "- Output only fact or PLAN_HINT lines, with no header, explanation, state, source ID, evidence index, or JSON.")
+        update = update.replace(
+            "Return a single standalone NONE only when the current text contains no relevant fact for any target.",
+            "Return a single standalone NONE only when there is neither a target fact nor a supported plan-gap hint.")
+        update += (
+            "\nIf the current text explicitly supports a necessary evidence relation absent from every "
+            "extraction target, output PLAN_HINT | source-supported fact and missing evidence need. "
+            "A missing value for an existing target is not a plan gap. Do not propose final-answer "
+            "comparison or counting queries."
+        )
+        if interface == "UPDATE_REPAIR":
+            update += "\nOnly repair displayed frozen PLAN_HINT targets; do not add a new hint."
     bind_only = fact_only and original.get("allowed_mode") == "BIND"
     memory = MEMORY_FACT_ONLY_BIND if bind_only else MEMORY_FACT_ONLY if fact_only else MEMORY
     if fact_only and original.get("admission_policy") == "strict-recall-v1":
         memory += UPSTREAM_ONLY_RULE
     if dynamic:
-        update += MEMBER_UPDATE_ROUTING_INSTRUCTION
+        update += (MEMBER_FACT_ONLY_UPDATE_ROUTING_INSTRUCTION if fact_only
+                   else MEMBER_UPDATE_ROUTING_INSTRUCTION)
         if fact_only:
             memory = MEMORY_MEMBERS + (UPSTREAM_ONLY_RULE if original.get("admission_policy") == "strict-recall-v1" else "")
         elif original.get("phase") == "FINAL":
@@ -731,6 +807,8 @@ def messages(interface, payload):
     system = (SYSTEM_FACT_ONLY_UPDATE if fact_only and interface in {"UPDATE", "UPDATE_REPAIR"}
               else SYSTEM_FACT_ONLY_BIND if bind_only and not dynamic and interface in {"MEMORY", "MEMORY_REPAIR"}
               else SYSTEM_FACT_ONLY if fact_only else SYSTEM)
+    if fact_only and dynamic and original.get("plan_hints_enabled") and interface in {"UPDATE", "UPDATE_REPAIR"}:
+        system = system.replace("pipe-delimited fact lines", "pipe-delimited fact or PLAN_HINT lines")
     view = _member_request_view(interface, payload) if dynamic else request_view(interface, payload)
     if interface == "MEMORY" and fact_only and not dynamic and original.get("admission_policy") == "strict-recall-v1":
         view = view.replace("Existing binding:\n", "Upstream-only inference:\n" +

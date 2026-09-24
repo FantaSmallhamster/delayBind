@@ -170,6 +170,8 @@ def build_update_context(runtime, question, refs, *, counter=None):
         fact_only=fact_only,
     )
     payload["member_bindings"] = enabled(runtime.state)
+    if fact_only and payload["member_bindings"]:
+        payload["plan_hints_enabled"] = runtime.config.plan_repair_mode == "on_hint"
     payload["context_id"] = "UC" + digest([runtime.run_id, payload])
     runtime.store.save_context_manifest(
         runtime.run_id,

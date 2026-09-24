@@ -48,6 +48,18 @@ def test_empty_input_markers_do_not_look_like_output_commands():
     assert "Who are the members of Team Red?" in text
 
 
+@pytest.mark.parametrize("interface", ["MEMORY", "MEMORY_REPAIR"])
+def test_fact_only_member_memory_omits_global_question(interface):
+    data = payload()
+    request = data if interface == "MEMORY" else repair("NOOP", "invalid response", data)
+    contents = [message["content"] for message in messages(interface, request)]
+    assert all("Where were Team Red's members born?" not in content for content in contents)
+    view = contents[-1].split("Input data:\n", 1)[1]
+    assert "Question:\n" not in view
+    assert "Current query:\nQ2 | Who are the members of Team Red?\noutput=?person" in view
+    assert "Effective upstream bindings:\n?team=Team Red" in view
+
+
 def test_previous_members_are_labeled_not_two_field_commands():
     text = messages("MEMORY", payload(old=True))[1]["content"].split("Input data:\n", 1)[1]
     assert "Existing binding:\nvalue=Alice; support=F1" in text

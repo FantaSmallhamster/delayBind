@@ -8,7 +8,7 @@ import asyncio
 from delaybind_core.context_r2 import build_update_context
 from delaybind_core.member_graph_r2 import branches_for
 from delaybind_core.navigation_r2 import query_projection, query_ready
-from delaybind_core.prompts_r2 import messages
+from delaybind_core.prompts_r2 import MEMBER_UPDATE_HINT_PROMPT_VERSION, messages
 from delaybind_core.protocol_r2 import parse_update, parse_memory
 from delaybind_core.memory_r2 import apply_memory
 from delaybind_core.schema_r2 import EvidencePlanR2
@@ -35,7 +35,7 @@ def finish_backgrounds(r, qid, mapping):
         decide(r, qid, (value, [fid]))
 
 
-def test_single_binding_instantiates_update_but_never_rewrites_plan_or_recall():
+def test_single_binding_keeps_concrete_and_future_member_update_targets():
     p = EvidencePlanR2(plan_id="film", queries=[
         dict(id="Q1", template="Who directed Film Cedar?", output="?director"),
         dict(id="Q2", template="What is the place of birth of ?director?", output="?place",
@@ -53,7 +53,8 @@ def test_single_binding_instantiates_update_but_never_rewrites_plan_or_recall():
     assert q2["extraction_instances"][0]["parent_member_ids"] == [current(r, "Q1").members[0].member_id]
     wire = messages("UPDATE", after)[1]["content"].split("Input data:\n", 1)[1]
     assert "Q2 | What is the place of birth of Otakar Vávra?" in wire
-    assert "?director" not in wire
+    assert "Q2 | What is the place of birth of ?director?" in wire
+    assert extraction_targets_view(after["query_graph"]).count("Q2 | ") == 1
     assert "parent_member_ids" not in wire and "branch_id" not in wire
     assert r.export() == state_before_projection
     assert r.state.plan == p
@@ -136,6 +137,7 @@ def test_no_compatible_join_does_not_fall_back_to_broad_template():
     graph = snapshot(r)["query_graph"]
     assert extraction_queries(next(q for q in graph["queries"] if q["id"] == "Q5")) == []
     assert "Q5 |" not in extraction_targets_view(graph)
+    assert "Q5 |" not in extraction_targets_view(graph, preserve_unbound_templates=True)
     assert "What connects" not in queries_view(graph)
     assert "Q5 [ACTIVE] evidence needed" not in update_routing_view(graph)
 
@@ -226,7 +228,7 @@ def test_real_runner_refreshes_update_targets_between_windows():
                 assert n == 3
                 assert "Q3 | Where was Alice born?" in data["body"]
                 assert "Q3 | Where was Bob born?" in data["body"]
-                assert "Q3 | Where was ?person born?" not in data["body"]
+                assert "Q3 | Where was ?person born?" in data["body"]
                 return "Q3 | Alice was born in Paris.\nQ3 | Bob was born in Rome."
             if interface == "RECALL":
                 return "SELECT " + ",".join(data["selectable"]) if data["selectable"] else "NONE"
@@ -261,3 +263,64 @@ def test_real_runner_refreshes_update_targets_between_windows():
     assert result["status"] == "ANSWERED", result["reason_codes"]
     assert len(client.updates) == result["windows_processed"] == 3
     assert result["r2_metrics"]["transaction_replay_consistency"] == 1
+
+
+def test_future_member_evidence_survives_same_window_as_new_member():
+    from delaybind_core.data import canonicalize_record, build_manifest
+    from delaybind_core.smoke_r2 import read_request
+
+    class Client:
+        def __init__(self):
+            self.updates = []
+
+        async def complete(self, *, interface, messages, **kwargs):
+            data = read_request(messages)
+            if interface == "UPDATE":
+                self.updates.append(data["body"])
+                if len(self.updates) == 1:
+                    return "Q1 | Film X was directed by Ada.\nQ2 | Ada was born in Paris."
+                assert "Q2 | Where was Ada born?" in data["body"]
+                assert "Q2 | Where was ?director born?" in data["body"]
+                return "Q1 | Film X was directed by Bea.\nQ2 | Bea was born in Rome."
+            if interface == "RECALL":
+                return "SELECT " + ",".join(data["selectable"]) if data["selectable"] else "NONE"
+            if interface == "MEMORY":
+                facts = {f["text"]: f["fact_id"] for f in data["facts"]}
+                if data["query_id"] == "Q1":
+                    members = [(name, facts.get(f"Film X was directed by {name}.")) for name in ("Ada", "Bea")]
+                    return "\n".join(f"BOUND | {name} | {fid}" for name, fid in members if fid) or "NOOP"
+                for person, city in (("Ada", "Paris"), ("Bea", "Rome")):
+                    if data["rendered_query"] == f"Where was {person} born?":
+                        fid = facts.get(f"{person} was born in {city}.")
+                        return f"BOUND | {city} | {fid}" if fid else "NOOP"
+                raise AssertionError(data["rendered_query"])
+            if interface == "ANSWER":
+                assert "Ada was born in Paris." in data["body"]
+                assert "Bea was born in Rome." in data["body"]
+                return r"\boxed{Paris and Rome}"
+            raise AssertionError(interface)
+
+    plan = EvidencePlanR2(plan_id="two-window", queries=[
+        dict(id="Q1", template="Who directed Film X?", output="?director"),
+        dict(id="Q2", template="Where was ?director born?", output="?city",
+             inputs={"?director": "Q1"}),
+    ])
+    sample = canonicalize_record(dict(
+        id="two-window", question="Where were Film X's directors born?",
+        context=[["First", ["Film X was directed by Ada. Ada was born in Paris."]],
+                 ["Second", ["Film X was directed by Bea. Bea was born in Rome."]]],
+    ))
+    client = Client()
+    result = asyncio.run(V5Runner(client, config=RunnerConfig(
+        protocol_version="v5.2-r2", sentence_splitting=False, chunk_size=1,
+        plan_repair_mode="on_hint")).run(
+            run_id="two-window", sample=sample, manifest=build_manifest(sample),
+            store=SQLiteEventStore(), plan=plan))
+    assert result["status"] == "ANSWERED", result["reason_codes"]
+    assert len(client.updates) == result["windows_processed"] == 2
+    assert result["config"]["update_prompt_version"] == MEMBER_UPDATE_HINT_PROMPT_VERSION
+    nodes = result["state"]["member_graph"]["nodes"]
+    directors = {node["value"]: node["member_id"] for node in nodes if node["query_id"] == "Q1"}
+    cities = {(node["value"], tuple(node["parent_member_ids"])) for node in nodes if node["query_id"] == "Q2"}
+    assert set(directors) == {"Ada", "Bea"}
+    assert cities == {("Paris", (directors["Ada"],)), ("Rome", (directors["Bea"],))}

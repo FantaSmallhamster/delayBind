@@ -99,11 +99,21 @@ def queries_view(graph):
     return "\n".join(rows) or "NONE"
 
 
-def extraction_targets_view(graph):
-    """Render only extraction targets so runtime state cannot bias fact recall."""
+def extraction_targets_view(graph, *, preserve_unbound_templates=False):
+    """Render UPDATE targets, optionally retaining future member evidence needs.
+
+    The template is an extraction target only. It does not create a compatible
+    member branch or change the concrete targets used by MEMORY and RECALL.
+    """
     rows = []
     for q in graph.get("queries", []):
-        rows.extend(f"{q['id']} | {rendered}" for rendered in query_targets(q))
+        targets = query_targets(q)
+        template = q.get("template", "")
+        if (preserve_unbound_templates and targets and q.get("member_bindings")
+                and q.get("inputs") and template not in targets
+                and any(variable in template for variable in q["inputs"])):
+            targets = [*targets, template]
+        rows.extend(f"{q['id']} | {rendered}" for rendered in targets)
     return "\n".join(rows) or "NONE"
 
 

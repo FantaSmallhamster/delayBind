@@ -33,7 +33,7 @@ Alice、Bob 都依赖同一个 Team Red 节点及其证明；Paris 只继承 Ali
 
 主要流程：
 
-1. UPDATE 仍抽取完整原子事实并按查询模板 QID 路由；不猜结果个数，分句实现仍是 syntok。
+1. UPDATE 按查询模板 QID 路由有来源支持的事实；成员图事实模式保留最小自足的原文句子或子句，不猜结果个数，分句实现仍是 syntok。
 2. RECALL 对查询模板扫描完整候选桶，涵盖所有成员；后续 MEMORY 再做具体实体匹配。
 3. Runtime 从有效上游成员生成具体分支，每个 MEMORY FINAL 请求只代入该分支的实体，绝不把名字列表拼进一个实体槽。
 4. 多父汇合使用 lineage 相容性连接：同一祖先必须是同一成员，防止甲的城市与乙的学校交叉配对；独立祖先才做组合。
@@ -49,7 +49,7 @@ Alice、Bob 都依赖同一个 Team Red 节点及其证明；Paris 只继承 Ali
 缺证据的分支标为 `UNRESOLVED_MEMBER_BRANCH`，不是空集合。计数、全部成员、否定等结论仍需完整性依据；不能因 query RESOLVED 就假定成员已穷尽。
 
 单查询分支展开上限 1024，超过则明确 `MEMBER_BRANCH_BUDGET`，不静默截断；仍受既有调用次数、轮数、token 预算限制。
-新建 fact-only 运行使用 `strict-recall-v1` 准入策略和 `v5.2-r2-member-graph-text-23-strict-admission` MEMORY 提示词。历史 B/P17 提示词、快照及测试结果保留，不等于当前默认提示词。
+新建 fact-only 运行使用 `strict-recall-v1` 准入策略和 `v5.2-r2-member-graph-text-26-current-query-only` MEMORY 提示词。历史 B/P17 提示词、快照及测试结果保留，不等于当前默认提示词。
 
 ## 新运行的事实准入与空工作规则
 
@@ -131,12 +131,15 @@ Q1 | Cindy 的老师是 Alice。
 Q2 | Alice 的母亲是 Mary。
 ```
 
-UPDATE 输入在不同文档间显式加入 `<DOCUMENT_BOUNDARY>`；每行只允许一个主体—关系—值的原子命题，
-多个人、地点或属性必须拆行，不得跨文档拼接。多行事实由协议直接拒绝。
+UPDATE 输入在不同文档间显式加入 `<DOCUMENT_BOUNDARY>`；成员图事实模式的每行保留最小自足的来源句子或子句，
+必要的角色、时间和限定不能因拆分而丢失。独立成员在保留支持含义的前提下拆行，不得跨文档拼接；单条事实中的换行仍由协议拒绝。
 当前事实模式提示要求逐一匹配 Plan 中所有问题：未实例化的 `?变量` 可匹配任意具体实体或值，
 其余关系、方向和限定条件必须与原文一致，已实例化的具体值仍须匹配。不得为了匹配问题改写原文关系。
-按两字段事实行的输出要求，当前事实模式提示不再要求输出 `PLAN_HINT`；解析器保留兼容能力，
-但本提示下不主动生成新的计划修复线索。
+成员图 UPDATE 在已有上游成员时，同时展示具体成员目标与原查询模板：具体目标指引当前分支，
+模板只用于保留未来新增或纠正成员的下游候选事实，不创建成员绑定，也不扩大 MEMORY/RECALL 的具体分支。
+显式无兼容分支的空自然连接仍不退回模板。`plan_repair_mode=on_hint` 时，事实模式还允许
+`PLAN_HINT | 原文支持的事实及缺少的证据需求`；已有目标缺少答案不算计划缺项，最终比较或计数
+也不应新增为计划查询。UPDATE_REPAIR 只能修复冻结的失败条目。
 
 事实写入后，MEMORY、RECALL、PLAN REPAIR 和 ANSWER 均不恢复 Archive 原文。MEMORY 没有 REVIEW / CONTEXT / CORRECTION
 阶段，只在当前 query 的具体分支中逐成员输出：
@@ -151,7 +154,7 @@ BOUND | Bob | F2
 原文索引、状态、reason、proof kind 或绑定版本。ANSWER 仍读取完整的有效工作记忆并完成最终推理，不直接返回叶子绑定。
 新运行无 SET/SINGLE：多个值分别输出多行，不能用数组或拼接字符串冒充一个成员；带 and/逗号的单个专名不因此拆开。
 
-事实模式的 MEMORY 输入只显示当前 query、Eligible facts、有效上游绑定和现有绑定；
+成员图事实模式的 MEMORY/MEMORY_REPAIR 输入显示当前子问题、Eligible facts、有效上游绑定和现有绑定，不传总问题的 `Question` 区块；
 不显示 FactUse 的 PENDING/CANDIDATE 内部状态、完整 barriers、`Decision authorized` 或 `scope_closed=false`。
 Eligible facts 使用本次请求内的短 ID `F1/F2`，解析后由 Runtime 映射回不可变的持久化 fact ID；未知或重复短 ID
 仍在协议边界拒绝。MEMORY 按固定实体、变量绑定、关系方向及限定条件逐项判断，多个可同时成立的结果不因数量而视为冲突。
