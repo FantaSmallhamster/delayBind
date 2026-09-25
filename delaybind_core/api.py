@@ -24,17 +24,6 @@ class ModelAPIError(RuntimeError):
     pass
 
 
-class ModelCompletion(str):
-    """String-compatible response carrying provider completion bookkeeping."""
-
-    def __new__(cls, content, *, finish_reason=None, input_tokens=None, output_tokens=None):
-        result = super().__new__(cls, content)
-        result.finish_reason = finish_reason
-        result.input_tokens = input_tokens
-        result.output_tokens = output_tokens
-        return result
-
-
 @dataclass(frozen=True)
 class APIConfig:
     base_url: str
@@ -89,19 +78,6 @@ class OpenAICompatibleClient:
             return response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ModelAPIError("OpenAI-compatible response has no choices[0].message.content") from exc
-
-    @classmethod
-    def _completed_content(cls, response: dict[str, Any], *, require_complete=False) -> ModelCompletion:
-        content = cls._extract_content(response)
-        if not isinstance(content, str):
-            raise ModelAPIError("OpenAI-compatible response content is not text")
-        reason = response["choices"][0].get("finish_reason")
-        if require_complete and reason != "stop":
-            raise ModelAPIError(f"INCOMPLETE_MODEL_RESPONSE:{reason or 'missing_finish_reason'}")
-        usage = response.get("usage") or {}
-        return ModelCompletion(content, finish_reason=reason,
-                               input_tokens=usage.get("prompt_tokens"),
-                               output_tokens=usage.get("completion_tokens"))
 
     def _call_sync(self, payload: dict[str, Any]) -> tuple[dict[str, Any], float]:
         base = self.config.base_url.rstrip("/")
@@ -176,21 +152,9 @@ class OpenAICompatibleClient:
         response_schema: dict[str, Any] | None = None,
         extra: dict[str, Any] | None = None,
         agent_role: str | None = None,
-        local_metadata: dict[str, Any] | None = None,
     ) -> str:
-        if self.store is not None and self.store.connection.in_transaction:
-            raise RuntimeError("MODEL_CALL_DURING_RUNTIME_TRANSACTION")
-        audit_fields = {"protocol_version", "memory_mode", "review_phase", "context_id", "review_id", "raw_bundle_hash"}
-        if local_metadata is not None and set(local_metadata) - (audit_fields | {"memory_interface_version"}):
-            raise ValueError("UNKNOWN_LOCAL_AUDIT_FIELD")
-        audit = {key: value for key, value in (local_metadata or {}).items() if key in audit_fields}
-        require_complete = (interface in {"MEMORY", "MEMORY_REPAIR"}
-                            and (local_metadata or {}).get("memory_interface_version") == "query-facts-result-v1")
         payload = self._request_payload(interface, messages, response_schema=response_schema, extra=extra)
-        cache_identity = {"payload": payload, "agent_role": agent_role}
-        if local_metadata:
-            cache_identity["local_metadata"] = local_metadata
-        serialized = json.dumps(cache_identity, ensure_ascii=False, sort_keys=True)
+        serialized = json.dumps({"payload": payload, "agent_role": agent_role}, ensure_ascii=False, sort_keys=True)
         request_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         prompt_hash = hashlib.sha256(
             json.dumps(messages, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -198,10 +162,6 @@ class OpenAICompatibleClient:
         if self.store is not None:
             cached = self.store.find_cached_model_call(run_id, request_hash)
             if cached is not None and cached.parsed_output is not None and cached.error is None:
-                completed = (self._completed_content(cached.raw_response, require_complete=True)
-                             if require_complete else ModelCompletion(
-                                 str(cached.parsed_output), input_tokens=cached.input_tokens,
-                                 output_tokens=cached.output_tokens))
                 self.store.append_model_call(
                     cached.model_copy(
                         update={
@@ -211,19 +171,17 @@ class OpenAICompatibleClient:
                         }
                     )
                 )
-                return completed
+                return str(cached.parsed_output)
         last_error: Exception | None = None
         for attempt in range(1, self.config.max_retries + 2):
             call_id = str(uuid4())
-            response, latency_ms = None, None
             try:
                 response, latency_ms = await asyncio.to_thread(self._call_sync, payload)
-                content = self._completed_content(response, require_complete=require_complete)
+                content = self._extract_content(response)
                 if self.store is not None:
                     usage = response.get("usage") or {}
                     self.store.append_model_call(
                         ModelCall(
-                            **audit,
                             call_id=call_id,
                             run_id=run_id,
                             interface=interface,  # type: ignore[arg-type]
@@ -242,13 +200,11 @@ class OpenAICompatibleClient:
                         )
                     )
                 return content
-            except Exception as exc:
+            except Exception as exc:  # API adapters must preserve each failed attempt in future revisions.
                 last_error = exc
                 if self.store is not None:
-                    usage = (response or {}).get("usage") or {}
                     self.store.append_model_call(
                         ModelCall(
-                            **audit,
                             call_id=call_id,
                             run_id=run_id,
                             interface=interface,  # type: ignore[arg-type]
@@ -258,12 +214,9 @@ class OpenAICompatibleClient:
                             parameters=payload,
                             prompt_hash=prompt_hash,
                             raw_request=payload,
-                            raw_response=response,
+                            raw_response=None,
                             parsed_output=None,
                             attempt=attempt,
-                            latency_ms=latency_ms,
-                            input_tokens=usage.get("prompt_tokens"),
-                            output_tokens=usage.get("completion_tokens"),
                             error=str(exc),
                         )
                     )

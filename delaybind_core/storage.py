@@ -11,11 +11,9 @@ from typing import Any, Iterator
 
 from .manifest import ManifestEntry
 from .schema import ModelCall, RuntimeEvent
-from .storage_archive_r2 import R2ArchiveStorageMixin
-from .storage_r2 import R2StorageMixin
 
 
-class SQLiteEventStore(R2ArchiveStorageMixin, R2StorageMixin):
+class SQLiteEventStore:
     def __init__(self, path: str = ":memory:"):
         self.path = path
         if path != ":memory:":
@@ -24,8 +22,6 @@ class SQLiteEventStore(R2ArchiveStorageMixin, R2StorageMixin):
         self.connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._initialize()
-        self.initialize_archive()
-        self.initialize_r2()
 
     def _initialize(self) -> None:
         with self.connection:
@@ -83,8 +79,6 @@ class SQLiteEventStore(R2ArchiveStorageMixin, R2StorageMixin):
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            if self.connection.in_transaction:
-                raise RuntimeError("NESTED_TRANSACTION_FORBIDDEN")
             try:
                 self.connection.execute("BEGIN")
                 yield self.connection
@@ -179,25 +173,20 @@ class SQLiteEventStore(R2ArchiveStorageMixin, R2StorageMixin):
         )
 
     def append_model_call(self, call: ModelCall) -> None:
-        # A repeated request after exhausted retries is still a billable attempt;
-        # a cache hit is a separate audit record, not another paid response.
-        with self.transaction() as connection:
-            if connection.execute("SELECT 1 FROM model_calls WHERE run_id=? AND call_id=?",
-                                  (call.run_id, call.call_id)).fetchone():
-                return
-            limits = connection.execute(
-                "SELECT MIN(attempt), MAX(attempt) FROM model_calls WHERE run_id=? AND request_hash=?",
-                (call.run_id, call.request_hash),
-            ).fetchone()
-            if call.cache_hit:
-                attempt = min(0, limits[0] - 1) if limits[0] is not None else 0
-            else:
-                attempt = max(call.attempt, (limits[1] or 0) + 1, 1)
-            stored = call.model_copy(update={"attempt": attempt})
-            connection.execute(
-                "INSERT INTO model_calls (run_id,call_id,request_hash,interface,attempt,payload_json) VALUES (?,?,?,?,?,?)",
-                (stored.run_id, stored.call_id, stored.request_hash, stored.interface, attempt, stored.model_dump_json()),
-            )
+        self.connection.execute(
+            """INSERT OR IGNORE INTO model_calls
+             (run_id,call_id,request_hash,interface,attempt,payload_json)
+             VALUES (?,?,?,?,?,?)""",
+            (
+                call.run_id,
+                call.call_id,
+                call.request_hash,
+                call.interface,
+                call.attempt,
+                call.model_dump_json(),
+            ),
+        )
+        self.connection.commit()
 
     def find_cached_model_call(self, run_id: str, request_hash: str) -> ModelCall | None:
         row = self.connection.execute(
@@ -221,34 +210,22 @@ class SQLiteEventStore(R2ArchiveStorageMixin, R2StorageMixin):
     def model_call_summary(self, run_id: str) -> dict[str, Any]:
         calls = self.list_model_calls(run_id)
         interfaces: dict[str, dict[str, Any]] = {}
-        modes: dict[str, dict[str, Any]] = {}
         for call in calls:
             key = f"{call.agent_role or 'SHARED'}:{call.interface}"
             row = interfaces.setdefault(key, {"records": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0.0})
             row["records"] += 1
-            if call.cache_hit:
-                continue
             row["input_tokens"] += call.input_tokens or 0
             row["output_tokens"] += call.output_tokens or 0
             row["latency_ms"] += call.latency_ms or 0.0
-            if call.memory_mode:
-                mode = modes.setdefault(f"{call.memory_mode}/{call.review_phase}",
-                    {"attempts": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0.0, "failed_attempts": 0})
-                mode["attempts"] += 1
-                mode["input_tokens"] += call.input_tokens or 0
-                mode["output_tokens"] += call.output_tokens or 0
-                mode["latency_ms"] += call.latency_ms or 0.0
-                mode["failed_attempts"] += int(call.error is not None)
         return {
-            **({"memory_mode_phase_usage": modes} if modes else {}),
             "interface_usage": interfaces,
             "model_call_records": len(calls),
             "model_calls": len({call.request_hash for call in calls}),
             "cache_hits": sum(call.cache_hit for call in calls),
             "failed_attempts": sum(call.error is not None for call in calls),
-            "input_tokens": sum(call.input_tokens or 0 for call in calls if not call.cache_hit),
-            "output_tokens": sum(call.output_tokens or 0 for call in calls if not call.cache_hit),
-            "model_latency_ms": sum(call.latency_ms or 0.0 for call in calls if not call.cache_hit),
+            "input_tokens": sum(call.input_tokens or 0 for call in calls),
+            "output_tokens": sum(call.output_tokens or 0 for call in calls),
+            "model_latency_ms": sum(call.latency_ms or 0.0 for call in calls),
         }
 
     def append_raw_span(self, run_id: str, entry: ManifestEntry) -> None:

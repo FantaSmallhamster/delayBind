@@ -56,12 +56,7 @@ class FactUpdate(StrictModel):
 
 class MemoryUpdate(StrictModel):
     bindings: list[BindingProposal] = Field(default_factory=list)
-    keep: list[str] | None = None
-    retract: dict[str, list[str]] = Field(default_factory=dict)
-    unbind: list[str] = Field(default_factory=list)
-    clear_conflicts: dict[str, list[str]] = Field(default_factory=dict)
-    patches: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    routes: dict[str, list[str]] = Field(default_factory=dict)
+    rebindings: list[BindingProposal] = Field(default_factory=list)
     ignored_lines: list[dict[str, str]] = Field(default_factory=list)
     rejected_lines: list[dict[str, str]] = Field(default_factory=list)
 
@@ -103,7 +98,7 @@ def resolve_query_id(value: str, allowed: set[str]) -> str:
 
 
 def _command_line(line: str) -> str:
-    match = re.match(r"^(BIND|KEEP|RETRACT|UNBIND|CLEAR_CONFLICT|PATCH|ROUTE|PLAN_HINT)(?:\s*\|\s*|\s+)(.*)$", line, re.I)
+    match = re.match(r"^(BIND|REBIND|PLAN_HINT)(?:\s*\|\s*|\s+)(.*)$", line, re.I)
     return f"{match[1].upper()} | {match[2]}" if match else line
 
 
@@ -161,17 +156,20 @@ def parse_plan(raw: str) -> QueryPlan:
     return QueryPlan(plan_id="predicted", queries=queries)
 
 
-def parse_binding(line: str) -> BindingProposal:
+def parse_binding(line: str, *, command: str = "BIND") -> BindingProposal:
     fields = line.split("|", 2)
-    if len(fields) != 3 or fields[0].strip() != "BIND" or "|" not in fields[2]:
-        raise ProtocolError(f"invalid BIND line: {line}")
+    command = command.upper()
+    if command not in {"BIND", "REBIND"}:
+        raise ProtocolError(f"unsupported binding command: {command}")
+    if len(fields) != 3 or fields[0].strip().upper() != command or "|" not in fields[2]:
+        raise ProtocolError(f"invalid {command} line: {line}")
     value, refs = (item.strip() for item in fields[2].rsplit("|", 1))
     try:
         result = json.loads(value)
     except json.JSONDecodeError:
         result = _unescape(value)
     if result is None or isinstance(result, str) and not result.strip():
-        raise ProtocolError("BIND needs a concrete result")
+        raise ProtocolError(f"{command} needs a concrete result")
     return BindingProposal(query_id=fields[1].strip(), value=result, support_refs=_refs(refs))
 
 
@@ -259,22 +257,14 @@ def parse_memory(raw: str, *, recover: bool = False) -> MemoryUpdate:
                 result.ignored_lines.append({"line": line, "reason": "EXPLANATION"})
                 continue
             command = _command_line(line)
-            if in_note and not re.match(r"^(BIND|KEEP|RETRACT|UNBIND|CLEAR_CONFLICT|PATCH|ROUTE) \|", command):
+            if in_note and not re.match(r"^(BIND|REBIND) \|", command):
                 result.ignored_lines.append({"line": line, "reason": "EXPLANATION"})
                 continue
             in_note = False
             try:
                 part = parse_memory(command)
                 result.bindings.extend(part.bindings)
-                result.unbind.extend(part.unbind)
-                if part.keep is not None:
-                    result.keep = part.keep
-                for field in ("retract", "clear_conflicts", "patches", "routes"):
-                    target = getattr(result, field)
-                    for query_id, value in getattr(part, field).items():
-                        if query_id in target and target[query_id] != value:
-                            raise ProtocolError(f"incompatible repeated {field} command for {query_id}")
-                        target[query_id] = value
+                result.rebindings.extend(part.rebindings)
             except (ValueError, ValidationError) as exc:
                 result.rejected_lines.append({"line": line, "reason": str(exc)})
         return result
@@ -284,32 +274,18 @@ def parse_memory(raw: str, *, recover: bool = False) -> MemoryUpdate:
     for line in _lines(raw):
         line = _command_line(line)
         command = line.split("|", 1)[0].strip()
-        if command == "BIND":
-            result.bindings.append(parse_binding(line))
+        if command in {"BIND", "REBIND"}:
+            target = result.bindings if command == "BIND" else result.rebindings
+            target.append(parse_binding(line, command=command))
             continue
-        parts = [part.strip() for part in line.split("|", 2)]
-        if command == "KEEP" and len(parts) == 2:
-            result.keep = [] if parts[1].upper() in {"NONE", "[]"} else _refs(parts[1])
-        elif command == "UNBIND" and len(parts) == 2:
-            result.unbind.append(parts[1])
-        elif command in {"RETRACT", "CLEAR_CONFLICT", "ROUTE"} and len(parts) == 3:
-            target = {"RETRACT": result.retract, "CLEAR_CONFLICT": result.clear_conflicts, "ROUTE": result.routes}[command]
-            if parts[1] in target:
-                raise ProtocolError(f"duplicate {command} for {parts[1]}")
-            target[parts[1]] = _refs(parts[2])
-        elif command == "PATCH" and len(parts) == 3:
-            patch = json.loads(parts[2])
-            if not isinstance(patch, dict) or parts[1] in result.patches:
-                raise ProtocolError("PATCH requires one object per query")
-            result.patches[parts[1]] = patch
-        else:
-            raise ProtocolError(f"invalid MEMORY command: {line}")
+        raise ProtocolError(f"invalid MEMORY command: {line}; only BIND and REBIND are allowed")
     return result
 
 
 def normalize_memory_queries(update: MemoryUpdate, allowed: set[str]) -> MemoryUpdate:
     result = update.model_copy(deep=True)
     result.bindings = []
+    result.rebindings = []
     for binding in update.bindings:
         try:
             query_id = resolve_query_id(binding.query_id, allowed)
@@ -318,21 +294,14 @@ def normalize_memory_queries(update: MemoryUpdate, allowed: set[str]) -> MemoryU
             result.bindings.append(binding.model_copy(update={"query_id": query_id}))
         except ProtocolError as exc:
             result.rejected_lines.append({"line": f"BIND | {binding.query_id} | {binding.value} | {','.join(binding.support_refs)}", "reason": str(exc)})
-    for field in ("retract", "clear_conflicts", "routes"):
-        mapping = {}
-        for query_id, refs in getattr(update, field).items():
-            try:
-                normalized = resolve_query_id(query_id, allowed)
-                mapping.setdefault(normalized, []).extend(ref for ref in refs if ref not in mapping.get(normalized, []))
-            except ProtocolError as exc:
-                result.rejected_lines.append({"line": f"{field} | {query_id} | {','.join(refs)}", "reason": str(exc)})
-        setattr(result, field, mapping)
-    result.unbind = []
-    for query_id in update.unbind:
+    for binding in update.rebindings:
         try:
-            result.unbind.append(resolve_query_id(query_id, allowed))
+            query_id = resolve_query_id(binding.query_id, allowed)
+            if any(ref.upper() in {"NONE", "NULL"} for ref in binding.support_refs):
+                raise ProtocolError("REBIND requires accepted supporting fact IDs; omit unsupported bindings")
+            result.rebindings.append(binding.model_copy(update={"query_id": query_id}))
         except ProtocolError as exc:
-            result.rejected_lines.append({"line": f"UNBIND | {query_id}", "reason": str(exc)})
+            result.rejected_lines.append({"line": f"REBIND | {binding.query_id} | {binding.value} | {','.join(binding.support_refs)}", "reason": str(exc)})
     return result
 
 

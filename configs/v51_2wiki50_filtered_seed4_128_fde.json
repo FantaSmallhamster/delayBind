@@ -1,0 +1,51 @@
+{
+  "experiment_id": "v51-2wiki50-filtered-seed4-128-qwen35-9b-fde",
+  "input": "data/test/filtered_seed4_128/eval_2wikimultihopqa_50.json",
+  "expected_data_sha256": "c8bdf141c889766ef7a1aa0e4e8421ddcabe0c1995bf592ff2608b7a6484eeff",
+  "expected_total_samples": 128,
+  "expected_documents": 50,
+  "output_dir": "results/v51-2wiki50-filtered-seed4-128-qwen35-9b-fde",
+  "dataset_id": "2wiki",
+  "methods": [
+    "v5_predicted"
+  ],
+  "orders": [
+    "original"
+  ],
+  "sample_start": 0,
+  "sample_count": 128,
+  "sample_ids": [],
+  "seed": 4,
+  "resume": true,
+  "retry_errors": false,
+  "max_concurrency": 12,
+  "tokenizer_path": "models/Qwen3.5-9B-tokenizer/tokenizer.json",
+  "api": {
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "Qwen/Qwen3.5-9B",
+    "temperature": 0,
+    "top_p": 0.95,
+    "model_seed": null,
+    "max_output_tokens": 10000,
+    "enable_thinking": false,
+    "api_max_retries": 5,
+    "timeout_seconds": 300,
+    "connect_ip": "47.239.215.199"
+  },
+  "runner": {
+    "plan_format": "subqueries",
+    "chunk_size": 5000,
+    "answer_format": "boxed",
+    "memory_token_budget": 8192,
+    "max_model_calls": 1000,
+    "candidate_batch_size": 32,
+    "max_verify_candidates": 1000,
+    "max_plan_retries": 1,
+    "max_response_retries": 1,
+    "verify_source_neighborhood": 0,
+    "defer_unbound": true,
+    "enable_defer_callback": true,
+    "snapshot_every_windows": 1,
+    "min_streaming_windows": 0
+  }
+}

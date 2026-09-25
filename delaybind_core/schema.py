@@ -11,7 +11,6 @@ from enum import Enum
 from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
-from .schema_v52 import BindingRecord, EvidencePackV52, MemoryContext, QueryDependencyEdge, QueryPlanV3, RawEvidence
 
 
 SCHEMA_VERSION = "v1"
@@ -196,23 +195,9 @@ class QueryPlan(StrictModel):
     answer_query_id: str | None = None
 
 
-def parse_query_plan(value: Any) -> QueryPlan | GraphQueryPlan | QueryPlanV3:
+def parse_query_plan(value: Any) -> QueryPlan | GraphQueryPlan:
     """Read new plans and explicitly supplied historical graph plans."""
-    import json
-    if isinstance(value, str):
-        value = json.loads(value)
-    if not isinstance(value, dict):
-        raise ValueError("plan must be a JSON object")
-    version = value.get("schema_version")
-    if version == "r2-members-1":
-        from .schema_r2 import EvidencePlanR2
-        return EvidencePlanR2.model_validate(value)
-    if version == "v3":
-        return QueryPlanV3.model_validate(value)
-    if version not in {None, "v1", "v2"}:
-        raise ValueError(f"unsupported plan schema_version: {version}")
-    # Preserve unversioned historical inputs, but never infer v3 from `queries`.
-    model = QueryPlan if version == "v2" or (version is None and "queries" in value) else GraphQueryPlan
+    model = QueryPlan if isinstance(value, dict) and "queries" in value else GraphQueryPlan
     return model.model_validate(value)
 
 
@@ -398,7 +383,7 @@ class EvidencePack(StrictModel):
 
 
 class RuntimeEvent(StrictModel):
-    schema_version: Literal["v1", "v5.2", "v5.2-r2"] = SCHEMA_VERSION
+    schema_version: Literal["v1"] = SCHEMA_VERSION
     event_id: str
     run_id: str
     event_seq: int | None = None
@@ -414,14 +399,8 @@ class ModelCall(StrictModel):
     schema_version: Literal["v1"] = SCHEMA_VERSION
     call_id: str
     run_id: str
-    interface: Literal["PLAN", "UPDATE", "UPDATE_REPAIR", "MEMORY", "MEMORY_REPAIR", "RECALL", "VERIFY", "ANSWER"]
+    interface: Literal["PLAN", "UPDATE", "MEMORY", "RECALL", "VERIFY", "ANSWER"]
     agent_role: Literal["HIGH", "LOW"] | None = None
-    protocol_version: str | None = None
-    memory_mode: Literal["BIND", "REBIND"] | None = None
-    review_phase: Literal["REVIEW", "FINAL"] | None = None
-    context_id: str | None = None
-    review_id: str | None = None
-    raw_bundle_hash: str | None = None
     request_hash: str
     model: str
     parameters: dict[str, Any] = Field(default_factory=dict)

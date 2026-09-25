@@ -1,7 +1,6 @@
 """Load an exported model tokenizer without downloading model weights."""
 
 from pathlib import Path
-import hashlib
 
 
 class TokenizerJSON:
@@ -9,7 +8,6 @@ class TokenizerJSON:
         from tokenizers import Tokenizer
 
         self.tokenizer = Tokenizer.from_file(str(path))
-        self.name_or_path = f"{Path(path).resolve()}:{hashlib.sha256(Path(path).read_bytes()).hexdigest()}"
         self.tokenizer.no_truncation()
         self.tokenizer.no_padding()
 

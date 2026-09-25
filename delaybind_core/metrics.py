@@ -1,4 +1,4 @@
-"""Evaluation metrics for R2 experiment result records."""
+"""Evaluation metrics for Direct and V5 experiment result records."""
 
 from __future__ import annotations
 
@@ -7,9 +7,170 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from .data import CanonicalSample
+from .schema import GraphQueryPlan, QueryPlan
 
 
 _PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
+# LaTeX text commands such as \text{ October } or \textbf{foo}; repeated
+# substitution handles one level of nesting.  Answers are plain text, so any
+# residual backslash command is stripped as well.
+_LATEX_BRACED = re.compile(r"\\[a-zA-Z]+\{([^{}]*)\}")
+_LATEX_BARE = re.compile(r"\\[a-zA-Z]+")
+
+# Month names (full and common abbreviations), lowercase for casefolded text.
+_MONTHS = (
+    "january|february|march|april|may|june|july|august|september|october|november|december"
+    "|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+)
+# "May 10 1943" or "May 10th 1943" (month day year), after punctuation removal.
+_DATE_MDY = re.compile(rf"\b({_MONTHS})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+(\d{{4}})\b")
+# "10 May 1943" or "10th May 1943" (day month year), after punctuation removal.
+_DATE_DMY = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTHS})\s+(\d{{4}})\b")
+
+# Honorific / royal titles prepended to a person's canonical name.  Only stripped
+# when they appear as the first word followed by a space, so names like "Sirikit"
+# (which starts with "sir" but is not "Sir <name>") are unaffected.
+_TITLE_PREFIX = re.compile(
+    r"^(queen|king|prince|princess|duke|duchess|earl|countess?|lord|lady|sir|dame|"
+    r"emperor|empress|sultan|shah|pope|bishop|cardinal|reverend|father|brother|sister|"
+    r"archduke|archduchess|tsar|tsarina|khan|bey|pasha)\s+",
+    re.IGNORECASE,
+)
+
+# Redundant suffix words often appended to award / prize names.  Stripped only at
+# the very end, e.g. "young australian of the year award" -> "young australian of
+# the year".
+_REDUNDANT_SUFFIX = re.compile(
+    r"\s+(award|prize|title|medal|cup|trophy|championship|tournament|honour|honor|reward)$",
+    re.IGNORECASE,
+)
+
+# Word-level aliases: common abbreviations, city nicknames, country aliases,
+# and nationality adjectives mapped to canonical noun forms.
+_ALIASES = {
+    "okc": "oklahoma city",
+    "nyc": "new york city",
+    "la": "los angeles",
+    "sf": "san francisco",
+    "ussr": "soviet union",
+    "soviets": "soviet union",
+    "soviet": "soviet union",
+    "usa": "united states",
+    "us": "united states",
+    "america": "united states",
+    "uk": "united kingdom",
+    "britain": "united kingdom",
+    "gb": "united kingdom",
+    "prc": "china",
+    "singaporean": "singapore",
+    "indonesian": "indonesia",
+    "malaysian": "malaysia",
+    "thai": "thailand",
+    "vietnamese": "vietnam",
+    "filipino": "philippines",
+    "philippine": "philippines",
+    "korean": "korea",
+    "japanese": "japan",
+    "chinese": "china",
+    "russian": "russia",
+    "german": "germany",
+    "french": "france",
+    "italian": "italy",
+    "spanish": "spain",
+    "portuguese": "portugal",
+    "dutch": "netherlands",
+    "belgian": "belgium",
+    "swiss": "switzerland",
+    "swedish": "sweden",
+    "norwegian": "norway",
+    "danish": "denmark",
+    "finnish": "finland",
+    "polish": "poland",
+    "czech": "czechia",
+    "austrian": "austria",
+    "hungarian": "hungary",
+    "greek": "greece",
+    "turkish": "turkey",
+    "iranian": "iran",
+    "iraqi": "iraq",
+    "saudi": "saudi arabia",
+    "egyptian": "egypt",
+    "brazilian": "brazil",
+    "argentine": "argentina",
+    "argentinian": "argentina",
+    "mexican": "mexico",
+    "canadian": "canada",
+    "australian": "australia",
+    "indian": "india",
+    "pakistani": "pakistan",
+    "bangladeshi": "bangladesh",
+}
+
+_PHRASE_ALIASES = {
+    "u s a": "united states",
+    "united states of america": "united states",
+    "great britain": "united kingdom",
+    "union of soviet socialist republics": "soviet union",
+    "russian federation": "russia",
+    "federal republic of germany": "germany",
+    "republic of korea": "korea",
+    "kingdom of saudi arabia": "saudi arabia",
+    "republic of indonesia": "indonesia",
+    "republic of singapore": "singapore",
+    "republic of the philippines": "philippines",
+    "republic of poland": "poland",
+    "republic of finland": "finland",
+    "kingdom of denmark": "denmark",
+    "kingdom of norway": "norway",
+    "kingdom of sweden": "sweden",
+    "kingdom of the netherlands": "netherlands",
+    "kingdom of belgium": "belgium",
+    "republic of austria": "austria",
+    "republic of hungary": "hungary",
+    "hellenic republic": "greece",
+    "republic of turkey": "turkey",
+    "republic of egypt": "egypt",
+    "federative republic of brazil": "brazil",
+    "argentine republic": "argentina",
+    "united mexican states": "mexico",
+    "commonwealth of australia": "australia",
+    "republic of india": "india",
+    "islamic republic of pakistan": "pakistan",
+    "republic of malaysia": "malaysia",
+    "kingdom of thailand": "thailand",
+    "socialist republic of vietnam": "vietnam",
+    "peoples republic of china": "china",
+}
+
+
+def _expand_aliases(text: str) -> str:
+    """Replace common abbreviations, aliases and nationality adjectives with
+    canonical forms.  Phrase-level aliases are applied first, then word-level."""
+    for phrase, canonical in _PHRASE_ALIASES.items():
+        text = re.sub(rf"\b{re.escape(phrase)}\b", canonical, text)
+    words = text.split()
+    result = [_ALIASES.get(w, w) for w in words]
+    return " ".join(result)
+
+
+def _normalize_dates(text: str) -> str:
+    """Canonicalize dates to 'day month year' so EM matches across formats."""
+    text = _DATE_MDY.sub(lambda m: f"{m.group(2)} {m.group(1)} {m.group(3)}", text)
+    # DMY is already in the target order; just strip ordinal suffixes via the
+    # pattern above (the non-capturing group handles it).  Re-run to catch any
+    # MDY that became DMY and needs no further change.
+    text = _DATE_DMY.sub(lambda m: f"{m.group(1)} {m.group(2)} {m.group(3)}", text)
+    return text
+
+
+def _strip_latex(text: str) -> str:
+    """Remove LaTeX command wrappers, preserving their inner text."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _LATEX_BRACED.sub(r"\1", text)
+    text = _LATEX_BARE.sub(" ", text)
+    return text
 
 
 def normalize_answer(value: Any) -> str:
@@ -17,8 +178,18 @@ def normalize_answer(value: Any) -> str:
     if isinstance(value, bool):
         return "yes" if value else "no"
     text = "" if value is None else str(value)
+    text = _strip_latex(text)
     text = _PUNCTUATION.sub(" ", text.casefold())
+    text = _normalize_dates(text)
     normalized = " ".join(text.split())
+    # Strip leading honorific / royal titles (e.g. "queen sirikit" -> "sirikit").
+    normalized = _TITLE_PREFIX.sub("", normalized)
+    # Strip trailing redundant award / prize suffix words (e.g. "... of the year
+    # award" -> "... of the year").
+    normalized = _REDUNDANT_SUFFIX.sub("", normalized)
+    # Expand common abbreviations, aliases and nationality adjectives (e.g.
+    # "singaporean" -> "singapore", "ussr" -> "soviet union", "nyc" -> "new york city").
+    normalized = _expand_aliases(normalized)
     # JSON mode often serializes Boolean answers as strings.  The benchmark
     # convention uses yes/no, so preserve the semantic value before EM/F1.
     if normalized == "true":
@@ -79,26 +250,277 @@ def source_ref_f1(predicted: Iterable[str], gold: Iterable[str]) -> tuple[float,
     return precision, recall, f1
 
 
+def _normalized_triple(value: Iterable[Any]) -> tuple[str, str, str]:
+    subject, relation, obj = value
+    return normalize_answer(subject), normalize_answer(relation), normalize_answer(obj)
+
+
+def triple_f1(
+    predicted: Iterable[Iterable[Any]], gold: Iterable[Iterable[Any]]
+) -> tuple[float, float, float]:
+    return source_ref_f1(
+        {_normalized_triple(item) for item in predicted},
+        {_normalized_triple(item) for item in gold},
+    )
+
+
+def plan_relation_recall(
+    predicted: QueryPlan | GraphQueryPlan | None, oracle: GraphQueryPlan | None,
+) -> float | None:
+    if oracle is None or isinstance(predicted, QueryPlan):
+        return None
+    gold = {normalize_answer(pattern.relation_key) for pattern in oracle.patterns}
+    if not gold:
+        return 1.0
+    if predicted is None:
+        return 0.0
+    observed = {normalize_answer(pattern.relation_key) for pattern in predicted.patterns}
+    return len(gold & observed) / len(gold)
+
+
+def _v5_predicted_answer(result: dict[str, Any]) -> Any:
+    evidence_pack = result.get("evidence_pack") or {}
+    return evidence_pack.get("answer_value")
+
+
+def _v5_source_refs(result: dict[str, Any]) -> set[str]:
+    refs = {ref for fact in (result.get("evidence_pack") or {}).get("facts", [])
+            for ref in fact.get("source_refs", [fact["source_ref"]] if "source_ref" in fact else [])}
+    for claim in (result.get("evidence_pack") or {}).get("claims", []):
+        for assertion in claim.get("evidence_assertions", []):
+            source_ref = assertion.get("source_ref")
+            if source_ref:
+                refs.add(str(source_ref))
+    return refs
+
+
+def _direct_predicted_answer(result: dict[str, Any]) -> Any:
+    return (result.get("answer") or {}).get("answer")
+
+
+def _event_counts(result: dict[str, Any]) -> Counter[str]:
+    counts = Counter(result.get("event_counts") or {})
+    if counts:
+        return counts
+    return Counter(
+        event.get("event_type")
+        for event in result.get("events", [])
+        if event.get("event_type")
+    )
+
+
+def _event_items(result: dict[str, Any], event_type: str) -> list[dict[str, Any]]:
+    return [event for event in result.get("events", []) if event.get("event_type") == event_type]
+
+
+def _claim_triple(claim: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (
+        claim.get("subject"),
+        claim.get("relation"),
+        claim.get("object"),
+    )
+
+
+def verifier_metrics(
+    events: Iterable[dict[str, Any]],
+    gold_evidences: Iterable[Iterable[Any]],
+) -> dict[str, int | float | None]:
+    """Score the terminal VERIFY decision for each submitted claim.
+
+    This is deliberately conditional on claims that reached VERIFY.  It
+    measures verifier discrimination, not UPDATE coverage; the latter remains
+    ``triple_event_*``.  A NEED_MORE_CONTEXT followed by an expanded-context
+    ACCEPT is counted only as ACCEPT.
+    """
+    terminal: dict[str, tuple[str, tuple[Any, Any, Any]]] = {}
+    event_to_status = {
+        "VERIFY_NEED_MORE_CONTEXT": "NEED_MORE_CONTEXT",
+        "VERIFY_REJECTED": "REJECT",
+        "VERIFY_CONFLICT": "CONFLICT",
+        "CLAIM_PROMOTED": "ACCEPT",
+    }
+    for event in events:
+        status = event_to_status.get(str(event.get("event_type")))
+        if status is None:
+            continue
+        claim = event.get("payload", {}).get("claim")
+        if not isinstance(claim, dict):
+            continue
+        claim_id = claim.get("claim_id")
+        if not isinstance(claim_id, str):
+            continue
+        terminal[claim_id] = (status, _claim_triple(claim))
+    if not terminal:
+        return {
+            "verifier_candidate_count": 0,
+            "verifier_gold_candidate_count": 0,
+            "verifier_accept_count": 0,
+            "verifier_tp": 0,
+            "verifier_fp": 0,
+            "verifier_fn": 0,
+            "verifier_precision": None,
+            "verifier_recall": None,
+            "verifier_f1": None,
+        }
+
+    gold = {_normalized_triple(item[:3]) for item in gold_evidences if len(item) >= 3}
+    accepted = 0
+    true_positive = 0
+    false_positive = 0
+    false_negative = 0
+    gold_candidates = 0
+    for status, triple in terminal.values():
+        is_gold = _normalized_triple(triple) in gold
+        if is_gold:
+            gold_candidates += 1
+        if status == "ACCEPT":
+            accepted += 1
+            if is_gold:
+                true_positive += 1
+            else:
+                false_positive += 1
+        elif is_gold:
+            false_negative += 1
+    precision = true_positive / accepted if accepted else None
+    recall = true_positive / gold_candidates if gold_candidates else None
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision is not None and recall is not None and precision + recall
+        else None
+    )
+    return {
+        "verifier_candidate_count": len(terminal),
+        "verifier_gold_candidate_count": gold_candidates,
+        "verifier_accept_count": accepted,
+        "verifier_tp": true_positive,
+        "verifier_fp": false_positive,
+        "verifier_fn": false_negative,
+        "verifier_precision": precision,
+        "verifier_recall": recall,
+        "verifier_f1": f1,
+    }
+
+
 def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, Any]:
-    """Score an R2 result while preserving diagnostic fields."""
-    answer = result.get("answer") or {}
-    prediction = answer.get("answer")
+    """Score one method result while preserving diagnostic fields."""
+    method = str(result.get("method", "v5"))
+    prediction = _direct_predicted_answer(result) if method.startswith("direct") else _v5_predicted_answer(result)
     gold = sample.answers or ([sample.answer] if sample.answer is not None else [])
-    mapping = result.get("source_ref_map", {})
-    refs = {mapping[r] for r in answer.get("source_refs", []) if r in mapping}
-    precision, recall, f1 = source_ref_f1(refs, gold_source_refs(sample))
-    return {**result, "prediction": prediction, "gold_answers": gold,
-            "answer_exact": answer_exact(prediction, gold), "answer_token_f1": answer_token_f1(prediction, gold),
-            "abstained": prediction is None, "predicted_source_refs": sorted(refs),
-            "gold_source_refs": sorted(gold_source_refs(sample)),
-            "supporting_precision": precision if sample.supporting_facts else None,
-            "supporting_recall": recall if sample.supporting_facts else None,
-            "supporting_f1": f1 if sample.supporting_facts else None,
-            "runtime_status": result.get("state", {}).get("status", result.get("status")),
-            "run_success": result.get("state", {}).get("status") in {"ANSWERED", "INSUFFICIENT"},
-            "windows_processed": result.get("windows"), **result.get("v52_metrics", {}), **result.get("r2_metrics", {}),
-            "verifier_precision": None, "verifier_recall": None, "verifier_f1": None,
-            "graph_triple_f1": None, "triple_event_f1": None}
+    predicted_refs = (
+        set((result.get("answer") or {}).get("source_refs", []))
+        if method.startswith("direct")
+        else _v5_source_refs(result)
+    )
+    gold_refs = gold_source_refs(sample)
+    precision, recall, supporting_f1 = source_ref_f1(predicted_refs, gold_refs)
+    state = result.get("state") or {}
+    event_counts = _event_counts(result)
+    graph_triples = [
+        (claim.get("subject"), claim.get("relation"), claim.get("object"))
+        for claim in (result.get("evidence_pack") or {}).get("claims", [])
+    ]
+    graph_precision, graph_recall, graph_triple_f1 = triple_f1(
+        graph_triples, sample.evidences
+    )
+    proposed_triples = []
+    for event in _event_items(result, "TRIPLE_EVENT_PROPOSED"):
+        proposal = event.get("payload", {}).get("event", {})
+        proposed_triples.append(
+            (
+                proposal.get("subject"),
+                proposal.get("matched_family") or proposal.get("concrete_relation"),
+                proposal.get("object"),
+            )
+        )
+    event_precision, event_recall, event_triple_f1 = triple_f1(
+        proposed_triples, sample.evidences
+    )
+    lookup_events = _event_items(result, "DEFERRED_LOOKUP")
+    lookup_hits = sum(bool(event.get("payload", {}).get("claim_ids")) for event in lookup_events)
+    deferred_events = event_counts.get("CLAIM_DEFERRED", 0)
+    promoted_events = sum(
+        event.get("payload", {}).get("origin") == "DEFERRED"
+        for event in _event_items(result, "CLAIM_PROMOTED")
+    )
+    cross_window_promoted = event_counts.get("CROSS_WINDOW_DEFERRED_PROMOTED", 0)
+    non_early_promoted = event_counts.get("NON_EARLY_DEFERRED_PROMOTED", 0)
+    verifier = verifier_metrics(result.get("events", []), sample.evidences)
+    scored = {
+        **result,
+        "prediction": prediction,
+        "gold_answers": gold,
+        "answer_exact": answer_exact(prediction, gold),
+        "answer_token_f1": answer_token_f1(prediction, gold),
+        "predicted_source_refs": sorted(predicted_refs),
+        "gold_source_refs": sorted(gold_refs),
+        "supporting_precision": precision,
+        "supporting_recall": recall,
+        "supporting_f1": supporting_f1,
+        "graph_triple_precision": graph_precision,
+        "graph_triple_recall": graph_recall,
+        "graph_triple_f1": graph_triple_f1,
+        "triple_event_precision": event_precision,
+        "triple_event_recall": event_recall,
+        "triple_event_f1": event_triple_f1,
+        "runtime_status": state.get("status") or result.get("status", "UNKNOWN"),
+        "deferred_count": len(state.get("deferred", {})),
+        "pending_count": len(state.get("pending", {})),
+        "verified_count": len(state.get("verified", {})),
+        "callback_count": event_counts.get("DEFERRED_LOOKUP", 0),
+        "callback_hit_rate": lookup_hits / len(lookup_events) if lookup_events else 0.0,
+        "promoted_count": event_counts.get("CLAIM_PROMOTED", 0),
+        "deferred_promoted_count": promoted_events,
+        "deferred_to_promoted": promoted_events / deferred_events if deferred_events else 0.0,
+        "cross_window_deferred_promoted_count": cross_window_promoted,
+        "non_early_deferred_promoted_count": non_early_promoted,
+        "cross_window_deferred_to_promoted": (
+            cross_window_promoted / deferred_events if deferred_events else 0.0
+        ),
+        "conflict_count": event_counts.get("VERIFY_CONFLICT", 0),
+        "windows_processed": result.get("windows_processed"),
+        "streaming_protocol_valid": result.get("streaming_protocol_valid"),
+        **verifier,
+        "run_success": result.get("status") == "OK",
+    }
+    if result.get("plan_format") == "subqueries" or "queries" in state.get("plan", {}):
+        promotions = _event_items(result, "FACT_PROMOTED")
+        deferred_promotions = [event for event in promotions if event["payload"].get("origin") == "CANDIDATE"]
+        deferred_events = event_counts.get("FACT_DEFERRED", 0)
+        lookups = _event_items(result, "DEFER_WORKSPACE_LOOKUP")
+        cross_window = sum(bool(event["payload"].get("cross_window")) for event in promotions)
+        # Prose facts have no gold triple alignment. Do not report fabricated
+        # zero precision/recall for metrics defined only on the graph format.
+        for key in (*verifier, "graph_triple_precision", "graph_triple_recall",
+                    "graph_triple_f1", "triple_event_precision", "triple_event_recall", "triple_event_f1"):
+            scored[key] = None
+        scored.update({
+            "protocol_valid": result.get("protocol_valid", not event_counts.get("PROTOCOL_REPAIR_EXHAUSTED", 0)),
+            "protocol_repair_failure_count": event_counts.get("PROTOCOL_REPAIR_EXHAUSTED", 0),
+            "update_rejected_line_count": event_counts.get("UPDATE_LINE_REJECTED", 0),
+            "memory_rejected_line_count": event_counts.get("MEMORY_LINE_REJECTED", 0),
+            "binding_held_count": event_counts.get("BINDING_HELD", 0),
+            "deferred_count": sum(len(ids) for ids in state.get("defer_workspace", {}).values()),
+            "pending_count": 0,
+            "verified_count": sum(use.get("status") == "ACCEPTED" and use.get("acceptance") == "PROMOTE"
+                                  for uses in state.get("uses", {}).values() for use in uses.values()),
+            "committed_count": event_counts.get("FACT_COMMITTED", 0),
+            "working_memory_fact_count": len(state.get("working_memory", {}).get("facts", [])),
+            "working_memory_link_count": len(state.get("working_memory", {}).get("links", [])),
+            "callback_count": len(lookups),
+            "callback_hit_rate": sum(bool(event["payload"].get("fact_ids")) for event in lookups) / len(lookups) if lookups else 0.0,
+            "promoted_count": len(promotions),
+            "deferred_promoted_count": len(deferred_promotions),
+            "revalidated_count": len(promotions) - len(deferred_promotions),
+            "deferred_to_promoted": len(deferred_promotions) / deferred_events if deferred_events else 0.0,
+            "cross_window_deferred_promoted_count": cross_window,
+            "non_early_deferred_promoted_count": len(deferred_promotions) - cross_window,
+            "cross_window_deferred_to_promoted": cross_window / deferred_events if deferred_events else 0.0,
+            "conflict_count": sum(bool(execution.get("conflicts")) for execution in state.get("executions", {}).values()),
+        })
+    if sample.context is not None and not sample.supporting_facts:
+        for key in ("supporting_precision", "supporting_recall", "supporting_f1"):
+            scored[key] = None
+    return scored
 
 
 def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -186,10 +608,6 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "unsupported_rate": status_counts.get("UNSUPPORTED", 0) / len(items),
                 "resource_limit_rate": status_counts.get("RESOURCE_LIMIT", 0) / len(items),
                 "runtime_status_counts": dict(sorted(status_counts.items())),
-                **{key: mean(items, key) for key in (
-                    "anchor_valid_rate", "raw_coverage_of_accepted_facts", "raw_coverage_of_binding_support",
-                    "recall_scan_completion", "source_review_acceptance", "dual_graph_consistency",
-                    "stale_binding_rate", "transaction_replay_consistency")},
             }
         )
     gaps: dict[str, float] = {}

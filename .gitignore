@@ -131,8 +131,13 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 # Keep reproducible experiment configurations under version control.
 !configs/
 !configs/*.json
-!reports/r2_plain_chunk_equivalence_128_20260925.json
-!reports/r2_plan_repair_historical_classification_20260925.json
+
+# Keep V18 experiment results (results.jsonl only, not large trajectory files)
+!results/
+!results/**/results.jsonl
+results/**/trajectories/
+results/**/*.db
+results/**/*.sqlite*
 
 
 # local logs
