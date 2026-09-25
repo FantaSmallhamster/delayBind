@@ -7,6 +7,9 @@ from .schema_v52 import Strict, QueryPlanV3, FactNode, RawEvidence, EvidencePack
 
 PROTOCOL = "v5.2-r2"
 CONTRACT = "memory-v5.2-bind-rebind-1"
+LEGACY_MEMORY_INTERFACE = "legacy_bind_rebind_v1"
+UNIFIED_MEMORY_INTERFACE = "unified_evidence_v1"
+UNIFIED_MEMORY_VERSION = "query-facts-result-v1"
 
 
 class EvidenceQueryR2(Strict):
@@ -300,6 +303,11 @@ class ReviewSession(Strict):
     admitted_use_tokens: dict[str, str] = Field(default_factory=dict)
     prior_support_use_ids: list[str] = Field(default_factory=list)
     completion_reason: str | None = None
+    memory_interface: Literal["legacy_bind_rebind_v1", "unified_evidence_v1"] = LEGACY_MEMORY_INTERFACE
+    authorized_use_ids: list[str] = Field(default_factory=list)
+    evidence_origins: list[str] = Field(default_factory=list)
+    evidence_digest: str = ""
+    fact_aliases: dict[str, str] = Field(default_factory=dict)
 
 
 class DurableJob(Strict):
@@ -347,6 +355,11 @@ class MemoryContextR2(Strict):
     admission_policy: str = "legacy"
     admission_digest: str = ""
     upstream_only_allowed: bool = False
+    memory_interface: Literal["legacy_bind_rebind_v1", "unified_evidence_v1"] = LEGACY_MEMORY_INTERFACE
+    authorized_use_ids: list[str] = Field(default_factory=list)
+    evidence_origins: list[str] = Field(default_factory=list)
+    evidence_digest: str = ""
+    fact_aliases: dict[str, str] = Field(default_factory=dict)
 
 
 class StateR2(Strict):
@@ -355,6 +368,7 @@ class StateR2(Strict):
     # across commits, replay and resume.
     fact_only: bool = False
     admission_policy: str = "legacy"
+    memory_interface: Literal["legacy_bind_rebind_v1", "unified_evidence_v1"] = LEGACY_MEMORY_INTERFACE
     plan: EvidencePlanR2 | QueryPlanV3
     executions: dict[str, Execution] = Field(default_factory=dict)
     binding_store: dict[str, BindingR2] = Field(default_factory=dict)

@@ -2,12 +2,58 @@
 
 from .navigation_r2 import current_uses, query, query_ready, binding_effective
 from .schema_v52 import digest
+from .schema_r2 import UNIFIED_MEMORY_INTERFACE, UNIFIED_MEMORY_VERSION, use_key
 
 STRICT_POLICY = "strict-recall-v1"
+UNIFIED_POLICY = "unified-evidence-v1"
 
 
 def strict(state):
     return state.fact_only and state.admission_policy == STRICT_POLICY
+
+
+def unified(state):
+    return (state.fact_only and state.memory_interface == UNIFIED_MEMORY_INTERFACE
+            and state.admission_policy == UNIFIED_POLICY)
+
+
+def validates_evidence(state):
+    """Proof checks apply independently of the old recall admission tokens."""
+    return strict(state) or unified(state)
+
+
+def collect_memory_evidence(state, qid, target_binding_id=None):
+    """Collect the whole query bucket plus actual prior support, without filtering.
+
+    The semantic digest excludes mutable acceptance status and trigger labels:
+    publishing a result or reading an unrelated window is not new evidence.
+    Scheduling creates the current-instance uses before freezing this snapshot.
+    """
+    q, ex = query(state, qid), state.executions[qid]
+    prior = current_support_uses(state, qid, target_binding_id)
+    fact_ids = sorted(set(state.route_index.get(qid, [])) |
+                      {state.uses[key].fact_id for key in prior})
+    use_ids = [use_key(qid, ex.version, ex.input_signature, fid) for fid in fact_ids]
+    pending = {entry.use_key for entry in state.inbox.values()
+               if entry.query_id == qid and entry.status == "PENDING"}
+    origins = set()
+    for key in use_ids:
+        if key in prior:
+            origins.add("PRIOR_SUPPORT")
+        if key in pending:
+            origins.add("UPDATE")
+        elif key not in prior:
+            use = state.uses.get(key)
+            origins.add("PLAN_REPAIR" if use and use.acceptance_origin == "PLAN_REPAIR" else "DEFERRED")
+    signature = digest([
+        UNIFIED_MEMORY_VERSION, qid, ex.version, ex.input_signature,
+        q.model_dump(mode="json"),
+        [(fid, state.facts[fid].text) for fid in fact_ids],
+        state.scope_closed if q.requires_complete_set else None,
+    ])
+    return dict(use_ids=use_ids, fact_ids=fact_ids, digest=signature,
+                prior_support_use_ids=prior, evidence_origins=sorted(origins),
+                fact_aliases={f"F{i}": fid for i, fid in enumerate(fact_ids, 1)})
 
 
 def grant_admission(state, use, origin, source_id):
@@ -69,9 +115,10 @@ def allow_upstream_inference(state, qid, branch=None):
 def memory_work_decision(state, qid, *, recall_pending=False, branch=None):
     if not query_ready(state, qid):
         return "WAIT_UPSTREAM"
-    if recall_pending:
+    if recall_pending and not unified(state):
         return "WAIT_RECALL"
-    snapshot = build_admission_snapshot(state, qid)
+    snapshot = (collect_memory_evidence(state, qid) if unified(state)
+                else build_admission_snapshot(state, qid))
     if snapshot["fact_ids"] or allow_upstream_inference(state, qid, branch):
         return "CALL"
     return "SKIP_NO_EVIDENCE"

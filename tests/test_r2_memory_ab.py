@@ -9,6 +9,7 @@ from delaybind_core.context_r2 import build_update_context
 from delaybind_core.prompts_r2 import messages, prompt_version_for, PROMPT_VERSION, MEMORY_BIND_PROMPT_VERSION, SYSTEM_FACT_ONLY
 from delaybind_core.protocol_r2 import parse_update, fact_alias_map
 from delaybind_core.runner import RunnerConfig
+from scripts import evaluate_r2_memory_ab as ab
 from scripts.evaluate_r2_memory_ab import (assert_frozen_contracts, original_messages, make_payload,
                                          make_case, score, perturb, normalize, metrics, latest_results)
 from test_r2_core import fixture, context
@@ -29,17 +30,25 @@ def sample_case():
                      expected=dict(decision="BOUND", value="Alice", support_fact_ids=[fid]), run_id="r")
 
 
-def test_only_fact_only_bind_and_its_repair_switch_prompts():
-    # Historical prompt snapshots remain frozen; production runtime now has a
-    # separately versioned member graph. The old live experiment still refuses
-    # to run against changed runtime files (default check_runtime=True).
-    assert_frozen_contracts(check_runtime=False)
+@pytest.mark.parametrize("check_runtime", [False, True])
+def test_historical_experiment_rejects_current_prompt_contract(check_runtime):
+    frozen = ab.read_json(ab.FIXTURES / "frozen_contracts.txt")
+    assert PROMPT_VERSION != frozen["prompt_version"]
+    with pytest.raises(AssertionError):
+        assert_frozen_contracts(check_runtime=check_runtime)
+
+
+def test_fact_only_bind_and_its_repair_dispatch_current_prompts():
+    # These helpers render current constants. Historical replay is separately
+    # protected by the frozen-contract rejection above.
     case = sample_case()
     payload = case["payload"]
     old = original_messages(payload)
     new = messages("MEMORY", payload)
     assert new[0] != old[0]
     assert new[1]["content"].split("Input data:\n", 1)[1] == old[1]["content"].split("Input data:\n", 1)[1]
+    assert payload["question"] not in new[1]["content"]
+    assert payload["query_instance"]["rendered_query"] in new[1]["content"]
     assert prompt_version_for("MEMORY", payload) == MEMORY_BIND_PROMPT_VERSION
     rebound = {**payload, "allowed_mode": "REBIND"}
     assert messages("MEMORY", rebound) == original_messages(rebound)

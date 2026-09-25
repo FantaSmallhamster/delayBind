@@ -221,7 +221,13 @@ def rebuild(state):
 
 def assert_invariants(state):
     from .member_graph_r2 import assert_member_invariants
-    from .memory_admission_r2 import strict, current_support_uses
+    from .memory_admission_r2 import (strict, unified, current_support_uses,
+                                      collect_memory_evidence, UNIFIED_POLICY)
+    from .schema_r2 import UNIFIED_MEMORY_INTERFACE
+
+    if ((state.memory_interface == UNIFIED_MEMORY_INTERFACE) != (state.admission_policy == UNIFIED_POLICY)
+            or state.memory_interface == UNIFIED_MEMORY_INTERFACE and (not state.fact_only or not enabled(state))):
+        raise ValueError("UNIFIED_MEMORY_POLICY_MISMATCH")
 
     if enabled(state):
         assert_member_invariants(state)
@@ -257,6 +263,32 @@ def assert_invariants(state):
                         or use.input_signature != review.input_signature or use.status == "INVALIDATED"
                         or use.admission_token != token or use.consumed_admission_token == token):
                     raise ValueError("INVALID_REVIEW_ADMISSION")
+    if unified(state):
+        if any(job.kind == "RECALL" for job in state.jobs.values()):
+            raise ValueError("UNIFIED_MEMORY_HAS_RECALL_JOB")
+        if any(use.admission_token or use.consumed_admission_token for use in state.uses.values()):
+            raise ValueError("UNIFIED_MEMORY_HAS_ADMISSION_TOKEN")
+        for review in state.reviews.values():
+            if review.memory_interface != state.memory_interface or review.status == "WAITING_RECALL":
+                raise ValueError("UNIFIED_REVIEW_INTERFACE_MISMATCH")
+            if review.status in {"DONE", "CANCELLED"}:
+                continue
+            ex = state.executions[review.query_id]
+            snapshot = collect_memory_evidence(state, review.query_id, review.target_binding_id)
+            if ((review.query_version, review.input_signature, review.target_binding_id) !=
+                    (ex.version, ex.input_signature, ex.current_binding_id)
+                    or review.authorized_use_ids != snapshot["use_ids"]
+                    or review.evidence_digest != snapshot["digest"]
+                    or review.fact_aliases != snapshot["fact_aliases"]
+                    or review.prior_support_use_ids != snapshot["prior_support_use_ids"]):
+                raise ValueError("STALE_UNIFIED_REVIEW_EVIDENCE")
+            for key in review.authorized_use_ids:
+                use = state.uses.get(key)
+                if (use is None or key != use_key(review.query_id, review.query_version,
+                                                review.input_signature, use.fact_id)
+                        or use.query_id != review.query_id or use.query_version != review.query_version
+                        or use.input_signature != review.input_signature or use.status == "INVALIDATED"):
+                    raise ValueError("INVALID_UNIFIED_REVIEW_AUTHORIZATION")
     for b in state.binding_store.values():
         if not b.valid:
             continue

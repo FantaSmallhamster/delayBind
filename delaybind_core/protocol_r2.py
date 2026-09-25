@@ -7,7 +7,8 @@ reasons and proof-kind labels are never required for a transaction.
 
 import re
 
-from .schema_r2 import EvidenceReview, MemoryResponseR2, UpdateResponseR2, Observation, Hint
+from .schema_r2 import (EvidenceReview, MemoryResponseR2, UpdateResponseR2, Observation, Hint,
+                        LEGACY_MEMORY_INTERFACE, UNIFIED_MEMORY_INTERFACE)
 from .text_protocol_v52 import fields, refs, value, parse_plan
 from .source_refs_v52 import SentenceRefResolver
 
@@ -15,6 +16,29 @@ from .source_refs_v52 import SentenceRefResolver
 def fact_alias_map(fact_ids):
     """Return per-request short model IDs mapped to durable runtime fact IDs."""
     return {f"F{index}": fact_id for index, fact_id in enumerate(sorted(set(fact_ids)), start=1)}
+
+
+def unified_fact_aliases(context):
+    """Validate the same frozen fact whitelist for both rendering and parsing.
+
+    Unified requests authorize only short IDs actually accompanied by a fact
+    body. Durable IDs remain runtime metadata and are not accepted on the wire.
+    """
+    get = context.get if isinstance(context, dict) else lambda key, default=None: getattr(context, key, default)
+    aliases = dict(get("fact_aliases", {}))
+    allowed = list(get("allowed_fact_ids", []))
+    if (len(allowed) != len(set(allowed)) or len(aliases) != len(allowed)
+            or set(aliases.values()) != set(allowed)
+            or any(not re.fullmatch(r"F[1-9][0-9]*", alias) for alias in aliases)):
+        raise ValueError("UNIFIED_FACT_ALIAS_WHITELIST_MISMATCH")
+    pack = get("working_memory")
+    navigation = (pack.get("navigation", {}) if isinstance(pack, dict)
+                  else getattr(pack, "navigation", {})) or {}
+    facts = navigation.get("facts", [])
+    if (len(facts) != len(allowed) or {item.get("fact_id") for item in facts} != set(allowed)
+            or any(not isinstance(item.get("text"), str) or not item["text"].strip() for item in facts)):
+        raise ValueError("UNIFIED_FACT_DISPLAY_WHITELIST_MISMATCH")
+    return aliases
 
 
 def typed_value(text):
@@ -98,6 +122,11 @@ def _review_reason(verdict):
 
 
 def parse_memory(raw, context):
+    interface = getattr(context, "memory_interface", LEGACY_MEMORY_INTERFACE)
+    if interface == UNIFIED_MEMORY_INTERFACE:
+        return parse_unified_memory(raw, context)
+    if interface != LEGACY_MEMORY_INTERFACE:
+        raise ValueError("UNKNOWN_MEMORY_INTERFACE:" + str(interface))
     # This alias applies to the entire fact-only FINAL reply, never to a
     # support field or an individual line within a multi-member response.
     if context.fact_only and context.phase == "FINAL" and isinstance(raw, str) and raw.strip() == "NONE":
@@ -230,6 +259,68 @@ def parse_memory(raw, context):
         operations=[dict(op=context.allowed_mode, query_id=context.query_id,
                          evidence_reviews=list(reviews.values()), binding_result=result)])
     return response
+
+
+def parse_unified_memory(raw, context):
+    """Parse a complete neutral answer set; never infer protocol or write mode."""
+    from .schema_r2 import MemberResult
+    from .member_graph_r2 import scalar_value, projected_value
+    from .schema_v52 import digest
+
+    if not context.fact_only or not context.member_bindings or context.phase != "FINAL":
+        raise ValueError("UNIFIED_MEMORY_REQUIRES_FACT_ONLY_MEMBER_FINAL")
+    aliases = unified_fact_aliases(context)
+    rows = strict_lines(raw)
+    parsed = []
+    for row in rows:
+        parts = fields(row)
+        if len(parts) != 3:
+            raise ValueError(f"UNIFIED_MEMORY_FIELD_COUNT:expected=3,received={len(parts)}")
+        if parts[0] != context.query_id:
+            raise ValueError("UNIFIED_MEMORY_QUERY_MISMATCH:" + parts[0])
+        parsed.append(parts)
+
+    unknown = [parts for parts in parsed if parts[2] == "UNKNOWN"]
+    if unknown:
+        if len(parsed) != 1 or unknown[0][1] != "NONE":
+            raise ValueError("UNIFIED_UNKNOWN_REQUIRES_STANDALONE_NONE_SUPPORT")
+        result = dict(state="NOOP", reason_code="UNSUPPORTED_RESULT",
+                      reason="The supplied evidence did not support a result in this review.")
+    else:
+        members = {}
+        for _, support_text, answer in parsed:
+            if support_text == "NONE":
+                if not context.upstream_only_allowed:
+                    raise ValueError("UNIFIED_MISSING_FACT_SUPPORT")
+                support = []
+            else:
+                wire_support = [item.strip() for item in support_text.split(",")]
+                if not wire_support or any(not item for item in wire_support):
+                    raise ValueError("UNIFIED_INVALID_SUPPORT_FIELD")
+                unknown_ids = [item for item in wire_support if item not in aliases]
+                if unknown_ids:
+                    raise ValueError("UNKNOWN_FACT_ALIAS:" + ",".join(unknown_ids))
+                if len(wire_support) != len(set(wire_support)):
+                    raise ValueError("DUPLICATE_SUPPORT_FACT")
+                support = [aliases[item] for item in wire_support]
+            try:
+                member_value = scalar_value(typed_value(answer))
+            except ValueError as exc:
+                raise ValueError("UNIFIED_REQUIRES_ONE_CONCRETE_ANSWER:" + str(exc)) from exc
+            key = digest(member_value)
+            if key in members:
+                members[key].support_fact_ids = sorted(set(members[key].support_fact_ids + support))
+            else:
+                members[key] = MemberResult(value=member_value, support_fact_ids=sorted(support))
+        items = list(members.values())
+        support = sorted({fid for item in items for fid in item.support_fact_ids})
+        result = dict(state="BOUND", value=projected_value(items), members=items,
+                      kind="DIRECT" if support else "INFERRED", support_fact_ids=support,
+                      reason_code="SUPPORTED_RESULT",
+                      reason="The supplied evidence supports the complete returned answer set.")
+    return MemoryResponseR2(context_id=context.context_id, review_id=context.review_id,
+        operations=[dict(op=context.allowed_mode, query_id=context.query_id,
+                         evidence_reviews=[], binding_result=result)])
 
 
 def _parse_member_memory(rows, context):

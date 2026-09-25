@@ -12,7 +12,8 @@ from .navigation_r2 import (
 )
 from .schema_r2 import MemoryContextR2
 from .schema_v52 import EvidencePackV52, digest
-from .memory_admission_r2 import strict, allow_upstream_inference, build_admission_snapshot
+from .memory_admission_r2 import (strict, unified, allow_upstream_inference,
+                                  build_admission_snapshot, collect_memory_evidence)
 from .text_views_v52 import memory_view
 
 
@@ -201,6 +202,8 @@ def build_chunk_update_context(runtime, question, chunk, *, counter=None):
 
 
 def build_memory_context(runtime, review_id, *, batch_size=None):
+    if unified(runtime.state):
+        return build_unified_memory_context(runtime, review_id)
     s, cfg = runtime.state, runtime.config
     r = s.reviews[review_id]
     if r.status in {"DONE", "CANCELLED"} or not query_ready(s, r.query_id):
@@ -272,6 +275,58 @@ def build_memory_context(runtime, review_id, *, batch_size=None):
                          fact_only=fact_only, member_bindings=dynamic, branch=branch,
                          admission_policy=s.admission_policy, admission_digest=admission_digest,
                          upstream_only_allowed=upstream_only)
+    ctx.context_id = "MC" + digest([runtime.run_id, ctx.model_dump(mode="json")])
+    return ctx
+
+
+def build_unified_memory_context(runtime, review_id):
+    """Freeze one concrete branch and the full authorized query bucket."""
+    s, cfg = runtime.state, runtime.config
+    r = s.reviews[review_id]
+    if not unified(s) or r.memory_interface != s.memory_interface:
+        raise ValueError("MEMORY_INTERFACE_MISMATCH")
+    if r.status in {"DONE", "CANCELLED"} or not query_ready(s, r.query_id):
+        raise ValueError("REVIEW_NOT_READY")
+    ex = s.executions[r.query_id]
+    snapshot = collect_memory_evidence(s, r.query_id, r.target_binding_id)
+    if (r.query_version != ex.version or r.input_signature != ex.input_signature
+            or r.target_binding_id != ex.current_binding_id
+            or r.inbox_revision != ex.evidence_revision
+            or r.evidence_digest != snapshot["digest"]
+            or r.authorized_use_ids != snapshot["use_ids"]
+            or r.fact_aliases != snapshot["fact_aliases"]):
+        raise ValueError("STALE_UNIFIED_EVIDENCE_SNAPSHOT")
+    for key in r.authorized_use_ids:
+        use = s.uses.get(key)
+        if (use is None or use.query_id != r.query_id or use.query_version != r.query_version
+                or use.input_signature != r.input_signature or use.status == "INVALIDATED"):
+            raise ValueError("UNIFIED_USE_NOT_AUTHORIZED")
+    branch = next((b for b in r.branches if b.branch_id not in r.branch_results), None)
+    if branch is None:
+        raise ValueError("MEMBER_BRANCHES_ALREADY_COMPLETED")
+    # Do not import global working memory or ancestor facts: every displayed
+    # fact is a current-query use, and every allowed fact is shown exactly once.
+    facts = [{**s.facts[s.uses[key].fact_id].model_dump(mode="json"),
+              "query_id": r.query_id, "use_id": key,
+              "use_status": s.uses[key].status, "input_signature": r.input_signature}
+             for key in r.authorized_use_ids]
+    pack = EvidencePackV52(navigation={"facts": facts}, raw_evidence=[], unresolved_or_conflicts=[])
+    ctx = MemoryContextR2(
+        context_id="", review_id=review_id, state_revision=s.state_revision,
+        allowed_mode=r.mode, phase="FINAL", query_id=r.query_id, query_version=r.query_version,
+        input_signature=r.input_signature, expected_binding_id=r.target_binding_id,
+        inbox_revision=r.inbox_revision, candidate_bucket_version=r.candidate_bucket_version,
+        required_reviews=[], allowed_review_ids=[], allowed_fact_ids=snapshot["fact_ids"],
+        visible_source_refs=[], raw_hashes={}, working_memory=pack,
+        barriers=dict(scan_complete=True, review_complete=True, collection_scope_ready=True, can_finalize=True),
+        scope_closed=s.scope_closed,
+        context_limits=dict(before=cfg.source_context_before, after=cfg.source_context_after),
+        fact_only=True, member_bindings=True, branch=branch, admission_policy=s.admission_policy,
+        upstream_only_allowed=allow_upstream_inference(s, r.query_id, branch),
+        memory_interface=s.memory_interface, authorized_use_ids=list(r.authorized_use_ids),
+        evidence_origins=list(r.evidence_origins), evidence_digest=r.evidence_digest,
+        fact_aliases=dict(r.fact_aliases),
+    )
     ctx.context_id = "MC" + digest([runtime.run_id, ctx.model_dump(mode="json")])
     return ctx
 

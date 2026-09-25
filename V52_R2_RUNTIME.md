@@ -8,6 +8,13 @@
 新运行须显式设置 `protocol_version="v5.2-r2"`，使用新的 run ID / 输出目录。
 不得把旧轨迹或原来的八题结果重新标成 R2。
 
+## 统一 MEMORY 接口
+
+新增 `memory_interface="unified_evidence_v1"`：在 fact-only 成员模式中，MEMORY 只接收具体子问题和完整候选事实，
+输出 `Qn | 支持事实短编号 | 答案`。Runtime 负责绑定与复核，无独立 RECALL 模型调用。
+输入、权限、UNKNOWN、预算、恢复及新 128 题配置见 [V52_R2_UNIFIED_MEMORY.md](V52_R2_UNIFIED_MEMORY.md)。
+省略该开关时保留 `legacy_bind_rebind_v1`；本页以下 BOUND/NOOP、RECALL 准入描述属于该兼容接口。
+
 ## 当前默认：无基数预设的成员依赖图
 
 新建 R2 运行默认采用成员图；PLAN 不定义 SINGLE/SET。`EvidencePlanR2` 中只有查询、输出变量、输入依赖及可选的完整枚举需求。
@@ -73,6 +80,14 @@ MEMORY 的直接白名单由本会话未消费的 UPDATE/RECALL 准入和当前�
 | LOW ANSWER | 仅根据 question + 有效 working memory 作答 | 不读完整计划、Archive 或候选桶；有独立 Reader 客户端时走该客户端 |
 
 LOW 新路径不能调用 VERIFY。`enable_defer_callback=false` 只关闭历史候选回查，不关闭 REBIND。
+
+### 总 Question 的输入边界
+
+初始 H·PLAN 接收总 Question 以生成 query plan，最终 L·ANSWER 接收总 Question 和有效工作记忆。
+中间调用均不显示总 Question：UPDATE / UPDATE_REPAIR、RECALL、MEMORY / MEMORY_REPAIR（BIND 与 REBIND），以及 PLAN 的 REPAIR 模式。
+此规则覆盖直传 chunk、Archive 窗口、事实模式和原文审阅模式。UPDATE 以提取目标和当前文本为输入；
+RECALL 与 MEMORY 以当前子查询及各自获准的事实、绑定为输入；PLAN REPAIR 依据已有计划、hint 和事实修补。
+内部审计快照仍可保存 `question`，该字段不会被上述中间调用的模型输入视图渲染。
 
 ## 文本模型协议
 

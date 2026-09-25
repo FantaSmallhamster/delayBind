@@ -8,7 +8,8 @@ from .text_protocol_v52 import fields, refs, parse_memory as parse_legacy_patch
 from .protocol_r2 import strict_lines
 from .navigation_r2 import descendants, refresh, topological, query_projection, binding_effective
 from .runtime_r2 import invalidate_closure
-from .review_jobs_r2 import ensure_use, schedule_ready, event
+from .review_jobs_r2 import ensure_use, schedule_ready, cancel_reviews, event
+from .memory_admission_r2 import unified
 from .context_r2 import evidence_pack
 
 
@@ -188,6 +189,10 @@ def _prepare_repair(runtime, raw, ctx):
                 ensure_use(s, qid, fid, status="CANDIDATE", origin="PLAN_REPAIR")
                 event(events, "FACT_ROUTED", query_id=qid, fact_id=fid, caused_by="PLAN_REPAIR")
     s.processed_hints = sorted(set(s.processed_hints) | set(ctx["hint_ids"]))
+    if unified(s):
+        # Even a temporarily blocked child must discard a frozen request when
+        # PLAN repair changes its evidence bucket. Parent completion wakes it.
+        cancel_reviews(s, routed, events)
     for qid in topological(s):
         if qid in affected | routed:
             schedule_ready(s, qid, "PLAN_REPAIR", events, callback=runtime.config.enable_defer_callback,

@@ -6,6 +6,7 @@ import sqlite3
 from uuid import uuid4
 
 from .agents_r2 import HighLevelAgentR2, LowLevelAgentR2
+from .api import ModelAPIError
 from .archive import SentenceArchive
 from .context_r2 import (
     budgeted_evidence_pack,
@@ -44,6 +45,9 @@ from .schema_r2 import (
     EvidencePlanR2,
     StateR2,
     UpdateResponseR2,
+    LEGACY_MEMORY_INTERFACE,
+    UNIFIED_MEMORY_INTERFACE,
+    UNIFIED_MEMORY_VERSION,
     member_plan,
 )
 from .schema_v52 import QueryPlanV3, digest
@@ -60,6 +64,7 @@ def _query_projection_row(state, query_id, *, instantiate_members=False):
 
 async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=None):
     cfg = runner.config
+    unified_memory = cfg.memory_interface == UNIFIED_MEMORY_INTERFACE
     plain_chunks = cfg.update_input_mode == "plain_token_chunks"
     if plain_chunks and (sample.context is None or runner.tokenizer is None):
         raise ValueError("PLAIN_CHUNKS_REQUIRE_CONTEXT_AND_TOKENIZER")
@@ -99,11 +104,16 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         if logical_calls >= cfg.max_model_calls - reserve:
             raise V52ResourceLimit("MODEL_CALL_BUDGET")
         original = payload.get("original_memory_request", payload)
+        unified_review = unified_memory and interface in {"MEMORY", "MEMORY_REPAIR"}
         msg, tokens = request(interface, payload)
         wm = original.get("working_memory")
         final = interface == "ANSWER" or original.get("phase") == "FINAL"
         budget_error = ("FINAL_RAW_MEMORY_BUDGET" if cfg.sentence_splitting else "FINAL_FACT_MEMORY_BUDGET") if final else "REVIEW_INPUT_BUDGET" if interface.startswith("MEMORY") else interface + "_INPUT_BUDGET"
-        if wm is not None and not memory_fits(wm):
+        if unified_review:
+            budget_error = "UNIFIED_MEMORY_INPUT_BUDGET"
+        # Candidate evidence is temporary inspection material. Only actual
+        # request/context limits apply; the resident-memory budget is for ANSWER.
+        if wm is not None and not unified_review and not memory_fits(wm):
             raise V52ResourceLimit(budget_error)
         limit = cfg.max_answer_input_tokens if interface == "ANSWER" else cfg.max_review_input_tokens if interface.startswith("MEMORY") else cfg.max_input_tokens
         if interface in high.interfaces:
@@ -133,23 +143,49 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
                                                     for key in session.admitted_use_tokens),
                          prior_support_count=len(session.prior_support_use_ids),
                          admission_digest=original.get("admission_digest", ""))
+            if unified_review:
+                audit.update(memory_interface_version=UNIFIED_MEMORY_VERSION,
+                             evidence_origins=original.get("evidence_origins", []),
+                             query_id=original["query_id"],
+                             branch_id=(original.get("branch") or {}).get("branch_id"),
+                             input_signature=original.get("input_signature"),
+                             evidence_digest=original.get("evidence_digest"),
+                             authorized_use_ids=original.get("authorized_use_ids", []),
+                             evidence_fact_count=len(original.get("allowed_fact_ids", [])),
+                             rendered_fact_count=len(original.get("fact_aliases", {})))
         logical_calls += 1
         call_id = "R2CALL-" + str(uuid4())
         store.save_context_manifest(run_id, call_id, {"kind": "MODEL_REQUEST", "interface": interface,
+            "call_id": call_id,
             **audit, "plan_mode": original.get("mode", "INITIAL") if interface == "PLAN" else None,
             "prompt_version": prompt_version_for(interface, payload), "prompt_hash": digest(msg), "input_tokens": tokens,
-            "memory_view_version": (MEMBER_MEMORY_VIEW_VERSION if not cfg.sentence_splitting
+            "memory_view_version": (UNIFIED_MEMORY_VERSION if unified_review else MEMBER_MEMORY_VIEW_VERSION if not cfg.sentence_splitting
                                     and "members" in (wm or {}).get("navigation", {}) else None),
             "output_token_budget": output, "tokenizer": counter.identity,
             "raw_input_tokens": (counter.count(raw_body) if raw_body is not None else
                                  counter.count(plain_text_view(raws) if not cfg.sentence_splitting else raw_view(raws)) if raws else 0),
             **({"raw_input_kind": "plain_token_chunk"} if raw_body is not None else {}),
             "visible_source_refs": [] if not cfg.sentence_splitting else [r["source_ref"] for r in raws]})
-        return await agent.call(interface, run_id=run_id, messages=msg, response_schema=None,
-                                extra={"max_tokens": output},
-                                local_metadata={key: audit[key] for key in (
-                                    "protocol_version", "memory_mode", "review_phase", "context_id",
-                                    "review_id", "raw_bundle_hash")})
+        local_metadata = {key: audit[key] for key in (
+            "protocol_version", "memory_mode", "review_phase", "context_id", "review_id", "raw_bundle_hash")}
+        if unified_review:
+            local_metadata["memory_interface_version"] = UNIFIED_MEMORY_VERSION
+        raw = await agent.call(interface, run_id=run_id, messages=msg, response_schema=None,
+                               extra={"max_tokens": output}, local_metadata=local_metadata)
+        if unified_review:
+            # Real API clients require an explicit normal finish. Scripted
+            # clients may return plain strings, which represent complete fixtures.
+            if hasattr(raw, "finish_reason") and raw.finish_reason != "stop":
+                raise ModelAPIError(f"INCOMPLETE_MODEL_RESPONSE:{raw.finish_reason or 'missing_finish_reason'}")
+            store.save_context_manifest(run_id, call_id + "-response", {
+                "kind": "MODEL_RESPONSE", "call_id": call_id, "interface": interface,
+                "memory_interface_version": UNIFIED_MEMORY_VERSION,
+                "finish_reason": getattr(raw, "finish_reason", "scripted_complete"),
+                "memory_input_tokens": getattr(raw, "input_tokens", None) or tokens,
+                "memory_output_tokens": (getattr(raw, "output_tokens", None)
+                                         if getattr(raw, "output_tokens", None) is not None else counter.count(raw)),
+                "token_source": "provider" if getattr(raw, "output_tokens", None) is not None else "local_tokenizer"})
+        return raw
 
     if plan is None:
         error = None
@@ -172,6 +208,8 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         config_metadata.pop("update_input_mode")
     if cfg.plan_repair_failure_policy == "abort":
         config_metadata.pop("plan_repair_failure_policy")
+    if cfg.memory_interface == LEGACY_MEMORY_INTERFACE:
+        config_metadata.pop("memory_interface")
     metadata = dict(protocol_version=PROTOCOL, memory_contract=CONTRACT, prompt_version=PROMPT_VERSION,
                     execution_policy_version=("r2-low-answer-strict-recall-v1" if runtime.state.fact_only
                                               else "r2-low-answer-raw-v1"),
@@ -205,6 +243,13 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         metadata["binding_graph_contract"] = "r2-members-1"
         if not cfg.sentence_splitting:
             metadata["memory_view_version"] = MEMBER_MEMORY_VIEW_VERSION
+    if unified_memory:
+        metadata.update(memory_interface=UNIFIED_MEMORY_INTERFACE,
+                        memory_interface_version=UNIFIED_MEMORY_VERSION,
+                        memory_bind_prompt_version=UNIFIED_MEMORY_VERSION,
+                        memory_view_version=UNIFIED_MEMORY_VERSION,
+                        execution_policy_version="r2-low-answer-unified-evidence-v1",
+                        recall_prompt_version=None)
     if runtime.state.run_metadata and runtime.state.run_metadata != metadata:
         raise ValueError("RESUME_CONFIGURATION_CHANGED")
     if not runtime.state.run_metadata:
@@ -359,6 +404,8 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
                     if selected
                     else None
                 )
+        if unified_memory:
+            return {**ctx.model_dump(mode="json"), "query_instance": instance}
         return {"question": sample.question, **ctx.model_dump(mode="json"),
                 "query_instance": instance,
                 "old_binding": old_binding,
@@ -373,7 +420,7 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
             if strict(runtime.state) and not ctx.allowed_fact_ids and not ctx.upstream_only_allowed:
                 raise ValueError("EMPTY_MEMORY_NOT_AUTHORIZED")
             payload = memory_payload(ctx)
-            if ctx.phase == "FINAL" or size == 1 or (request("MEMORY", payload)[1] <= cfg.max_review_input_tokens
+            if unified_memory or ctx.phase == "FINAL" or size == 1 or (request("MEMORY", payload)[1] <= cfg.max_review_input_tokens
                                                     and memory_fits(payload["working_memory"])):
                 break
             size = max(1, size // 2)
@@ -455,6 +502,8 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
                         raise V52ResourceLimit(str(exc)) from exc
                     raise
             elif job.kind == "RECALL":
+                if unified_memory:
+                    raise ValueError("UNIFIED_MEMORY_RECALL_JOB_FORBIDDEN")
                 await recall(job)
             else:
                 await review(job)
@@ -519,7 +568,10 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         runtime.fail(str(exc), resource=isinstance(exc, V52ResourceLimit))
     events = store.list_runtime_events(run_id)
     manifests = store.list_context_manifests(run_id)
-    requests = [m for m in manifests if m.get("kind") == "MODEL_REQUEST"]
+    completions = {m["call_id"]: m for m in manifests if m.get("kind") == "MODEL_RESPONSE"}
+    requests = [{**m, **{key: value for key, value in completions.get(m.get("call_id"), {}).items()
+                         if key in {"memory_input_tokens", "memory_output_tokens", "finish_reason", "token_source"}}}
+                for m in manifests if m.get("kind") == "MODEL_REQUEST"]
     from .replay import replay_events
     result = dict(run_id=run_id, protocol_version=PROTOCOL, memory_contract=CONTRACT, plan_format="subqueries",
         state=runtime.export(), status=runtime.state.status, reason_codes=runtime.state.reason_codes, answer=runtime.state.answer,
@@ -531,7 +583,8 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         events=[e.model_dump(mode="json") for e in events], context_manifests=manifests,
         logical_model_calls=logical_calls, interface_calls=dict(Counter(m["interface"] for m in requests)), config=metadata)
     from .metrics_r2 import r2_metrics
-    result["r2_metrics"] = r2_metrics(runtime.state, pack, result["events"], requests)
+    result["r2_metrics"] = r2_metrics(runtime.state, pack, result["events"], requests,
+                                       model_calls=store.list_model_calls(run_id))
     if plain_chunks:
         result["r2_metrics"].update(chunk_count=cursor.window_index,
                                     chunk_body_tokens=len(cursor.tokens))

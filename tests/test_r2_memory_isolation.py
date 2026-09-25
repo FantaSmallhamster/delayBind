@@ -17,13 +17,23 @@ def condition(case, version="B", **options):
     return ex.make_condition(case, "test", version, "1", **options)
 
 
-def test_existing_a_b_and_full_render_are_byte_identical():
-    ab.assert_frozen_contracts(check_runtime=False)
+def test_historical_full_view_is_rejected_as_current_frozen_replay():
+    with pytest.raises(AssertionError):
+        ab.assert_frozen_contracts(check_runtime=False)
     c = sample_case()
-    assert experimental_messages(c, "A") == ab.original_messages(c["payload"])
-    assert experimental_messages(c, "B") == p.messages("MEMORY", c["payload"])
+    historical = experimental_view(c)
+    current = p.request_view("MEMORY", c["payload"])
+    assert "Question:\n" + c["payload"]["question"] in historical
+    assert c["payload"]["question"] not in current
+    assert historical != current
+
+
+def test_question_hidden_experiments_match_current_memory_view():
+    c = sample_case()
+    assert experimental_messages(c, "A", hide_question=True) == ab.original_messages(c["payload"])
+    assert experimental_messages(c, "B", hide_question=True) == p.messages("MEMORY", c["payload"])
     assert experimental_messages(c, "B")[0] == experimental_messages(c, "P17-full")[0]
-    assert experimental_view(c) == p.request_view("MEMORY", c["payload"])
+    assert experimental_view(c, hide_question=True) == p.request_view("MEMORY", c["payload"])
     restored = p.MEMORY_FACT_ONLY_NEUTRAL
     for old, new in (("Anne de Mowbray", "Elara Venn"), ("Richard of Shrewsbury", "Corvin Dale"),
                      ("Cindy", "Neris Moss"), ("Bob", "Torin Vale"), ("Alice", "Selene Hart")):

@@ -1,12 +1,55 @@
 """Stage evidence overlays; publish one BIND/REBIND decision atomically."""
 
 from .schema_v52 import FactNode, digest
-from .schema_r2 import ReviewRecord, BindingR2, fact_id, use_key
+from .schema_r2 import ReviewRecord, BindingR2, MemoryContextR2, fact_id, use_key
 from .navigation_r2 import (query, query_ready, current_uses, proof_refs, refresh, binding_effective, descendants)
 from .review_jobs_r2 import ensure_use, ensure_review, schedule_ready, event, evidence_signature, enqueue
 from .runtime_r2 import invalidate_closure
 from .source_refs_v52 import SentenceRefResolver
-from .memory_admission_r2 import strict, build_admission_snapshot
+from .memory_admission_r2 import (strict, unified, validates_evidence, build_admission_snapshot,
+                                  collect_memory_evidence, allow_upstream_inference)
+
+
+def _validate_unified_evidence(state, session, ctx):
+    """Recheck the frozen complete evidence set before any branch is staged."""
+    from .member_graph_r2 import branches_for
+    from .protocol_r2 import fact_alias_map
+
+    frozen = session.authorized_use_ids
+    if (not ctx.fact_only or not ctx.member_bindings
+            or ctx.memory_interface != session.memory_interface
+            or ctx.memory_interface != state.memory_interface
+            or ctx.admission_policy != state.admission_policy
+            or len(frozen) != len(set(frozen))
+            or ctx.authorized_use_ids != frozen
+            or (session.query_id, session.query_version, session.input_signature, session.target_binding_id)
+            != (ctx.query_id, ctx.query_version, ctx.input_signature, ctx.expected_binding_id)
+            or session.mode != ctx.allowed_mode
+            or any(key not in state.uses
+                   or state.uses[key].query_id != ctx.query_id
+                   or state.uses[key].query_version != ctx.query_version
+                   or state.uses[key].input_signature != ctx.input_signature
+                   or state.uses[key].status == "INVALIDATED" for key in frozen)):
+        raise ValueError("UNIFIED_EVIDENCE_PERMISSION_MISMATCH")
+    snapshot = collect_memory_evidence(state, ctx.query_id, target_binding_id=session.target_binding_id)
+    if (set(frozen) != set(snapshot["use_ids"])
+            or ctx.evidence_digest != session.evidence_digest
+            or ctx.evidence_digest != snapshot["digest"]
+            or set(ctx.allowed_fact_ids) != set(snapshot["fact_ids"])
+            or len(ctx.allowed_fact_ids) != len(set(ctx.allowed_fact_ids))
+            or ctx.evidence_origins != session.evidence_origins
+            or ctx.fact_aliases != session.fact_aliases
+            or ctx.fact_aliases != fact_alias_map(ctx.allowed_fact_ids)):
+        raise ValueError("UNIFIED_EVIDENCE_PERMISSION_MISMATCH")
+    rows = ctx.working_memory.navigation.get("facts", [])
+    visible = {row["fact_id"]: row for row in rows}
+    if (len(rows) != len(ctx.allowed_fact_ids) or set(visible) != set(ctx.allowed_fact_ids)
+            or any(visible[fid].get("text") != state.facts[fid].text for fid in ctx.allowed_fact_ids)):
+        raise ValueError("UNIFIED_EVIDENCE_BODY_MISMATCH")
+    if ctx.branch not in session.branches or ctx.branch not in branches_for(state, ctx.query_id):
+        raise ValueError("STALE_MEMBER_BRANCH")
+    if ctx.upstream_only_allowed != allow_upstream_inference(state, ctx.query_id, ctx.branch):
+        raise ValueError("UPSTREAM_ONLY_PERMISSION_MISMATCH")
 
 
 def apply_memory(runtime, response, ctx):
@@ -31,8 +74,22 @@ def apply_memory(runtime, response, ctx):
     manifest = runtime.store.connection.execute("SELECT payload_json FROM context_manifests WHERE run_id=? AND context_id=?",
                                                  (runtime.run_id, ctx.context_id)).fetchone()
     import json
-    if not manifest or json.loads(manifest[0]) != {"interface": "MEMORY_SNAPSHOT", **ctx.model_dump(mode="json")}:
+    registered = json.loads(manifest[0]) if manifest else None
+    # Old registered snapshots predate interface/evidence fields. Normalize
+    # their schema defaults while preserving every persisted permission field.
+    if (not registered or registered.get("interface") != "MEMORY_SNAPSHOT"
+            or MemoryContextR2.model_validate({key: value for key, value in registered.items()
+                                               if key != "interface"}).model_dump(mode="json")
+            != ctx.model_dump(mode="json")):
         raise ValueError("MEMORY_CONTEXT_NOT_REGISTERED")
+    unified_mode = unified(s0)
+    if (unified_mode != (ctx.memory_interface == "unified_evidence_v1")
+            or unified_mode != (r0.memory_interface == "unified_evidence_v1")):
+        raise ValueError("MEMORY_INTERFACE_MISMATCH")
+    if unified_mode:
+        _validate_unified_evidence(s0, r0, ctx)
+        if response.ignored_lines:
+            raise ValueError("UNIFIED_RESULT_HAS_IGNORED_LINES")
     action = response.operations[0]
     if action.op != ctx.allowed_mode or action.query_id != ctx.query_id:
         raise ValueError("MEMORY_MODE_OR_QUERY_MISMATCH")
@@ -60,6 +117,7 @@ def apply_memory(runtime, response, ctx):
     signatures_before = {qid: ex.input_signature for qid, ex in s0.executions.items()}
     session = s.reviews[ctx.review_id]
     strict_fact_only = strict(s)
+    validated_fact_only = validates_evidence(s)
     if strict_fact_only:
         frozen = set(session.admitted_use_tokens) | set(session.prior_support_use_ids)
         if (set(ctx.allowed_fact_ids) != {s.uses[key].fact_id for key in frozen}
@@ -169,8 +227,9 @@ def apply_memory(runtime, response, ctx):
         if result.decision_source_refs:
             raise ValueError("FACT_ONLY_RESULT_HAS_SOURCE_REFS")
         allowed = set(ctx.allowed_fact_ids)
-        current = ([s.uses[key] for key in sorted(set(session.admitted_use_tokens) |
-                                                 set(session.prior_support_use_ids))]
+        current = ([s.uses[key] for key in session.authorized_use_ids] if unified_mode else
+                   [s.uses[key] for key in sorted(set(session.admitted_use_tokens) |
+                                                set(session.prior_support_use_ids))]
                    if strict_fact_only else current_uses(s, ctx.query_id))
         current_by_fact = {u.fact_id: u for u in current}
         if not set(support) <= allowed or not set(support) <= set(current_by_fact):
@@ -180,8 +239,8 @@ def apply_memory(runtime, response, ctx):
             # for a later evidence revision and an existing proof stays intact.
             event(events, "FACT_ONLY_DECISION_NOOP", query_id=ctx.query_id,
                   review_id=session.review_id, preserved_binding_id=session.target_binding_id)
-            if strict_fact_only:
-                for key in session.admitted_use_tokens:
+            if validated_fact_only:
+                for key in (session.authorized_use_ids if unified_mode else session.admitted_use_tokens):
                     if s.uses[key].status == "PENDING":
                         s.uses[key].status = "CANDIDATE"
         else:
@@ -203,7 +262,7 @@ def apply_memory(runtime, response, ctx):
     parent_ids = [s.executions[p].current_binding_id for p in query(s, ctx.query_id).depends_on]
     use_ids, raw_refs = [], set()
     if result.state == "BOUND":
-        unresolved = (current if ctx.fact_only and strict_fact_only else current_uses(s, ctx.query_id))
+        unresolved = (current if ctx.fact_only and validated_fact_only else current_uses(s, ctx.query_id))
         if not ctx.member_bindings and any(u.status in {"PENDING", "HELD", "CONFLICT"} for u in unresolved):
             raise ValueError("UNRESOLVED_REVIEW_BLOCKS_BOUND")
         q = query(s, ctx.query_id)
@@ -213,7 +272,7 @@ def apply_memory(runtime, response, ctx):
             raise ValueError("BINDING_CARDINALITY_MISMATCH")
         if not support and (result.kind == "DIRECT" or not parent_ids):
             raise ValueError("MISSING_BINDING_PROOF")
-        if strict_fact_only and not support and not ctx.upstream_only_allowed:
+        if validated_fact_only and not support and not ctx.upstream_only_allowed:
             raise ValueError("UPSTREAM_ONLY_NOT_AUTHORIZED")
         if result.kind == "INFERRED" and not any(ctx.query_id in child.depends_on for child in s.plan.queries):
             raise ValueError("INFERRED_ONLY_FOR_INTERMEDIATE_QUERY")
@@ -241,11 +300,14 @@ def apply_memory(runtime, response, ctx):
     unchanged = bool(old and result.state == "BOUND" and digest(old.value) == digest(normalized_value)
                      and old.direct_use_ids == sorted(use_ids) and old.parent_binding_ids == sorted(parent_ids)
                      and old.kind == result.kind and (not ctx.member_bindings or old.members == published_members))
+    unknown_branch_count = (sum(decision == "NOOP" for decision in session.branch_decisions.values())
+                            if unified_mode else 0)
     affected = set()
     if old and not unchanged and not fact_only_noop:
         affected = invalidate_closure(s, {ctx.query_id}, events, preserve_root_uses=True, except_review=session.review_id)
     if unchanged:
-        event(events, "BINDING_REAFFIRMED", query_id=ctx.query_id, binding_id=old_id, review_id=session.review_id)
+        event(events, "BINDING_PRESERVED_UNSUPPORTED" if unknown_branch_count else "BINDING_REAFFIRMED",
+              query_id=ctx.query_id, binding_id=old_id, review_id=session.review_id)
     elif result.state == "BOUND":
         revision = 1 + max((b.binding_revision for b in s.binding_store.values() if b.producer_query_id == ctx.query_id), default=0)
         bid = "B" + str(len(s.binding_store) + 1)
@@ -257,7 +319,7 @@ def apply_memory(runtime, response, ctx):
         s.executions[ctx.query_id].current_binding_id = bid
         event(events, "BINDING_CREATED", query_id=ctx.query_id, binding_id=bid, mode=session.mode)
     else:
-        diagnostic_state = "NOOP" if fact_only_noop else "UNBOUND"
+        diagnostic_state = "UNSUPPORTED_RESULT" if unified_mode and fact_only_noop else "NOOP" if fact_only_noop else "UNBOUND"
         s.diagnostics.append(dict(query_id=ctx.query_id, state=diagnostic_state, reason_code=result.reason_code,
                                   source_refs=result.decision_source_refs, review_id=session.review_id,
                                   query_version=ctx.query_version, input_signature=ctx.input_signature))
@@ -297,7 +359,13 @@ def apply_memory(runtime, response, ctx):
     # Resume saved child inboxes after a reaffirm without recomputing valid chains.
     if unchanged or (fact_only_noop and old is not None):
         for child in s.plan.queries:
-            if any(u.status == "PENDING" for u in current_uses(s, child.id)) and query_ready(s, child.id):
+            if unified_mode and query_ready(s, child.id):
+                # PLAN repair can route CANDIDATE evidence while an upstream
+                # review barrier blocks an already-bound query. Its whole
+                # evidence digest, rather than PENDING uses, decides wakeup.
+                schedule_ready(s, child.id, "UPSTREAM_REVIEW_COMPLETED", events,
+                               callback=runtime.config.enable_defer_callback)
+            elif any(u.status == "PENDING" for u in current_uses(s, child.id)) and query_ready(s, child.id):
                 schedule_ready(s, child.id, "UPSTREAM_REAFFIRMED", events,
                                callback=runtime.config.enable_defer_callback)
             elif not ready_before[child.id] and query_ready(s, child.id) and not s.executions[child.id].current_binding_id:
@@ -325,6 +393,20 @@ def apply_memory(runtime, response, ctx):
     event(events, "NAVIGATION_REBUILT", query_id=ctx.query_id, affected_query_ids=sorted(affected))
     changed = ((result.state == "BOUND" and not unchanged)
                or (result.state == "UNBOUND" and old is not None and not ctx.fact_only))
+    if unified_mode:
+        supported_members = [member for branch_id, members in session.branch_results.items()
+                             if session.branch_decisions[branch_id] == "BOUND" for member in members]
+        event(events, "UNIFIED_MEMORY_RESULT_APPLIED", query_id=ctx.query_id,
+              review_id=session.review_id, context_id=ctx.context_id,
+              memory_interface=ctx.memory_interface, evidence_digest=ctx.evidence_digest,
+              evidence_origins=session.evidence_origins,
+              unknown_result=fact_only_noop, unknown_branch_count=unknown_branch_count,
+              unchanged=unchanged and not unknown_branch_count,
+              snapshot_unchanged=bool(old and (unchanged or fact_only_noop)), binding_changed=changed,
+              supported_member_count=len(supported_members),
+              support_fact_count=len({fid for member in supported_members for fid in member.direct_fact_ids}),
+              published_member_count=len(published_members) if changed else 0,
+              preserved_binding_id=old_id if old and not changed else None)
     return runtime.commit(s, events, context_id=ctx.context_id, response=encoded,
                           receipt=dict(changed=changed,
                                        affected_query_ids=sorted(affected), review_complete=True,

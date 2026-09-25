@@ -65,6 +65,7 @@ class RunnerConfig:
     max_rebind_sessions_per_window: int = 64
     update_input_mode: str = "archive_windows"
     plan_repair_failure_policy: str = "abort"
+    memory_interface: str = "legacy_bind_rebind_v1"
 
     def protocol_mapping(self):
         """Keep the persisted R2 fingerprint stable across resumed runs."""
@@ -74,6 +75,8 @@ class RunnerConfig:
             result.pop("update_input_mode")
         if self.plan_repair_failure_policy == "abort":
             result.pop("plan_repair_failure_policy")
+        if self.memory_interface == "legacy_bind_rebind_v1":
+            result.pop("memory_interface")
         return result
 
     def __post_init__(self) -> None:
@@ -102,6 +105,10 @@ class RunnerConfig:
             raise ValueError("invalid update_input_mode")
         if self.plan_repair_failure_policy not in {"abort", "continue_valid_plan"}:
             raise ValueError("invalid plan_repair_failure_policy")
+        if self.memory_interface not in {"legacy_bind_rebind_v1", "unified_evidence_v1"}:
+            raise ValueError("invalid memory_interface")
+        if self.memory_interface == "unified_evidence_v1" and self.sentence_splitting:
+            raise ValueError("unified_evidence_v1 requires fact-only R2")
         if self.update_input_mode == "plain_token_chunks" and self.sentence_splitting:
             raise ValueError("plain_token_chunks requires fact-only R2")
         if self.candidate_batch_size <= 0 or self.chunk_size <= 0:

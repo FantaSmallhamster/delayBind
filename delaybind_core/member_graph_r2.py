@@ -73,6 +73,7 @@ def branches_for(state, qid, *, limit=1024, allow_partial=False):
 
 def make_members(state, ctx, result):
     from .navigation_r2 import current_uses
+    from .memory_admission_r2 import validates_evidence
     branch = ctx.branch
     if branch is None:
         raise ValueError("MEMBER_BRANCH_REQUIRED")
@@ -101,7 +102,7 @@ def make_members(state, ctx, result):
             raise ValueError("MISSING_MEMBER_PROOF")
         if not item.support_fact_ids and not any(ctx.query_id in q.depends_on for q in state.plan.queries):
             raise ValueError("INFERRED_ONLY_FOR_INTERMEDIATE_QUERY")
-        if ctx.fact_only and ctx.admission_policy == "strict-recall-v1" and not item.support_fact_ids and not ctx.upstream_only_allowed:
+        if validates_evidence(state) and not item.support_fact_ids and not ctx.upstream_only_allowed:
             raise ValueError("UPSTREAM_ONLY_NOT_AUTHORIZED")
         key = digest(item.value)
         if key not in grouped:
@@ -126,6 +127,7 @@ def stage_branch(state, ctx, result, session, events):
     withdraw that branch after review, matching the existing raw contract.
     """
     from .review_jobs_r2 import event
+    from .memory_admission_r2 import unified
     if ctx.branch is None or ctx.branch not in session.branches or ctx.branch.branch_id in session.branch_results:
         raise ValueError("STALE_MEMBER_BRANCH")
     previous = state.binding_store.get(session.target_binding_id)
@@ -135,6 +137,17 @@ def stage_branch(state, ctx, result, session, events):
         members = [m for m in previous.members if m.branch_id == ctx.branch.branch_id] if previous else []
     else:
         members = []
+    if unified(state):
+        if result.state not in {"BOUND", "NOOP"} or result.reason_code != (
+                "SUPPORTED_RESULT" if result.state == "BOUND" else "UNSUPPORTED_RESULT"):
+            raise ValueError("UNIFIED_RESULT_CONTRACT_MISMATCH")
+        event(events, "MEMORY_RESULT_EVALUATED", query_id=ctx.query_id, review_id=session.review_id,
+              context_id=ctx.context_id, branch_id=ctx.branch.branch_id,
+              memory_interface=ctx.memory_interface, evidence_digest=ctx.evidence_digest,
+              evidence_origins=session.evidence_origins, unknown_result=result.state == "NOOP",
+              supported_member_count=len(members) if result.state == "BOUND" else 0,
+              support_fact_count=len({fid for member in members for fid in member.direct_fact_ids})
+              if result.state == "BOUND" else 0)
     session.branch_results[ctx.branch.branch_id] = members
     session.branch_decisions[ctx.branch.branch_id] = result.state
     event(events, "MEMBER_BRANCH_STAGED", query_id=ctx.query_id, branch_id=ctx.branch.branch_id,
@@ -178,6 +191,7 @@ def member_projection(state):
 
 def assert_member_invariants(state):
     from .navigation_r2 import query
+    from .memory_admission_r2 import unified
     # Include blocked but still current snapshots: barriers temporarily hide
     # proofs; they must not alter their immutable structure.
     members = {m.member_id: (b, m) for b in state.binding_store.values() if b.valid for m in b.members}
@@ -190,7 +204,8 @@ def assert_member_invariants(state):
             raise ValueError("MEMBER_FACT_PROJECTION_MISMATCH")
         if len({m.member_id for m in b.members}) != len(b.members):
             raise ValueError("DUPLICATE_MEMBER_NODE")
-        parents = set(query(state, b.producer_query_id).depends_on)
+        planned_query = query(state, b.producer_query_id)
+        parents = set(planned_query.depends_on)
         for m in b.members:
             scalar_value(m.value)
             actual, lineage = set(), {}
@@ -210,3 +225,7 @@ def assert_member_invariants(state):
                 raise ValueError("MEMBER_LINEAGE_MISMATCH")
             if not m.direct_fact_ids and not m.parent_member_ids:
                 raise ValueError("MISSING_MEMBER_PROOF")
+            if (unified(state) and not m.direct_fact_ids
+                    and not (planned_query.allow_upstream_only and planned_query.inputs
+                             and any(planned_query.id in child.depends_on for child in state.plan.queries))):
+                raise ValueError("UPSTREAM_ONLY_NOT_AUTHORIZED")

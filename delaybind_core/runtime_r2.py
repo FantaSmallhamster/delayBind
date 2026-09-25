@@ -3,18 +3,23 @@
 from uuid import uuid4
 
 from .schema_v52 import FactNode, digest
-from .schema_r2 import StateR2, Execution, InboxEntry, PendingChunkR2, UpdateRepairProgressR2, fact_id
+from .schema_r2 import (StateR2, Execution, InboxEntry, PendingChunkR2, UpdateRepairProgressR2,
+                        EvidencePlanR2, LEGACY_MEMORY_INTERFACE, UNIFIED_MEMORY_INTERFACE, fact_id)
 from .navigation_r2 import (query, query_ready, current_uses, descendants, refresh, assert_invariants,
                             query_projection, binding_effective)
 from .review_jobs_r2 import (event, ensure_use, ensure_review, schedule_ready, cancel_reviews,
                              evidence_signature, TERMINAL, enqueue, finish_strict_work)
-from .memory_admission_r2 import strict, STRICT_POLICY, grant_admission
+from .memory_admission_r2 import strict, unified, STRICT_POLICY, UNIFIED_POLICY, grant_admission
 
 
 class RuntimeR2:
     def __init__(self, *, run_id, plan, archive, store, config):
         self.run_id, self.archive, self.store, self.config = run_id, archive, store, config
-        policy = STRICT_POLICY if not config.sentence_splitting else "legacy"
+        interface = getattr(config, "memory_interface", LEGACY_MEMORY_INTERFACE)
+        if interface == UNIFIED_MEMORY_INTERFACE and (config.sentence_splitting or not isinstance(plan, EvidencePlanR2)):
+            raise ValueError("UNIFIED_MEMORY_REQUIRES_FACT_ONLY_MEMBER_PLAN")
+        policy = (UNIFIED_POLICY if interface == UNIFIED_MEMORY_INTERFACE
+                  else STRICT_POLICY if not config.sentence_splitting else "legacy")
         saved = store.latest_v52_state(run_id)
         if saved:
             self.state = StateR2.model_validate(saved)
@@ -22,6 +27,8 @@ class RuntimeR2:
                 raise ValueError("RESUME_PLAN_CHANGED")
             if self.state.fact_only != (not config.sentence_splitting):
                 raise ValueError("RESUME_FACT_MODE_CHANGED")
+            if self.state.memory_interface != interface:
+                raise ValueError("RESUME_MEMORY_INTERFACE_CHANGED")
             if self.state.admission_policy != policy:
                 raise ValueError("RESUME_ADMISSION_POLICY_CHANGED")
             if self.archive is not None:
@@ -29,7 +36,7 @@ class RuntimeR2:
             assert_invariants(self.state)
         else:
             self.state = StateR2(plan=plan, fact_only=not config.sentence_splitting,
-                                 admission_policy=policy,
+                                 admission_policy=policy, memory_interface=interface,
                                  executions={q.id: Execution() for q in plan.queries})
             refresh(self.state)
             self.commit(self.state.model_copy(deep=True), [("PLAN_CREATED", {"plan": plan.model_dump()})])
@@ -209,9 +216,13 @@ class RuntimeR2:
                 s.hints.append(fid)
         # All routes exist before ancestor barriers are installed and jobs wake.
         from .navigation_r2 import topological
+        if unified(s):
+            # A changed bucket must never mutate an in-flight frozen request,
+            # including a child currently waiting behind an ancestor's review.
+            cancel_reviews(s, changed, events)
         for qid in topological(s):
             if qid in changed and snapshot[qid]["status"] != "DORMANT":
-                if strict(s):
+                if strict(s) or unified(s):
                     schedule_ready(s, qid, "UPDATE", events, callback=self.config.enable_defer_callback)
                 else:
                     ensure_review(s, qid, "UPDATE", events)
@@ -235,6 +246,8 @@ class RuntimeR2:
         return self.state.jobs[job_id]
 
     def finish_recall_batch(self, job_id, selected, *, batch_size=None, expected_offset=None):
+        if unified(self.state):
+            raise ValueError("RECALL_MODEL_DISABLED_FOR_UNIFIED_MEMORY")
         s, events = self.state.model_copy(deep=True), []
         j = s.jobs[job_id]
         p = j.payload
@@ -281,6 +294,10 @@ class RuntimeR2:
             return
         s, events = self.state.model_copy(deep=True), [("SCOPE_CLOSED", {})]
         s.scope_closed = True
+        if unified(s):
+            # EOF changes the frozen basis for completeness-sensitive queries,
+            # including those temporarily blocked by an ancestor's review.
+            cancel_reviews(s, {q.id for q in s.plan.queries if q.requires_complete_set}, events)
         resumed = set()
         for r in s.reviews.values():
             if r.status in {"WAITING_CONTEXT", "WAITING_SCOPE"}:
@@ -298,7 +315,7 @@ class RuntimeR2:
         for q in s.plan.queries:
             if (q.id not in resumed and query_ready(s, q.id)
                     and (q.requires_complete_set or any(u.status == "HELD" for u in current_uses(s, q.id)))):
-                if strict(s):
+                if strict(s) or unified(s):
                     schedule_ready(s, q.id, "SCOPE_CLOSED", events,
                                    callback=self.config.enable_defer_callback, force_review=True)
                 else:

@@ -75,11 +75,12 @@ def test_real_tokenizer_uses_exact_reference_decode():
 
 def test_actual_requests_and_snapshots_contain_identical_sections():
     context = "  Document 7: repeated\nDocument 2: repeated\nDocument 10: end  "
+    question = "GLOBAL_QUESTION_SENTINEL: Compare the two family trees."
     client, tokenizer, store = NoneClient(), CharacterTokenizer(), SQLiteEventStore()
     config = RunnerConfig(protocol_version="v5.2-r2", sentence_splitting=False,
                           update_input_mode="plain_token_chunks", chunk_size=15)
     result = asyncio.run(V5Runner(client, config=config, tokenizer=tokenizer).run(
-        run_id="plain-snapshots", question="Who teaches Cindy?", context=context, store=store, plan=plan()))
+        run_id="plain-snapshots", question=question, context=context, store=store, plan=plan()))
     reference = tokenizer.encode(context.strip())
     chunks = [tokenizer.decode(reference[i:i + 15]) for i in range(0, len(reference), 15)]
     snapshots = [m for m in result["context_manifests"] if m.get("interface") == "UPDATE_SNAPSHOT"]
@@ -90,6 +91,8 @@ def test_actual_requests_and_snapshots_contain_identical_sections():
     for index, message in enumerate(calls):
         assert "<section>\n" + chunks[index] + "\n</section>" in message[-1]["content"]
         assert "<DOCUMENT_BOUNDARY>" not in message[-1]["content"]
+        assert all(question not in part["content"] for part in message)
+        assert "<problem>" not in message[-1]["content"]
     assert result["r2_metrics"]["chunk_body_tokens"] == len(reference)
     assert result["r2_metrics"]["transaction_replay_consistency"] == 1
     assert all(m["raw_input_tokens"] == len(chunks[i]) for i, m in enumerate(

@@ -4,7 +4,7 @@ from .schema_v52 import digest
 from .schema_r2 import DurableJob, ReviewSession, FactUseR2, use_key
 from .navigation_r2 import query, current_uses, query_ready, topological, refresh
 from .memory_admission_r2 import (strict, build_admission_snapshot, pending_admissions,
-                                  memory_work_decision)
+                                  memory_work_decision, unified, collect_memory_evidence)
 
 TERMINAL = {"DONE", "CANCELLED"}
 
@@ -14,6 +14,8 @@ def event(events, event_type, **payload):
 
 
 def evidence_signature(state, qid):
+    if unified(state):
+        return collect_memory_evidence(state, qid)["digest"]
     ex = state.executions[qid]
     return digest([ex.version, ex.input_signature, ex.evidence_revision, state.scope_closed,
                    sorted(state.route_index.get(qid, []))])
@@ -63,11 +65,20 @@ def ensure_review(state, qid, trigger, events, *, enqueue_memory=True):
     ex = state.executions[qid]
     if not query_ready(state, qid):
         return None
+    if unified(state):
+        # A bucket belongs to a query template; each concrete input signature
+        # needs its own authorization records when its dependencies become ready.
+        for fid in collect_memory_evidence(state, qid)["fact_ids"]:
+            use = ensure_use(state, qid, fid, status="CANDIDATE", origin="DEFERRED")
+            if use.status == "INVALIDATED":
+                use.status = "CANDIDATE"
+        enqueue_memory = True
     signature = evidence_signature(state, qid)
     if ex.retry_gate == signature:
         return None
     uses = current_uses(state, qid)
-    snapshot = build_admission_snapshot(state, qid) if strict(state) else None
+    snapshot = (collect_memory_evidence(state, qid) if unified(state)
+                else build_admission_snapshot(state, qid) if strict(state) else None)
     required = (set(snapshot["use_ids"]) if snapshot else
                 {u.use_id for u in uses if u.status in {"PENDING", "HELD", "CONFLICT"}})
     if ex.current_binding_id and not snapshot:
@@ -89,8 +100,14 @@ def ensure_review(state, qid, trigger, events, *, enqueue_memory=True):
                       input_signature=ex.input_signature, target_binding_id=ex.current_binding_id,
                       inbox_revision=ex.evidence_revision, candidate_bucket_version=digest(sorted(state.route_index.get(qid, []))),
                       evidence_signature=signature, required_use_ids=sorted(required), trigger=trigger,
-                      admitted_use_tokens=snapshot["admitted_use_tokens"] if snapshot else {},
+                      admitted_use_tokens=snapshot.get("admitted_use_tokens", {}) if snapshot else {},
                       prior_support_use_ids=snapshot["prior_support_use_ids"] if snapshot else [])
+    if unified(state):
+        r.memory_interface = state.memory_interface
+        r.authorized_use_ids = list(snapshot["use_ids"])
+        r.evidence_origins = list(snapshot["evidence_origins"])
+        r.evidence_digest = snapshot["digest"]
+        r.fact_aliases = dict(snapshot["fact_aliases"])
     from .member_graph_r2 import enabled, branches_for
     if enabled(state):
         r.branches = branches_for(state, qid)
@@ -123,6 +140,17 @@ def schedule_ready(state, qid, trigger, events, *, callback=True, force_review=F
     if not query_ready(state, qid):
         return
     ex = state.executions[qid]
+    if unified(state):
+        signature = evidence_signature(state, qid)
+        if ex.retry_gate == signature:
+            return
+        if memory_work_decision(state, qid) == "CALL":
+            ensure_review(state, qid, trigger, events)
+        else:
+            ex.retry_gate = signature
+            event(events, "MEMORY_SKIPPED", query_id=qid, reason="SKIPPED_NO_EVIDENCE",
+                  evidence_signature=signature, caused_by=trigger)
+        return
     if strict(state):
         if ex.retry_gate == evidence_signature(state, qid):
             return
