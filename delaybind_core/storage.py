@@ -11,11 +11,11 @@ from typing import Any, Iterator
 
 from .manifest import ManifestEntry
 from .schema import ModelCall, RuntimeEvent
-from .storage_v52 import V52StorageMixin
+from .storage_archive_r2 import R2ArchiveStorageMixin
 from .storage_r2 import R2StorageMixin
 
 
-class SQLiteEventStore(V52StorageMixin, R2StorageMixin):
+class SQLiteEventStore(R2ArchiveStorageMixin, R2StorageMixin):
     def __init__(self, path: str = ":memory:"):
         self.path = path
         if path != ":memory:":
@@ -24,7 +24,7 @@ class SQLiteEventStore(V52StorageMixin, R2StorageMixin):
         self.connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._initialize()
-        self.initialize_v52()
+        self.initialize_archive()
         self.initialize_r2()
 
     def _initialize(self) -> None:

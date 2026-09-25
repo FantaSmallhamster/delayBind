@@ -11,6 +11,7 @@ from .context_r2 import (
     budgeted_evidence_pack,
     build_memory_context,
     build_update_context,
+    build_chunk_update_context,
     evidence_pack,
     persist_memory_context,
 )
@@ -21,7 +22,10 @@ from .memory_r2 import apply_memory
 from .memory_admission_r2 import strict
 from .navigation_r2 import query_projection, render_query
 from .plan_goal_r2 import parse_v51_member_plan
-from .plan_repair_r2 import build_repair_context, apply_repair
+from .plan_repair_r2 import (build_repair_context, register_repair_context, repair_basis_key,
+                             record_plan_repair_rejection, PlanRepairProposalError, apply_repair,
+                             REJECTION_POLICY_VERSION)
+from .cursor_plain_r2 import PlainTokenChunkCursor, PLAIN_CHUNK_VERSION
 from .prompts_r2 import (
     MEMBER_MEMORY_PROMPT_VERSION,
     MEMBER_PROMPT_VERSION,
@@ -43,7 +47,7 @@ from .schema_r2 import (
     member_plan,
 )
 from .schema_v52 import QueryPlanV3, digest
-from .subquery_runner_v52 import extract_boxed, V52ResourceLimit, V52ProtocolError
+from .answer_wire_r2 import extract_boxed, V52ResourceLimit, V52ProtocolError
 from .text_protocol_v52 import parse_selection
 from .text_views_v52 import memory_view, plain_text_view, raw_view
 from .token_budget import TokenCounter
@@ -56,6 +60,9 @@ def _query_projection_row(state, query_id, *, instantiate_members=False):
 
 async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=None):
     cfg = runner.config
+    plain_chunks = cfg.update_input_mode == "plain_token_chunks"
+    if plain_chunks and (sample.context is None or runner.tokenizer is None):
+        raise ValueError("PLAIN_CHUNKS_REQUIRE_CONTEXT_AND_TOKENIZER")
     if cfg.answer_format == "auto":
         cfg = replace(cfg, answer_format="boxed")
     if manifest is None and (cfg.sentence_splitting or sample.context is None):
@@ -67,13 +74,14 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
     counter = TokenCounter(runner.tokenizer, encoding_name=cfg.tokenizer_encoding)
     reader = runner.reader_client or runner.client
     high, low = HighLevelAgentR2(runner.client), LowLevelAgentR2(reader)
-    archive = SentenceArchive(store, run_id)
+    archive = None if plain_chunks else SentenceArchive(store, run_id)
     saved = store.latest_v52_state(run_id)
     if saved and plan is None:
         plan = StateR2.model_validate(saved).plan
     elif plan is not None and not saved:
         plan = member_plan(plan)
     logical_calls = sum(m.get("kind") == "MODEL_REQUEST" for m in store.list_context_manifests(run_id))
+    repair_skips = 0
 
     def request(interface, payload):
         msg = messages(interface, payload)
@@ -110,9 +118,10 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         if tokens > limit or tokens + output > cfg.max_context_tokens:
             raise V52ResourceLimit(budget_error)
         raws = (wm or {}).get("raw_evidence", []) + original.get("window_sources", [])
+        raw_body = original.get("chunk_text")
         audit = dict(protocol_version=PROTOCOL, memory_mode=original.get("allowed_mode"),
                      review_phase=original.get("phase"), context_id=original.get("context_id"),
-                     review_id=original.get("review_id"), raw_bundle_hash=digest(raws),
+                     review_id=original.get("review_id"), raw_bundle_hash=digest(raw_body if raw_body is not None else raws),
                      agent_role=agent.role,
                      client_model=getattr(getattr(agent.client, "config", None), "model", type(agent.client).__name__))
         if interface in {"MEMORY", "MEMORY_REPAIR"} and original.get("review_id"):
@@ -132,7 +141,9 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
             "memory_view_version": (MEMBER_MEMORY_VIEW_VERSION if not cfg.sentence_splitting
                                     and "members" in (wm or {}).get("navigation", {}) else None),
             "output_token_budget": output, "tokenizer": counter.identity,
-            "raw_input_tokens": counter.count(plain_text_view(raws) if not cfg.sentence_splitting else raw_view(raws)) if raws else 0,
+            "raw_input_tokens": (counter.count(raw_body) if raw_body is not None else
+                                 counter.count(plain_text_view(raws) if not cfg.sentence_splitting else raw_view(raws)) if raws else 0),
+            **({"raw_input_kind": "plain_token_chunk"} if raw_body is not None else {}),
             "visible_source_refs": [] if not cfg.sentence_splitting else [r["source_ref"] for r in raws]})
         return await agent.call(interface, run_id=run_id, messages=msg, response_schema=None,
                                 extra={"max_tokens": output},
@@ -156,6 +167,11 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         if plan is None:
             raise V52ProtocolError("PLAN_PROTOCOL_ERROR:" + str(error))
     runtime = RuntimeR2(run_id=run_id, plan=plan, archive=archive, store=store, config=cfg)
+    config_metadata = asdict(cfg)
+    if cfg.update_input_mode == "archive_windows":
+        config_metadata.pop("update_input_mode")
+    if cfg.plan_repair_failure_policy == "abort":
+        config_metadata.pop("plan_repair_failure_policy")
     metadata = dict(protocol_version=PROTOCOL, memory_contract=CONTRACT, prompt_version=PROMPT_VERSION,
                     execution_policy_version=("r2-low-answer-strict-recall-v1" if runtime.state.fact_only
                                               else "r2-low-answer-raw-v1"),
@@ -166,9 +182,15 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
                                          else "legacy"),
                     question_hash=digest(sample.question),
                     manifest_hash=digest(manifest.model_dump(mode="json") if manifest is not None else sample.context),
-                    config=asdict(cfg), tokenizer=counter.identity,
+                    config=config_metadata, tokenizer=counter.identity,
                     high_model=getattr(getattr(runner.client, "config", None), "model", type(runner.client).__name__),
                     low_model=getattr(getattr(reader, "config", None), "model", type(reader).__name__))
+    if plain_chunks:
+        metadata.update(update_input_version=PLAIN_CHUNK_VERSION, chunk_size=cfg.chunk_size,
+                        chunk_preprocess="context.strip() once", chunk_truncation="none",
+                        tokenizer_identity=getattr(runner.tokenizer, "name_or_path", type(runner.tokenizer).__name__))
+    if cfg.plan_repair_failure_policy == "continue_valid_plan":
+        metadata["plan_repair_control_version"] = REJECTION_POLICY_VERSION
     if not cfg.sentence_splitting:
         metadata["memory_bind_prompt_version"] = MEMBER_MEMORY_PROMPT_VERSION if isinstance(plan, EvidencePlanR2) else MEMORY_BIND_PROMPT_VERSION
     if isinstance(plan, EvidencePlanR2):
@@ -177,6 +199,7 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
             "member_bindings": True,
             "fact_only": runtime.state.fact_only,
             "plan_hints_enabled": runtime.state.fact_only and cfg.plan_repair_mode == "on_hint",
+            **({"chunk_text": ""} if plain_chunks else {}),
         })
         metadata["recall_prompt_version"] = MEMBER_RECALL_PROMPT_VERSION
         metadata["binding_graph_contract"] = "r2-members-1"
@@ -188,7 +211,24 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         staged = runtime.state.model_copy(deep=True)
         staged.run_metadata = metadata
         runtime.commit(staged, [("RUN_CONFIGURED", metadata)])
-    if cfg.sentence_splitting:
+    if plain_chunks:
+        cursor = PlainTokenChunkCursor(sample.context, runner.tokenizer, chunk_size=cfg.chunk_size,
+                                       state=runtime.state.cursor_state or None)
+        if runtime.state.cursor_state and runtime.state.read_watermark != cursor.window_index - 1:
+            raise ValueError("CURSOR_WATERMARK_MISMATCH")
+        if not runtime.state.cursor_state and runtime.state.read_watermark != -1:
+            raise ValueError("CURSOR_STATE_MISSING")
+        pending = runtime.state.pending_chunk
+        if pending is not None:
+            start = pending.chunk_index * cfg.chunk_size
+            end = min(start + cfg.chunk_size, len(cursor.tokens))
+            if (pending.chunk_index != cursor.window_index - 1 or pending.token_start != start
+                    or pending.token_end != end or cursor.position != end
+                    or pending.chunk_text != runner.tokenizer.decode(cursor.tokens[start:end])):
+                raise ValueError("PENDING_CHUNK_CURSOR_MISMATCH")
+        elif runtime.state.update_repair_progress is not None:
+            raise ValueError("UPDATE_PROGRESS_WITHOUT_PENDING_CHUNK")
+    elif cfg.sentence_splitting:
         cursor = SentenceReadCursor(manifest, archive, counter=counter, window_mode=cfg.window_mode,
                                     state=runtime.state.cursor_state or None)
     else:
@@ -196,10 +236,39 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         cursor = LegacyReadCursor(archive, text=sample.context, sample_id=sample.sample_id, manifest=manifest,
                                   tokenizer=runner.tokenizer, state=runtime.state.cursor_state or None)
 
-    async def update(refs):
-        payload = build_update_context(runtime, sample.question, refs, counter=counter)
-        scope, original_rejected, retained, error = None, [], [], []
-        for attempt in range(cfg.max_protocol_retries + 1):
+    async def update(refs=None, *, chunk=None):
+        progress = runtime.state.update_repair_progress if chunk is not None else None
+        if progress:
+            matches = [m for m in store.list_context_manifests(run_id)
+                       if m.get("interface") == "UPDATE_SNAPSHOT" and m.get("context_id") == progress.context_id]
+            if (len(matches) != 1 or matches[0].get("chunk_text") != chunk.chunk_text
+                    or matches[0].get("chunk_index") != chunk.chunk_index
+                    or progress.context_id not in runtime.state.update_receipts):
+                raise ValueError("UPDATE_RESUME_SNAPSHOT_MISMATCH")
+            payload = {k: v for k, v in matches[0].items() if k != "interface"}
+            if progress.complete:
+                runtime.finish_chunk()
+                return
+            scope = RepairScope(progress.original_rejected, UpdateResponseR2(context_id=payload["context_id"]))
+            scope.targets = list(progress.repair_targets)
+            scope.retained = {(x[0], x[1], tuple(x[2])) for x in progress.retained_identities}
+            original_rejected, retained, error = (list(progress.original_rejected),
+                                                  list(progress.retained_items), list(progress.validation_errors))
+            first_attempt = progress.next_attempt
+        else:
+            if chunk is None:
+                payload = build_update_context(runtime, sample.question, refs, counter=counter)
+            else:
+                matches = [m for m in store.list_context_manifests(run_id)
+                           if m.get("interface") == "UPDATE_SNAPSHOT" and m.get("chunk_text") == chunk.chunk_text
+                           and m.get("chunk_index") == chunk.chunk_index
+                           and m.get("state_revision") == runtime.state.state_revision]
+                if any(m.get("context_id") in runtime.state.update_receipts for m in matches):
+                    raise ValueError("UPDATE_RESUME_PROGRESS_MISSING")
+                payload = ({k: v for k, v in matches[-1].items() if k != "interface"} if matches else
+                           build_chunk_update_context(runtime, sample.question, chunk, counter=counter))
+            scope, original_rejected, retained, error, first_attempt = None, [], [], [], 0
+        for attempt in range(first_attempt, cfg.max_protocol_retries + 1):
             data = payload if attempt == 0 else {**payload, "rejected_items": original_rejected,
                 "retained_items": retained, "repair_targets": scope.targets, "validation_errors": error}
             raw = await complete("UPDATE" if attempt == 0 else "UPDATE_REPAIR", data)
@@ -213,29 +282,49 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
             elif rejected:
                 original_rejected = rejected
                 scope = RepairScope(rejected, observations)
-            runtime.ingest(observations, payload, rejected=rejected)
-            retained.extend(f.model_dump() for f in [*observations.facts, *observations.hints])
+            new_retained = retained + [f.model_dump() for f in [*observations.facts, *observations.hints]]
+            repair_progress = None
+            if chunk is not None:
+                repair_progress = dict(context_id=payload["context_id"], next_attempt=attempt + 1,
+                                       complete=not rejected, original_rejected=original_rejected,
+                                       retained_items=new_retained,
+                                       repair_targets=scope.targets if scope else [],
+                                       retained_identities=[[qid, body, list(refs)] for qid, body, refs in sorted(scope.retained)] if scope else [],
+                                       validation_errors=list(rejected))
+            runtime.ingest(observations, payload, rejected=rejected, repair_progress=repair_progress)
+            retained = new_retained
             if not rejected:
-                runtime.finish_window()
+                runtime.finish_chunk() if chunk is not None else runtime.finish_window()
                 return
             error = rejected
         raise V52ProtocolError("UPDATE_REPAIR_EXHAUSTED")
 
     async def repair_plan():
+        nonlocal repair_skips
         if cfg.plan_repair_mode != "on_hint" or not set(runtime.state.hints) - set(runtime.state.processed_hints):
             return
-        ctx = build_repair_context(runtime, sample.question)
+        recoverable = cfg.plan_repair_failure_policy == "continue_valid_plan"
+        ctx = build_repair_context(runtime, sample.question, persist=not recoverable)
+        key = repair_basis_key(runtime.state, ctx) if recoverable else None
+        if recoverable:
+            if key in runtime.state.plan_repair_failures:
+                repair_skips += 1
+                return
+            register_repair_context(runtime, ctx)
         data = dict(ctx)
+        errors, response_hashes = [], []
         for _ in range(cfg.max_protocol_retries + 1):
             raw = await complete("PLAN", data)
+            response_hashes.append(digest(raw))
             try:
                 apply_repair(runtime, raw, ctx)
                 return
-            except ValueError as exc:
-                if "STALE" in str(exc):
-                    raise
+            except PlanRepairProposalError as exc:
+                errors.append(exc.code)
                 data["validation_errors"] = str(exc)
-        raise V52ProtocolError("PLAN_REPAIR_EXHAUSTED")
+        if not recoverable:
+            raise V52ProtocolError("PLAN_REPAIR_EXHAUSTED")
+        record_plan_repair_rejection(runtime, ctx, key, errors, response_hashes)
 
     def memory_payload(ctx):
         s = runtime.state
@@ -374,16 +463,23 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
 
     if runtime.state.status == "RUNNING":
         try:
-            if runtime.state.pending_window:
+            if plain_chunks and runtime.state.pending_chunk is not None:
+                await update(chunk=runtime.state.pending_chunk)
+            elif runtime.state.pending_window:
                 await update(runtime.state.pending_window)
             await repair_plan()
             await drain()
             while not cursor.exhausted:
                 if cursor.window_index >= cfg.max_windows:
                     raise V52ResourceLimit("WINDOW_BUDGET")
-                window = cursor.next_anchored_window(cfg.chunk_size)
-                runtime.record_window(window, cursor.state())
-                await update(list(window.source_refs))
+                if plain_chunks:
+                    chunk = cursor.next_chunk()
+                    runtime.record_chunk(chunk, cursor.state())
+                    await update(chunk=runtime.state.pending_chunk)
+                else:
+                    window = cursor.next_anchored_window(cfg.chunk_size)
+                    runtime.record_window(window, cursor.state())
+                    await update(list(window.source_refs))
                 await repair_plan()
                 await drain()
             runtime.close_scope()
@@ -436,5 +532,15 @@ async def run_subqueries_r2(runner, *, run_id, sample, manifest, store, plan=Non
         logical_model_calls=logical_calls, interface_calls=dict(Counter(m["interface"] for m in requests)), config=metadata)
     from .metrics_r2 import r2_metrics
     result["r2_metrics"] = r2_metrics(runtime.state, pack, result["events"], requests)
+    if plain_chunks:
+        result["r2_metrics"].update(chunk_count=cursor.window_index,
+                                    chunk_body_tokens=len(cursor.tokens))
+    if cfg.plan_repair_failure_policy == "continue_valid_plan":
+        result["r2_metrics"].update(plan_repair_rejected_count=len(runtime.state.plan_repair_failures),
+                                    plan_repair_rejected_basis=sorted(runtime.state.plan_repair_failures),
+                                    plan_repair_success_count=sum(e["event_type"] == "PLAN_REPAIRED" for e in result["events"]),
+                                    plan_repair_skipped_same_basis=repair_skips,
+                                    plan_repair_continued=bool(runtime.state.plan_repair_failures)
+                                    and runtime.state.status in {"ANSWERED", "INSUFFICIENT"})
     result["r2_metrics"]["transaction_replay_consistency"] = float(replay_events(events).export() == runtime.export())
     return result

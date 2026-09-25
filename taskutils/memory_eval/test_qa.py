@@ -60,14 +60,6 @@ def get_pred(data, args, out_file):
         from utils.rememr1 import async_query_llm
         from utils import extract_boxed_answer as extract_answer
         nocallback = 'nocallback' in args.save_file
-    elif args.api == "v51":
-        from utils.v51 import async_query_llm
-        from utils import extract_boxed_answer as extract_answer
-        nocallback = 'nocallback' in args.save_file
-    elif args.api == "v52":
-        from utils.v52 import async_query_llm
-        from utils import extract_boxed_answer as extract_answer
-        nocallback = 'nocallback' in args.save_file
     elif args.api == "v52_r2":
         from utils.v52_r2 import async_query_llm
         from utils import extract_boxed_answer as extract_answer
@@ -83,7 +75,7 @@ def get_pred(data, args, out_file):
         raise ValueError
     coros = []
     for item in data:
-        if args.api in {"recurrent_revisit", "v51", "v52", "v52_r2"}:
+        if args.api in {"recurrent_revisit", "v52_r2"}:
             coro = async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95, nocallback=nocallback)
         else:
             coro = async_query_llm(item, model, tokenizer, temperature=0.7, top_p=0.95)

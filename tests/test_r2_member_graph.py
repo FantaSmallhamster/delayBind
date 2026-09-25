@@ -392,12 +392,9 @@ def test_plan_repair_preserves_cardinality_free_schema_and_rejects_fixed_cardina
 
 def test_member_plan_round_trips_through_evaluation_validation():
     from delaybind_core.schema import parse_query_plan
-    from types import SimpleNamespace
     from delaybind_core.plan_validation import validate_plan
-    from delaybind_core.metrics import plan_relation_recall
     restored = parse_query_plan(plan().model_dump())
     assert restored == plan() and validate_plan(restored) == []
-    assert plan_relation_recall(restored, SimpleNamespace(patterns=[])) is None
 
 
 def test_full_text_runner_fans_out_and_answer_receives_graph_not_flattened_names():

@@ -278,3 +278,43 @@ V5.2 / R2 原文模式发送给模型的原文统一为 `[来源ID] 原文`，�
 另有事实模式端到端用例验证两字段 UPDATE、零原文 MEMORY/ANSWER，以及后续 RESOLVED 新事实导致
 Q1/Q2/Q3 旧链全部退休并重绑为新链。
 无筛选的仓库级 pytest 仍需要训练侧可选依赖 `torch`、`datasets`、`ray`。
+
+## 可选 token 片直传与 PLAN 修补拒绝
+
+R2 事实成员模式可显式设置 `update_input_mode=plain_token_chunks`。读取入口对
+`context` 只做一次 `strip()`，用配置的真实 tokenizer 编码一次，再按 `chunk_size`
+顺序切分 token ID 并逐片解码。解码结果直接放入 UPDATE / UPDATE_REPAIR 的
+`<section>`，不经来源归档、文档重排或句子拼接，也不插入 `DOCUMENT_BOUNDARY`。
+此模式必须提供上下文和 tokenizer；完整请求仍受现有 token 与调用预算约束。
+默认 `archive_windows` 保留旧事实模式行为。
+
+每片的 token 起止位置、正文和下一位置随 `CHUNK_OBSERVED` 事务保存。
+UPDATE 成功后才清除 `pending_chunk`；中断恢复复用已登记的 UPDATE 快照，
+部分采纳后的修复范围、保留条目和剩余重试次数也随状态提交。请求审计中的
+`raw_input_tokens` 和哈希覆盖实际片正文。版本为 `baseline-token-chunks-v1`。
+
+`plan_repair_failure_policy=continue_valid_plan` 仅作用于 `mode=REPAIR` 的模型提案。
+合法提案仍按原事务提交；格式、权限或计划 DTO 错误按现有次数重试，耗尽后
+写入 `plan_repair_failures` 和 `PLAN_REPAIR_REJECTED` 事件，再继续原调度。
+同一计划、待处理 hint、授权事实、有效绑定和查询语义视图不重复请求；新依据
+允许再次尝试。失败不会把 hint 标记为已处理，也不改写绑定或证据。
+上下文过期、存储/不变量、API 和预算错误仍沿原失败路径传播。默认 `abort`
+保留旧行为；控制版本为 `optional-repair-reject-v1`。
+
+完整实验配置在
+`configs/v52_r2_full128_member_graph_plain_chunks_optional_repair.json`，使用独立
+实验 ID 和输出目录。本次修改只运行本地确定性测试，没有发送模型请求；
+离线测试覆盖真实 tokenizer 的参考切片、模型请求正文、快照恢复、局部修复拒绝、
+事件回放及旧模式回归。
+
+2026-09-25 离线实现验证时 `.venv/bin/python -m pytest -q tests` 为 **588 passed**。
+冻结 128 题的实际 tokenizer 离线审计共检查 240 个 chunk，cursor、注册快照及
+UPDATE `<section>` 与参考 decode 均相同，差异数为 0。历史五题的十次修补回复
+用其原有事务 revision 重建提案准备状态，十次均归类为模型提案错误。
+详见 `reports/r2_plain_chunk_equivalence_128_20260925.json` 和
+`reports/r2_plan_repair_historical_classification_20260925.json`。
+未执行 G0–G3 真实模型评测，不能从上述离线验证推断 EM/F1 改善。
+
+随后清理了不再被 R2 使用的 V5/V5.2 运行模块及其专用测试。清理后的
+`.venv/bin/python -m pytest -q tests` 为 **329 passed**，现有 128 题实验的
+配置指纹保持一致，可继续 resume。旧实验配置和既有结果保留作历史记录。

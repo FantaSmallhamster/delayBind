@@ -3,7 +3,7 @@ import re
 from .data import canonicalize_record, build_manifest
 from .runner import RunnerConfig, V5Runner
 from .storage import SQLiteEventStore
-from .v52_smoke import smoke_plan, fixture_response, read_fixture_raw
+from .fixture_wire_r2 import smoke_plan, fixture_response, read_fixture_raw
 from .text_protocol_v52 import fields, refs
 from .text_views_v52 import escaped
 

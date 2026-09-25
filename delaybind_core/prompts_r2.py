@@ -677,9 +677,15 @@ def _member_request_view(interface, payload):
     if interface == "MEMORY" and payload.get("fact_only"):
         return _member_fact_only_memory_view(payload)
     if interface in {"UPDATE", "UPDATE_REPAIR"} and payload.get("fact_only"):
-        rows = ["Question:", payload["question"], "Extraction targets:",
-                extraction_targets_view(payload["query_graph"], preserve_unbound_templates=True),
-                "Current window:", plain_text_view(payload["window_sources"])]
+        if "chunk_text" in payload:
+            rows = ["<problem>\n" + payload["question"] + "\n</problem>",
+                    "<extraction_targets>\n" + extraction_targets_view(
+                        payload["query_graph"], preserve_unbound_templates=True) + "\n</extraction_targets>",
+                    "<section>\n" + payload["chunk_text"] + "\n</section>"]
+        else:
+            rows = ["Question:", payload["question"], "Extraction targets:",
+                    extraction_targets_view(payload["query_graph"], preserve_unbound_templates=True),
+                    "Current window:", plain_text_view(payload["window_sources"])]
         if interface == "UPDATE_REPAIR":
             rows += ["Frozen repair targets:", display(payload["repair_targets"]),
                      "Rejected items:", display(payload["rejected_items"]),
@@ -705,6 +711,8 @@ def prompt_version_for(interface, payload):
         return STRICT_MEMORY_PROMPT_VERSION
     if original.get("member_bindings"):
         if interface in {"UPDATE", "UPDATE_REPAIR"} and original.get("fact_only"):
+            if "chunk_text" in original:
+                return "baseline-token-chunks-v1"
             return (MEMBER_UPDATE_HINT_PROMPT_VERSION if original.get("plan_hints_enabled")
                     else MEMBER_UPDATE_PROMPT_VERSION)
         if interface in {"MEMORY", "MEMORY_REPAIR"} and original.get("fact_only"):
@@ -739,6 +747,11 @@ def messages(interface, payload):
     fact_only = bool(original.get("fact_only"))
     dynamic = bool(original.get("member_bindings"))
     update = (UPDATE_FACT_ONLY_SOURCE_CLAUSE if dynamic else UPDATE_FACT_ONLY) if fact_only else UPDATE
+    if fact_only and dynamic and "chunk_text" in original and interface in {"UPDATE", "UPDATE_REPAIR"}:
+        update = update.replace("Current window", "<section>")
+        update = update.replace(
+            "<DOCUMENT_BOUNDARY> separates independent documents. Never join an entity, pronoun, alias, relationship, or value across that boundary into one fact.",
+            "Respect document titles and boundaries present in <section>. Never join an entity, pronoun, alias, relationship, or value across documents into one fact.")
     if fact_only and dynamic and original.get("plan_hints_enabled") and interface in {"UPDATE", "UPDATE_REPAIR"}:
         update = update.replace(
             "- Output exactly two fields separated by |: query ID | complete source-supported fact.",

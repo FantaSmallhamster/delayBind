@@ -169,6 +169,37 @@ class UpdateResponseR2(Strict):
     hints: list[Hint] = Field(default_factory=list)
 
 
+class PendingChunkR2(Strict):
+    chunk_index: int = Field(ge=0)
+    token_start: int = Field(ge=0)
+    token_end: int = Field(ge=0)
+    chunk_text: str
+
+
+class PlanRepairFailureR2(Strict):
+    status: Literal["REJECTED"] = "REJECTED"
+    hint_ids: list[str]
+    base_plan_hash: str
+    basis_hash: str
+    context_id: str
+    base_state_revision: int
+    attempt_count: int
+    error_codes: list[str]
+    response_hashes: list[str]
+    policy_version: Literal["optional-repair-reject-v1"] = "optional-repair-reject-v1"
+
+
+class UpdateRepairProgressR2(Strict):
+    context_id: str
+    next_attempt: int
+    complete: bool = False
+    original_rejected: list[dict[str, Any]] = Field(default_factory=list)
+    retained_items: list[dict[str, Any]] = Field(default_factory=list)
+    repair_targets: list[dict[str, Any]] = Field(default_factory=list)
+    retained_identities: list[list[Any]] = Field(default_factory=list)
+    validation_errors: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class Execution(Strict):
     status: Literal["ACTIVE", "DORMANT", "RESOLVED"] = "DORMANT"
     version: int = 1
@@ -347,7 +378,10 @@ class StateR2(Strict):
     read_watermark: int = -1
     cursor_state: dict[str, Any] = Field(default_factory=dict)
     pending_window: list[str] = Field(default_factory=list)
+    pending_chunk: PendingChunkR2 | None = None
     update_receipts: dict[str, int] = Field(default_factory=dict)
+    update_repair_progress: UpdateRepairProgressR2 | None = None
+    plan_repair_failures: dict[str, PlanRepairFailureR2] = Field(default_factory=dict)
     context_expansions: int = 0
     status: str = "RUNNING"
     reason_codes: list[str] = Field(default_factory=list)

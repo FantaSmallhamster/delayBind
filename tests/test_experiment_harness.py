@@ -1,132 +1,50 @@
+"""The current R2 experiment path writes reproducible outputs and resumes."""
+
 import asyncio
 import json
 
 import pytest
 
 from delaybind_core.evaluation import ExperimentConfig, run_experiment
+from delaybind_core.smoke_r2 import ScriptedR2Client
 
 
-class ExperimentClient:
-    async def complete(self, *, run_id, interface, messages, response_schema=None, extra=None):
-        content = messages[0]["content"]
-        if interface == "PLAN":
-            return json.dumps(
-                {
-                    "plan_id": "predicted",
-                    "patterns": [
-                        {"id": "director", "subject": "Film A", "relation": "director", "object": "?director"}
-                    ],
-                    "answer_contract": {"target": "?director", "type": "ENTITY"},
-                }
-            )
-        if interface == "UPDATE":
-            if "<UPDATE_CALLBACK" in content:
-                return json.dumps({"matches": []})
-            window = json.loads(content.split("Current window:\n", 1)[1].split("\n\nReturn only", 1)[0])
-            entry = window[0]
-            return json.dumps(
-                {
-                    "events": [
-                        {
-                            "event_id": f"event-{entry['source_ref']}",
-                            "source_ref": entry["source_ref"],
-                            "subject": "Film A",
-                            "concrete_relation": "director",
-                            "matched_family": "director",
-                            "object": "Martin Lee",
-                            "span_hint": "directed by Martin Lee",
-                            "source_order": entry["stream_position"],
-                        }
-                    ]
-                }
-            )
-        if interface == "VERIFY":
-            claim = json.loads(
-                content.split("Candidate claim:\n", 1)[1].split("\n\nRaw neighborhood:", 1)[0]
-            )
-            neighborhood = json.loads(content.split("Raw neighborhood:\n", 1)[1].split("\n\nReturn only", 1)[0])
-            return json.dumps({
-                "claim_id": claim["claim_id"], "status": "ACCEPT", "reason": "explicit statement",
-                "supporting_source_refs": [neighborhood[0]["source_ref"]],
-                "supporting_text": neighborhood[0]["text"],
-            })
-        if interface == "ANSWER":
-            context = json.loads(content.split("Complete context:\n", 1)[1].split("\n\nReturn only", 1)[0])
-            return json.dumps(
-                {
-                    "answer": "Martin Lee",
-                    "answer_type": "ENTITY",
-                    "source_refs": [context[0]["source_ref"]],
-                }
-            )
-        raise AssertionError(interface)
-
-
-def test_experiment_harness_writes_all_artifacts_and_resumes(tmp_path):
+def test_r2_experiment_writes_artifacts_and_resumes(tmp_path):
     dataset = tmp_path / "fixture.json"
-    dataset.write_text(
-        json.dumps(
-            [
-                {
-                    "id": "q1",
-                    "type": "compositional",
-                    "question": "Who directed Film A?",
-                    "answer": "Martin Lee",
-                    "evidences": [["Film A", "director", "Martin Lee"]],
-                    "supporting_facts": [["Film A", 0]],
-                    "context": [["Film A", ["Film A was directed by Martin Lee."]]],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    dataset.write_text(json.dumps([{
+        "id": "r2-smoke",
+        "question": "Where was Cindy's teacher's mother born?",
+        "answer": "Suzhou",
+        "context": [
+            ["Mary", ["Mary was born in Suzhou."]],
+            ["Alice", ["Alice's mother is Mary."]],
+            ["Cindy", ["Cindy's teacher is Alice."]],
+            ["Review", ["Other Cindy likes Alice."]],
+        ],
+    }]), encoding="utf-8")
     output = tmp_path / "experiment"
-    config = ExperimentConfig.from_mapping(
-        {
-            "input": str(dataset),
-            "output_dir": str(output),
-            "experiment_id": "fixture",
-            "sample_count": 1,
-            "methods": [
-                "direct_full_context",
-                "v5_oracle",
-                "v5_predicted",
-                "v5_oracle_no_defer",
-            ],
-            "orders": ["original", "reverse"],
-            "compile_oracle": True,
-            "max_concurrency": 2,
-            "runner": {"plan_format": "graph", "chunk_size": 10, "max_model_calls": 10},
-        }
-    )
-    factory = lambda store: ExperimentClient()
+    config = ExperimentConfig.from_mapping({
+        "input": str(dataset), "output_dir": str(output), "experiment_id": "fixture",
+        "sample_count": 1, "methods": ["v52_r2_predicted"], "orders": ["original"],
+        "runner": {"protocol_version": "v5.2-r2", "chunk_size": 32},
+    })
+    factory = lambda store: ScriptedR2Client()
     summary = asyncio.run(run_experiment(config, client_factory=factory))
     rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
-    assert summary["count"] == 8
-    assert len(rows) == 8
-    assert all(row["answer_exact"] for row in rows)
-    assert (output / "results.csv").exists()
-    assert (output / "summary.csv").exists()
-    assert (output / "summary.json").exists()
-    assert (output / "config.resolved.json").exists()
-    assert (output / "oracle_plans.compiled.json").exists()
-    assert len(list((output / "trajectories").glob("*.json"))) == 8
-    assert len(list((output / "manifests").glob("*.json"))) == 2
+    assert summary["count"] == 1
+    assert len(rows) == 1 and rows[0]["answer_exact"]
+    for name in ("results.csv", "summary.csv", "summary.json", "config.resolved.json"):
+        assert (output / name).exists()
+    assert len(list((output / "trajectories").glob("*.json"))) == 1
+    assert len(list((output / "manifests").glob("*.json"))) == 1
 
     resumed = asyncio.run(run_experiment(config, client_factory=factory))
-    assert resumed["count"] == 8
-    assert len((output / "results.jsonl").read_text().splitlines()) == 8
+    assert resumed["count"] == 1
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
 
-    changed = ExperimentConfig.from_mapping(
-        {
-            "input": str(dataset),
-            "output_dir": str(output),
-            "experiment_id": "fixture",
-            "sample_count": 1,
-            "methods": ["direct_full_context"],
-            "orders": ["original"],
-            "resume": True,
-        }
-    )
+    changed = ExperimentConfig.from_mapping({
+        "input": str(dataset), "output_dir": str(output), "experiment_id": "fixture",
+        "sample_count": 1, "methods": ["v52_r2_no_callback"], "orders": ["original"],
+    })
     with pytest.raises(ValueError, match="resume configuration differs"):
         asyncio.run(run_experiment(changed, client_factory=factory))

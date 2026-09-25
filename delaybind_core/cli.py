@@ -11,10 +11,7 @@ from typing import Any
 
 from .api import APIConfig, OpenAICompatibleClient
 from .data import build_manifest, canonicalize_record, load_records
-from .fact_protocol import parse_plan
 from .evaluation import ExperimentConfig, run_experiment
-from .oracle import compile_oracle_plans, write_oracle_plans
-from .profiler import profile_dataset
 from .replay import replay_events
 from .runner import RunnerConfig, V5Runner, load_manifest
 from .schema import RuntimeEvent, parse_query_plan
@@ -143,11 +140,9 @@ def _run_from_config(config_path: str | Path, *, sentence_splitting: bool | None
         plan_text = Path(plan_path).read_text(encoding="utf-8")
         if plan_text.lstrip().startswith("{"):
             plan = parse_query_plan(json.loads(plan_text))
-        elif (config.get("runner") or config).get("protocol_version") in {"v5.2", "v5.2-r2"}:
+        else:
             from .text_protocol_v52 import parse_plan as parse_v3_text_plan
             plan = parse_v3_text_plan(plan_text)
-        else:
-            plan = parse_plan(plan_text)
     runner = V5Runner(
         client,
         reader_client=reader_client,
@@ -205,11 +200,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="original",
     )
 
-    profile = sub.add_parser("profile")
-    profile.add_argument("--input", required=True)
-    profile.add_argument("--output", required=True)
-    profile.add_argument("--dataset-id", default="2wiki")
-
     replay = sub.add_parser("replay")
     replay.add_argument("--events", required=True)
     replay.add_argument("--output", required=True)
@@ -220,16 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     experiment = sub.add_parser("experiment")
     experiment.add_argument("--config", required=True)
     for command in (run, experiment):
-        command.add_argument("--protocol-version", choices=["v5", "v5.1", "v5.2", "v5.2-r2"], default=None)
+        command.add_argument("--protocol-version", choices=["v5.2-r2"], default=None)
         command.add_argument("--sentence-splitting", action=argparse.BooleanOptionalAction, default=None,
-                             help="V5.2: enable sentence indexing (default), or --no-sentence-splitting for V5.1 windows")
-
-    oracle = sub.add_parser("compile-oracle-plans")
-    oracle.add_argument("--input", required=True)
-    oracle.add_argument("--output", required=True)
-    oracle.add_argument("--dataset-id", default="2wiki")
-    oracle.add_argument("--sample-start", type=int, default=0)
-    oracle.add_argument("--sample-count", type=int)
+                             help="Enable sentence indexing, or process fact-only text windows")
     return parser
 
 
@@ -246,10 +229,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         manifest.to_json(args.output)
         return 0
-    if args.command == "profile":
-        result = profile_dataset(load_records(args.input, dataset_id=args.dataset_id))
-        Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        return 0
     if args.command == "replay":
         raw = json.loads(Path(args.events).read_text(encoding="utf-8"))
         events = [RuntimeEvent.model_validate(item) for item in raw]
@@ -259,16 +238,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         result = _run_from_config(args.config, sentence_splitting=args.sentence_splitting, protocol_version=args.protocol_version)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "compile-oracle-plans":
-        samples = list(load_records(args.input, dataset_id=args.dataset_id))
-        end = None if args.sample_count is None else args.sample_start + args.sample_count
-        selected = samples[args.sample_start:end]
-        if not selected:
-            raise SystemExit("Oracle Plan sample selection is empty")
-        plans = compile_oracle_plans(selected)
-        write_oracle_plans(plans, args.output)
-        print(json.dumps({"plans": len(plans), "output": args.output}, ensure_ascii=False))
         return 0
     if args.command == "experiment":
         _load_env_file()

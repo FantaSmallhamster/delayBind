@@ -41,9 +41,9 @@ def p17_version(interface, payload):
 
 
 class ProgressHarness(ExperimentHarness):
-    async def _run_condition(self, sample, method, order, oracle_plans):
+    async def _run_condition(self, sample, method, order):
         print("START " + sample.sample_id + " " + sample.question, flush=True)
-        result = await super()._run_condition(sample, method, order, oracle_plans)
+        result = await super()._run_condition(sample, method, order)
         # A completed question remains inspectable if a later call is paused.
         with (self.output_dir / "progress.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(result, ensure_ascii=False) + "\n")

@@ -1,16 +1,32 @@
 """Explicit HIGH PLAN(mode=REPAIR), separate from MEMORY binding authority."""
 
-from .schema_r2 import Execution, EvidencePlanR2
+from pydantic import ValidationError
+
+from .schema_r2 import Execution, EvidencePlanR2, PlanRepairFailureR2
 from .schema_v52 import QueryPlanV3, digest
 from .text_protocol_v52 import fields, refs, parse_memory as parse_legacy_patch
 from .protocol_r2 import strict_lines
-from .navigation_r2 import descendants, refresh, topological, query_projection
+from .navigation_r2 import descendants, refresh, topological, query_projection, binding_effective
 from .runtime_r2 import invalidate_closure
 from .review_jobs_r2 import ensure_use, schedule_ready, event
 from .context_r2 import evidence_pack
 
 
-def build_repair_context(runtime, question):
+REJECTION_POLICY_VERSION = "optional-repair-reject-v1"
+
+
+class PlanRepairProposalError(ValueError):
+    def __init__(self, code, message=None):
+        self.code = code
+        super().__init__(message or code)
+
+
+def register_repair_context(runtime, ctx):
+    runtime.store.save_context_manifest(runtime.run_id, ctx["context_id"],
+                                        {"interface": "PLAN_REPAIR_SNAPSHOT", **ctx})
+
+
+def build_repair_context(runtime, question, *, persist=True):
     s = runtime.state
     pending = sorted(set(s.hints) - set(s.processed_hints))
     allowed = sorted(set(s.hints) | {f for bucket in s.route_index.values() for f in bucket})
@@ -19,8 +35,27 @@ def build_repair_context(runtime, question):
                hint_ids=pending, allowed_fact_ids=allowed, working_memory=wm, fact_only=s.fact_only,
                member_bindings=isinstance(s.plan, EvidencePlanR2))
     ctx["context_id"] = "PC" + digest([runtime.run_id, ctx])
-    runtime.store.save_context_manifest(runtime.run_id, ctx["context_id"], {"interface": "PLAN_REPAIR_SNAPSHOT", **ctx})
+    if persist:
+        register_repair_context(runtime, ctx)
     return ctx
+
+
+def repair_basis_key(state, ctx):
+    """Semantic repair basis; window progress and request identity are excluded."""
+    graph = [{key: row.get(key) for key in (
+        "id", "template", "output", "inputs", "status", "version", "input_signature",
+        "rendered_query", "bound_inputs", "extraction_instances", "current_value",
+        "effective", "review_pending") if key in row}
+             for row in ctx["query_graph"]["queries"]]
+    bindings = [b.model_dump(mode="json") for bid, b in sorted(state.binding_store.items())
+                if binding_effective(state, bid)]
+    basis = dict(plan=state.plan.model_dump(mode="json"), hint_ids=ctx["hint_ids"],
+                 authorized_facts=[state.facts[fid].model_dump(mode="json", exclude={"observed_window"})
+                                   for fid in ctx["allowed_fact_ids"]],
+                 query_graph=graph, effective_bindings=bindings,
+                 scope_closed=state.scope_closed, fact_only=state.fact_only,
+                 mode=ctx["mode"], policy=REJECTION_POLICY_VERSION)
+    return "PR" + digest(basis)
 
 
 def parse_repair(raw, plan):
@@ -90,12 +125,21 @@ def apply_repair(runtime, raw, ctx):
     if not row or json.loads(row[0]) != {"interface": "PLAN_REPAIR_SNAPSHOT", **ctx}:
         raise ValueError("PLAN_REPAIR_CONTEXT_NOT_REGISTERED")
     for item in ctx["working_memory"]["raw_evidence"]:
-        if runtime.archive.fetch_sentence(item["source_ref"]).text_sha256 != item["text_sha256"]:
+        if runtime.archive is None or runtime.archive.fetch_sentence(item["source_ref"]).text_sha256 != item["text_sha256"]:
             raise ValueError("RAW_INTEGRITY_ERROR")
-    ops, evidence = parse_repair(raw, runtime.state.plan)
+    s, events, receipt_payload = _prepare_repair(runtime, raw, ctx)
+    return runtime.commit(s, events, context_id=ctx["context_id"], response=response,
+                          receipt=receipt_payload)
+
+
+def _prepare_repair(runtime, raw, ctx):
+    try:
+        ops, evidence = parse_repair(raw, runtime.state.plan)
+    except ValueError as exc:
+        raise PlanRepairProposalError("PLAN_REPAIR_FORMAT", str(exc)) from exc
     allowed = set(ctx["allowed_fact_ids"])
     if not set(evidence) <= allowed or (ops and not evidence):
-        raise ValueError("PLAN_REPAIR_EVIDENCE_REQUIRED")
+        raise PlanRepairProposalError("PLAN_REPAIR_EVIDENCE_REQUIRED")
     s, events = runtime.state.model_copy(deep=True), []
     queries = {q.id: q.model_dump() for q in s.plan.queries}
     roots, routed = set(), set()
@@ -103,12 +147,19 @@ def apply_repair(runtime, raw, ctx):
         if op["op"] == "PATCH":
             qid = op["query_id"]
             if isinstance(s.plan, EvidencePlanR2) and "cardinality" in op["patch"]:
-                raise ValueError("PLAN_CARDINALITY_IS_RUNTIME_OWNED:omit_cardinality")
+                raise PlanRepairProposalError("PLAN_CARDINALITY_IS_RUNTIME_OWNED")
             updated = {**queries.get(qid, {"id": qid}), **op["patch"]}
             if updated != queries.get(qid):
                 roots.add(qid)
             queries[qid] = updated
-    proposed = type(s.plan)(plan_id=s.plan.plan_id, queries=list(queries.values()))
+    try:
+        proposed = type(s.plan)(plan_id=s.plan.plan_id, queries=list(queries.values()))
+    except ValidationError as exc:
+        raise PlanRepairProposalError("PLAN_REPAIR_INVALID_PLAN", str(exc)) from exc
+    for op in ops:
+        if op["op"] == "ROUTE" and (op["query_id"] not in {q.id for q in proposed.queries}
+                                      or not set(op["fact_ids"]) <= allowed):
+            raise PlanRepairProposalError("PLAN_ROUTE_NOT_AUTHORIZED")
     new_projection = s.model_copy(deep=True)
     new_projection.plan = proposed
     old_roots = roots & s.executions.keys()
@@ -125,8 +176,8 @@ def apply_repair(runtime, raw, ctx):
         if op["op"] != "ROUTE":
             continue
         qid = op["query_id"]
-        if qid not in s.executions or not set(op["fact_ids"]) <= allowed:
-            raise ValueError("PLAN_ROUTE_NOT_AUTHORIZED")
+        if qid not in s.executions:
+            raise ValueError("PLAN_REPAIR_PREPARE_INCONSISTENT")
         for fid in op["fact_ids"]:
             bucket = s.route_index.setdefault(qid, [])
             if fid not in bucket:
@@ -142,5 +193,30 @@ def apply_repair(runtime, raw, ctx):
             schedule_ready(s, qid, "PLAN_REPAIR", events, callback=runtime.config.enable_defer_callback,
                            force_review=qid in roots)
     event(events, "PLAN_REPAIRED", changed_query_ids=sorted(roots), affected_query_ids=sorted(affected))
-    return runtime.commit(s, events, context_id=ctx["context_id"], response=response,
-                          receipt={"affected_query_ids": sorted(affected)})
+    return s, events, {"affected_query_ids": sorted(affected)}
+
+
+def record_plan_repair_rejection(runtime, ctx, key, error_codes, response_hashes):
+    import json
+    if ctx["state_revision"] != runtime.state.state_revision:
+        raise ValueError("STALE_PLAN_REPAIR_CONTEXT")
+    row = runtime.store.connection.execute("SELECT payload_json FROM context_manifests WHERE run_id=? AND context_id=?",
+                                           (runtime.run_id, ctx["context_id"])).fetchone()
+    if not row or json.loads(row[0]) != {"interface": "PLAN_REPAIR_SNAPSHOT", **ctx}:
+        raise ValueError("PLAN_REPAIR_CONTEXT_NOT_REGISTERED")
+    if (ctx["mode"] != "REPAIR" or key != repair_basis_key(runtime.state, ctx)
+            or not error_codes or len(error_codes) != len(response_hashes)):
+        raise ValueError("PLAN_REPAIR_REJECTION_BASIS_MISMATCH")
+    if key in runtime.state.plan_repair_failures:
+        return
+    s = runtime.state.model_copy(deep=True)
+    record = PlanRepairFailureR2(
+        hint_ids=list(ctx["hint_ids"]), base_plan_hash=digest(s.plan.model_dump(mode="json")),
+        basis_hash=key, context_id=ctx["context_id"], base_state_revision=ctx["state_revision"],
+        attempt_count=len(response_hashes), error_codes=list(error_codes),
+        response_hashes=list(response_hashes))
+    s.plan_repair_failures[key] = record
+    runtime.commit(s, [("PLAN_REPAIR_REJECTED", {"basis_hash": key,
+                                                   "context_id": ctx["context_id"],
+                                                   "error_codes": list(error_codes),
+                                                   "attempt_count": len(response_hashes)})])

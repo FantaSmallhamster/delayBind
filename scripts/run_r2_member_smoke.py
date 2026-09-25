@@ -18,9 +18,9 @@ SAMPLE_IDS = ["dev_5343", "dev_4784", "dev_11393", "dev_954", "dev_91", "dev_106
 
 
 class ProgressHarness(ExperimentHarness):
-    async def _run_condition(self, sample, method, order, oracle_plans):
+    async def _run_condition(self, sample, method, order):
         print(f"START {sample.sample_id} {sample.question}", flush=True)
-        result = await super()._run_condition(sample, method, order, oracle_plans)
+        result = await super()._run_condition(sample, method, order)
         with (self.output_dir / "progress.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(result, ensure_ascii=False) + "\n")
         print(json.dumps({key: result.get(key) for key in (

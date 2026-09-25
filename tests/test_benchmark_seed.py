@@ -1,9 +1,7 @@
-import json
 import random
 import re
 
 from scripts.build_2wiki_benchmark import build_records, prepare_source
-from scripts.run_v51_smoke import summarize
 
 
 def source_rows():
@@ -48,18 +46,3 @@ def test_fifty_document_generation_preserves_original_support_and_answers():
         assert row["input"] == record["question"] + "?"
         for position, title in zip(row["evidence_idx"], record["metadata"]["supporting_facts"]["title"]):
             assert docs[position].startswith(title + "\n")
-
-
-def test_new_seed_summary_does_not_reuse_old_baseline_results(tmp_path):
-    data = tmp_path / "data.json"
-    data.write_text(json.dumps([{"id": "new", "input": "Question?", "context": "text", "answers": ["Paris"]}]))
-    (tmp_path / "results.jsonl").write_text(json.dumps({
-        "sample_id": "new", "run_id": "r", "prediction": "Paris", "raw_answer": r"\boxed{Paris}",
-        "status": "OK", "runtime_status": "ANSWERED",
-    }) + "\n")
-    result = summarize({"input": str(data), "output_dir": str(tmp_path), "api": {}},
-                       {"selected": [{"sample_id": "new", "frozen_index": 0}]})
-    assert result["em"] == result["f1"] == 1.0
-    assert result["historical_baseline_em"] is None
-    assert result["historical_baseline_f1"] is None
-    assert not result["baseline_comparison_available"]

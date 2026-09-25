@@ -3,7 +3,7 @@
 from uuid import uuid4
 
 from .schema_v52 import FactNode, digest
-from .schema_r2 import StateR2, Execution, InboxEntry, fact_id
+from .schema_r2 import StateR2, Execution, InboxEntry, PendingChunkR2, UpdateRepairProgressR2, fact_id
 from .navigation_r2 import (query, query_ready, current_uses, descendants, refresh, assert_invariants,
                             query_projection, binding_effective)
 from .review_jobs_r2 import (event, ensure_use, ensure_review, schedule_ready, cancel_reviews,
@@ -24,7 +24,8 @@ class RuntimeR2:
                 raise ValueError("RESUME_FACT_MODE_CHANGED")
             if self.state.admission_policy != policy:
                 raise ValueError("RESUME_ADMISSION_POLICY_CHANGED")
-            self.archive.watermark = self.state.read_watermark
+            if self.archive is not None:
+                self.archive.watermark = self.state.read_watermark
             assert_invariants(self.state)
         else:
             self.state = StateR2(plan=plan, fact_only=not config.sentence_splitting,
@@ -55,6 +56,8 @@ class RuntimeR2:
         return result
 
     def record_window(self, window, cursor_state):
+        if self.archive is None:
+            raise ValueError("ARCHIVE_WINDOW_UNAVAILABLE")
         s = self.state.model_copy(deep=True)
         s.read_watermark, s.cursor_state = self.archive.watermark, cursor_state
         s.pending_window = list(window.source_refs)
@@ -87,20 +90,50 @@ class RuntimeR2:
                         break
         self.commit(s, events)
 
+    def record_chunk(self, chunk, cursor_state):
+        if self.archive is not None or self.config.update_input_mode != "plain_token_chunks":
+            raise ValueError("CHUNK_MODE_REQUIRED")
+        if self.state.pending_chunk is not None or chunk.chunk_index != self.state.read_watermark + 1:
+            raise ValueError("CHUNK_PROGRESS_MISMATCH")
+        s = self.state.model_copy(deep=True)
+        s.read_watermark, s.cursor_state = chunk.chunk_index, cursor_state
+        s.pending_chunk = PendingChunkR2(**vars(chunk))
+        self.commit(s, [("CHUNK_OBSERVED", {"chunk_index": chunk.chunk_index,
+                                             "token_start": chunk.token_start, "token_end": chunk.token_end,
+                                             "chunk_hash": digest(chunk.chunk_text), "cursor": cursor_state})])
+
+    def finish_chunk(self):
+        if self.state.pending_chunk is None:
+            raise ValueError("NO_PENDING_CHUNK")
+        s = self.state.model_copy(deep=True)
+        index = s.pending_chunk.chunk_index
+        s.pending_chunk = None
+        s.update_repair_progress = None
+        self.commit(s, [("CHUNK_PROCESSED", {"chunk_index": index})])
+
     def finish_window(self):
         s = self.state.model_copy(deep=True)
         s.pending_window = []
+        s.update_repair_progress = None
         self.commit(s, [("WINDOW_PROCESSED", {})])
 
-    def ingest(self, update, context, *, rejected=()):
+    def ingest(self, update, context, *, rejected=(), repair_progress=None):
         import json
         row = self.store.connection.execute("SELECT payload_json FROM context_manifests WHERE run_id=? AND context_id=?",
                                             (self.run_id, context["context_id"])).fetchone()
         if not row or json.loads(row[0]) != {"interface": "UPDATE_SNAPSHOT", **context}:
             raise ValueError("UPDATE_CONTEXT_NOT_REGISTERED")
-        for raw in context["window_sources"] + context["working_memory"]["raw_evidence"]:
-            if self.archive.fetch_sentence(raw["source_ref"]).text_sha256 != raw["text_sha256"]:
-                raise ValueError("RAW_INTEGRITY_ERROR")
+        if "chunk_text" in context:
+            pending = self.state.pending_chunk
+            if (self.archive is not None or not context.get("fact_only") or not context.get("member_bindings")
+                    or pending is None or pending.chunk_text != context["chunk_text"]
+                    or pending.chunk_index != context.get("chunk_index")
+                    or context["window_sources"] or context["working_memory"]["raw_evidence"]):
+                raise ValueError("CHUNK_UPDATE_CONTEXT_MISMATCH")
+        else:
+            for raw in context["window_sources"] + context["working_memory"]["raw_evidence"]:
+                if self.archive.fetch_sentence(raw["source_ref"]).text_sha256 != raw["text_sha256"]:
+                    raise ValueError("RAW_INTEGRITY_ERROR")
         if update.context_id != context["context_id"]:
             raise ValueError("UPDATE_CONTEXT_MISMATCH")
         allowed_revision = self.state.update_receipts.get(update.context_id, context["state_revision"])
@@ -183,6 +216,8 @@ class RuntimeR2:
                 else:
                     ensure_review(s, qid, "UPDATE", events)
         s.update_receipts[update.context_id] = self.state.state_revision + 1
+        if repair_progress is not None:
+            s.update_repair_progress = UpdateRepairProgressR2.model_validate(repair_progress)
         self.commit(s, events)
         return {"changed_query_ids": sorted(changed), "enqueued_job_ids": [p["job_id"] for e, p in events if e == "JOB_ENQUEUED"]}
 
@@ -280,6 +315,8 @@ class RuntimeR2:
         self.commit(s, [("RUN_STATUS", {"status": s.status, "reason": reason, "job_id": job_id})])
 
     def expand_context(self, job_id):
+        if self.archive is None:
+            raise ValueError("CONTEXT_EXPANSION_UNAVAILABLE")
         s, events = self.state.model_copy(deep=True), []
         job = s.jobs[job_id]
         r = s.reviews[job.review_id]

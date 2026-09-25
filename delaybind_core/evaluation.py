@@ -16,24 +16,12 @@ from typing import Any, Callable
 from .api import APIConfig, OpenAICompatibleClient
 from .data import CanonicalSample, build_manifest, load_records
 from .cursor import TextTokenizer
-from .direct import run_direct_full_context
-from .metrics import gold_source_refs, plan_relation_recall, score_result, summarize_results
-from .oracle import compile_oracle_plans, load_oracle_plans, write_oracle_plans
+from .metrics import gold_source_refs, score_result, summarize_results
 from .runner import RunnerConfig, V5Runner
-from .schema import GraphQueryPlan, parse_query_plan
 from .storage import SQLiteEventStore
 
 
-SUPPORTED_METHODS = {
-    "v52_predicted", "v52_no_callback", "v52_no_defer",
-    "v52_r2_predicted", "v52_r2_no_callback", "v52_r2_no_defer",
-    "direct_full_context",
-    "v5_predicted",
-    "v5_oracle",
-    "v5_oracle_no_defer",
-    "v5_oracle_flat",
-    "v5_oracle_flat_no_defer",
-}
+SUPPORTED_METHODS = {"v52_r2_predicted", "v52_r2_no_callback", "v52_r2_no_defer"}
 SUPPORTED_ORDERS = {"original", "reverse", "interleaved", "distant", "shuffle"}
 
 
@@ -41,13 +29,10 @@ SUPPORTED_ORDERS = {"original", "reverse", "interleaved", "distant", "shuffle"}
 class ExperimentConfig:
     input: str
     output_dir: str
-    experiment_id: str = "v5-smoke"
+    experiment_id: str = "r2-experiment"
     dataset_id: str = "2wiki"
-    methods: tuple[str, ...] = (
-        "direct_full_context",
-        "v5_predicted",
-    )
-    orders: tuple[str, ...] = ("original", "reverse")
+    methods: tuple[str, ...] = ("v52_r2_predicted",)
+    orders: tuple[str, ...] = ("original",)
     sample_start: int = 0
     sample_count: int | None = 16
     sample_ids: tuple[str, ...] = ()
@@ -81,8 +66,8 @@ class ExperimentConfig:
             raise ValueError("max_concurrency must be at least 1")
         return cls(
             input=str(value["input"]),
-            output_dir=str(value.get("output_dir", "results/v5_experiment")),
-            experiment_id=str(value.get("experiment_id", "v5-smoke")),
+            output_dir=str(value.get("output_dir", "results/r2_experiment")),
+            experiment_id=str(value.get("experiment_id", "r2-experiment")),
             dataset_id=str(value.get("dataset_id", "2wiki")),
             methods=methods,
             orders=orders,
@@ -186,7 +171,7 @@ class ExperimentHarness:
 
     def _resolved_config(self) -> dict[str, Any]:
         resolved = asdict(self.config)
-        resolved["runner"] = self.config.runner.protocol_mapping(include_r2=any(m.startswith("v52_r2_") for m in self.config.methods))
+        resolved["runner"] = self.config.runner.protocol_mapping()
         resolved["api"] = self.api_metadata
         resolved["reader_api"] = (
             {key: value for key, value in asdict(self.reader_api_config).items() if key != "api_key"}
@@ -248,20 +233,6 @@ class ExperimentHarness:
             raise ValueError("experiment sample selection is empty")
         return samples
 
-    def _oracle_plans(self, samples: list[CanonicalSample]) -> dict[str, GraphQueryPlan]:
-        requires_oracle = any("oracle" in method for method in self.config.methods)
-        if not requires_oracle:
-            return {}
-        if self.config.oracle_plans:
-            return load_oracle_plans(self.config.oracle_plans)
-        if not self.config.compile_oracle:
-            raise ValueError(
-                "Oracle methods require oracle_plans or compile_oracle=true"
-            )
-        plans = compile_oracle_plans(samples)
-        write_oracle_plans(plans, self.output_dir / "oracle_plans.compiled.json")
-        return plans
-
     async def run(self) -> dict[str, Any]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "trajectories").mkdir(exist_ok=True)
@@ -275,7 +246,6 @@ class ExperimentHarness:
                     "resume configuration differs from config.resolved.json; use a new output_dir or resume=false"
                 )
         samples = self._samples()
-        oracle_plans = self._oracle_plans(samples)
         results_path = self.output_dir / "results.jsonl"
         existing = _read_jsonl(results_path) if self.config.resume else []
         completed = {
@@ -294,7 +264,7 @@ class ExperimentHarness:
 
         async def guarded(sample: CanonicalSample, method: str, order: str) -> dict[str, Any]:
             async with semaphore:
-                return await self._run_condition(sample, method, order, oracle_plans)
+                return await self._run_condition(sample, method, order)
 
         new_rows: list[dict[str, Any]] = []
         if self.config.fail_fast:
@@ -340,7 +310,6 @@ class ExperimentHarness:
         sample: CanonicalSample,
         method: str,
         order: str,
-        oracle_plans: dict[str, GraphQueryPlan],
     ) -> dict[str, Any]:
         manifest = build_manifest(
             sample, dataset_id=self.config.dataset_id, seed=self.config.seed, order=order
@@ -359,40 +328,21 @@ class ExperimentHarness:
         started = time.perf_counter()
         plan_valid: bool | None = None
         try:
-            if method == "direct_full_context":
-                result = await run_direct_full_context(
-                    run_id=run_id,
-                    question=sample.question,
-                    manifest=manifest,
-                    client=client,
-                    store=store,
-                )
-            else:
-                oracle_plan = oracle_plans.get(sample.sample_id)
-                if "oracle" in method and oracle_plan is None:
-                    raise ValueError(f"missing Oracle Plan for sample {sample.sample_id}")
-                plan = oracle_plan if "oracle" in method else None
-                if plan is not None:
-                    plan_valid = True
-                runner_config = replace(
-                    self.config.runner,
-                    protocol_version="v5.2-r2" if method.startswith("v52_r2_") else "v5.2" if method.startswith("v52_") else self.config.runner.protocol_version,
-                    plan_format="subqueries" if method.startswith("v52_") else self.config.runner.plan_format,
-                    enable_defer_callback=False if method in {"v52_no_callback", "v52_r2_no_callback"} else self.config.runner.enable_defer_callback,
-                    defer_unbound=not method.endswith("no_defer"),
-                    query_graph_mode=("flat" if "_flat" in method else self.config.runner.query_graph_mode),
-                )
-                reader_client = (OpenAICompatibleClient(self.reader_api_config, store=store)
-                                 if self.reader_api_config else None)
-                result = await V5Runner(client, config=runner_config, reader_client=reader_client, tokenizer=self.tokenizer).run(
-                    run_id=run_id,
-                    sample=sample,
-                    manifest=None if sample.context is not None and runner_config.plan_format == "subqueries" else manifest,
-                    store=store,
-                    plan=plan,
-                )
-                result["method"] = method
-                plan_valid = True
+            runner_config = replace(
+                self.config.runner,
+                enable_defer_callback=False if method == "v52_r2_no_callback" else self.config.runner.enable_defer_callback,
+                defer_unbound=method != "v52_r2_no_defer",
+            )
+            reader_client = (OpenAICompatibleClient(self.reader_api_config, store=store)
+                             if self.reader_api_config else None)
+            result = await V5Runner(client, config=runner_config, reader_client=reader_client, tokenizer=self.tokenizer).run(
+                run_id=run_id,
+                sample=sample,
+                manifest=None if sample.context is not None else manifest,
+                store=store,
+            )
+            result["method"] = method
+            plan_valid = True
             result.update(
                 {
                     "sample_id": sample.sample_id,
@@ -416,7 +366,7 @@ class ExperimentHarness:
                 "method": method,
                 "order": order,
                 "manifest_id": manifest.manifest_id,
-                "plan_valid": False if method == "v5_predicted" else plan_valid,
+                "plan_valid": plan_valid,
                 "status": "ERROR",
                 "error_type": type(exc).__name__,
                 "error": str(exc),
@@ -427,8 +377,6 @@ class ExperimentHarness:
         calls = [call.model_dump(mode="json") for call in store.list_model_calls(run_id)]
         usage = store.model_call_summary(run_id)
         event_counts = dict(Counter(event["event_type"] for event in events))
-        if method == "v5_predicted" and event_counts.get("PLAN_CREATED"):
-            result["plan_valid"] = True
         result.update(usage)
         result["latency_ms"] = (time.perf_counter() - started) * 1000.0
         result["event_counts"] = event_counts
@@ -455,16 +403,7 @@ class ExperimentHarness:
         result["early_latent_evidence_recall"] = (
             len(early_gold & deferred_refs) / len(early_gold) if early_gold else None
         )
-        oracle = oracle_plans.get(sample.sample_id)
-        predicted_plan = None
-        if (result.get("state") or {}).get("plan"):
-            predicted_plan = parse_query_plan(result["state"]["plan"])
-        elif event_counts.get("PLAN_CREATED"):
-            plan_event = next(
-                event for event in events if event["event_type"] == "PLAN_CREATED"
-            )
-            predicted_plan = parse_query_plan(plan_event["payload"]["plan"])
-        result["plan_relation_recall"] = plan_relation_recall(predicted_plan, oracle)
+        result["plan_relation_recall"] = None
         scored = score_result(result, sample)
         trajectory_path = self.output_dir / "trajectories" / f"{run_id}.json"
         trajectory_path.write_text(

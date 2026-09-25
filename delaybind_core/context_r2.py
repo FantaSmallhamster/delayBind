@@ -181,6 +181,25 @@ def build_update_context(runtime, question, refs, *, counter=None):
     return payload
 
 
+def build_chunk_update_context(runtime, question, chunk, *, counter=None):
+    if runtime.archive is not None or not runtime.state.fact_only or not enabled(runtime.state):
+        raise ValueError("PLAIN_CHUNK_CONTEXT_REQUIRES_FACT_MEMBER_MODE")
+    pending = runtime.state.pending_chunk
+    if pending is None or pending != chunk:
+        raise ValueError("CHUNK_NOT_PENDING")
+    pack = budgeted_evidence_pack(runtime, counter) if counter else evidence_pack(runtime)
+    payload = dict(question=question, state_revision=runtime.state.state_revision,
+                   query_graph=query_projection(runtime.state, instantiate_members=True),
+                   working_memory=pack.model_dump(mode="json"), visible_sources=[], window_sources=[],
+                   chunk_index=chunk.chunk_index, chunk_text=chunk.chunk_text,
+                   fact_only=True, member_bindings=True,
+                   plan_hints_enabled=runtime.config.plan_repair_mode == "on_hint")
+    payload["context_id"] = "UC" + digest([runtime.run_id, payload])
+    runtime.store.save_context_manifest(runtime.run_id, payload["context_id"],
+                                        {"interface": "UPDATE_SNAPSHOT", **payload})
+    return payload
+
+
 def build_memory_context(runtime, review_id, *, batch_size=None):
     s, cfg = runtime.state, runtime.config
     r = s.reviews[review_id]

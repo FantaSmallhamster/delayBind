@@ -8,7 +8,7 @@ from delaybind_core.smoke_r2 import run_smoke, ScriptedR2Client, read_request
 from delaybind_core.storage import SQLiteEventStore
 from delaybind_core.agents_v52 import LowLevelAgentV52
 from delaybind_core.data import canonicalize_record, build_manifest
-from delaybind_core.v52_smoke import smoke_plan
+from delaybind_core.fixture_wire_r2 import smoke_plan
 from delaybind_core.schema_v52 import QueryPlanV3
 
 
@@ -210,18 +210,19 @@ def test_r16_cli_and_evaluation_dispatch_version_text_plan_and_metrics(tmp_path,
 def test_r16_adapter_passes_version_and_nocallback(monkeypatch):
     from taskutils.memory_eval.utils import v52_r2
     captured = {}
-    async def fake(*args, **kwargs):
-        captured.update(kwargs)
-        captured["nocallback"] = args[-1]
-        return "fixture"
-    monkeypatch.setattr(v52_r2, "_query", fake)
-    assert asyncio.run(v52_r2.async_query_llm({}, "model", None, nocallback=True)) == "fixture"
-    assert captured == {"protocol_version": "v5.2-r2", "nocallback": True}
+    class FakeRunner:
+        def __init__(self, client, *, config, tokenizer):
+            captured["config"] = config
+        async def run(self, *, run_id, item, store):
+            return {"status": "ANSWERED", "answer": {"raw_response": r"\boxed{fixture}"}}
+    monkeypatch.setattr(v52_r2, "V5Runner", FakeRunner)
+    assert asyncio.run(v52_r2.async_query_llm({}, "model", None, nocallback=True)) == r"\boxed{fixture}"
+    assert captured["config"].protocol_version == "v5.2-r2"
+    assert captured["config"].enable_defer_callback is False
 
 
-def test_old_config_fingerprints_exclude_unused_r2_settings():
+def test_runner_config_accepts_only_r2():
     for version in ("v5", "v5.1", "v5.2"):
-        settings = RunnerConfig(protocol_version=version).protocol_mapping()
-        assert "memory_contract" not in settings and "plan_repair_mode" not in settings
-        assert settings["protocol_version"] == version
+        with pytest.raises(ValueError, match="only protocol_version=v5.2-r2"):
+            RunnerConfig(protocol_version=version)
     assert RunnerConfig(protocol_version="v5.2-r2").protocol_mapping()["memory_contract"] == "bind-rebind-1"

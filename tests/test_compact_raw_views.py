@@ -9,7 +9,7 @@ from delaybind_core.cursor_v52 import TextReadCursor
 from delaybind_core.storage import SQLiteEventStore
 from delaybind_core.text_views_v52 import raw_view, queries_view
 from delaybind_core.token_budget import TokenCounter
-from delaybind_core.v52_smoke import read_fixture_raw
+from delaybind_core.fixture_wire_r2 import read_fixture_raw
 from test_v52_sources import CharacterTokenizer
 
 
