@@ -7,10 +7,170 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from .data import CanonicalSample
-from .schema import QueryPlan
+from .schema import GraphQueryPlan, QueryPlan
 
 
 _PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
+# LaTeX text commands such as \text{ October } or \textbf{foo}; repeated
+# substitution handles one level of nesting.  Answers are plain text, so any
+# residual backslash command is stripped as well.
+_LATEX_BRACED = re.compile(r"\\[a-zA-Z]+\{([^{}]*)\}")
+_LATEX_BARE = re.compile(r"\\[a-zA-Z]+")
+
+# Month names (full and common abbreviations), lowercase for casefolded text.
+_MONTHS = (
+    "january|february|march|april|may|june|july|august|september|october|november|december"
+    "|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+)
+# "May 10 1943" or "May 10th 1943" (month day year), after punctuation removal.
+_DATE_MDY = re.compile(rf"\b({_MONTHS})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+(\d{{4}})\b")
+# "10 May 1943" or "10th May 1943" (day month year), after punctuation removal.
+_DATE_DMY = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTHS})\s+(\d{{4}})\b")
+
+# Honorific / royal titles prepended to a person's canonical name.  Only stripped
+# when they appear as the first word followed by a space, so names like "Sirikit"
+# (which starts with "sir" but is not "Sir <name>") are unaffected.
+_TITLE_PREFIX = re.compile(
+    r"^(queen|king|prince|princess|duke|duchess|earl|countess?|lord|lady|sir|dame|"
+    r"emperor|empress|sultan|shah|pope|bishop|cardinal|reverend|father|brother|sister|"
+    r"archduke|archduchess|tsar|tsarina|khan|bey|pasha)\s+",
+    re.IGNORECASE,
+)
+
+# Redundant suffix words often appended to award / prize names.  Stripped only at
+# the very end, e.g. "young australian of the year award" -> "young australian of
+# the year".
+_REDUNDANT_SUFFIX = re.compile(
+    r"\s+(award|prize|title|medal|cup|trophy|championship|tournament|honour|honor|reward)$",
+    re.IGNORECASE,
+)
+
+# Word-level aliases: common abbreviations, city nicknames, country aliases,
+# and nationality adjectives mapped to canonical noun forms.
+_ALIASES = {
+    "okc": "oklahoma city",
+    "nyc": "new york city",
+    "la": "los angeles",
+    "sf": "san francisco",
+    "ussr": "soviet union",
+    "soviets": "soviet union",
+    "soviet": "soviet union",
+    "usa": "united states",
+    "us": "united states",
+    "america": "united states",
+    "uk": "united kingdom",
+    "britain": "united kingdom",
+    "gb": "united kingdom",
+    "prc": "china",
+    "singaporean": "singapore",
+    "indonesian": "indonesia",
+    "malaysian": "malaysia",
+    "thai": "thailand",
+    "vietnamese": "vietnam",
+    "filipino": "philippines",
+    "philippine": "philippines",
+    "korean": "korea",
+    "japanese": "japan",
+    "chinese": "china",
+    "russian": "russia",
+    "german": "germany",
+    "french": "france",
+    "italian": "italy",
+    "spanish": "spain",
+    "portuguese": "portugal",
+    "dutch": "netherlands",
+    "belgian": "belgium",
+    "swiss": "switzerland",
+    "swedish": "sweden",
+    "norwegian": "norway",
+    "danish": "denmark",
+    "finnish": "finland",
+    "polish": "poland",
+    "czech": "czechia",
+    "austrian": "austria",
+    "hungarian": "hungary",
+    "greek": "greece",
+    "turkish": "turkey",
+    "iranian": "iran",
+    "iraqi": "iraq",
+    "saudi": "saudi arabia",
+    "egyptian": "egypt",
+    "brazilian": "brazil",
+    "argentine": "argentina",
+    "argentinian": "argentina",
+    "mexican": "mexico",
+    "canadian": "canada",
+    "australian": "australia",
+    "indian": "india",
+    "pakistani": "pakistan",
+    "bangladeshi": "bangladesh",
+}
+
+_PHRASE_ALIASES = {
+    "u s a": "united states",
+    "united states of america": "united states",
+    "great britain": "united kingdom",
+    "union of soviet socialist republics": "soviet union",
+    "russian federation": "russia",
+    "federal republic of germany": "germany",
+    "republic of korea": "korea",
+    "kingdom of saudi arabia": "saudi arabia",
+    "republic of indonesia": "indonesia",
+    "republic of singapore": "singapore",
+    "republic of the philippines": "philippines",
+    "republic of poland": "poland",
+    "republic of finland": "finland",
+    "kingdom of denmark": "denmark",
+    "kingdom of norway": "norway",
+    "kingdom of sweden": "sweden",
+    "kingdom of the netherlands": "netherlands",
+    "kingdom of belgium": "belgium",
+    "republic of austria": "austria",
+    "republic of hungary": "hungary",
+    "hellenic republic": "greece",
+    "republic of turkey": "turkey",
+    "republic of egypt": "egypt",
+    "federative republic of brazil": "brazil",
+    "argentine republic": "argentina",
+    "united mexican states": "mexico",
+    "commonwealth of australia": "australia",
+    "republic of india": "india",
+    "islamic republic of pakistan": "pakistan",
+    "republic of malaysia": "malaysia",
+    "kingdom of thailand": "thailand",
+    "socialist republic of vietnam": "vietnam",
+    "peoples republic of china": "china",
+}
+
+
+def _expand_aliases(text: str) -> str:
+    """Replace common abbreviations, aliases and nationality adjectives with
+    canonical forms.  Phrase-level aliases are applied first, then word-level."""
+    for phrase, canonical in _PHRASE_ALIASES.items():
+        text = re.sub(rf"\b{re.escape(phrase)}\b", canonical, text)
+    words = text.split()
+    result = [_ALIASES.get(w, w) for w in words]
+    return " ".join(result)
+
+
+def _normalize_dates(text: str) -> str:
+    """Canonicalize dates to 'day month year' so EM matches across formats."""
+    text = _DATE_MDY.sub(lambda m: f"{m.group(2)} {m.group(1)} {m.group(3)}", text)
+    # DMY is already in the target order; just strip ordinal suffixes via the
+    # pattern above (the non-capturing group handles it).  Re-run to catch any
+    # MDY that became DMY and needs no further change.
+    text = _DATE_DMY.sub(lambda m: f"{m.group(1)} {m.group(2)} {m.group(3)}", text)
+    return text
+
+
+def _strip_latex(text: str) -> str:
+    """Remove LaTeX command wrappers, preserving their inner text."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _LATEX_BRACED.sub(r"\1", text)
+    text = _LATEX_BARE.sub(" ", text)
+    return text
 
 
 def normalize_answer(value: Any) -> str:
@@ -18,8 +178,18 @@ def normalize_answer(value: Any) -> str:
     if isinstance(value, bool):
         return "yes" if value else "no"
     text = "" if value is None else str(value)
+    text = _strip_latex(text)
     text = _PUNCTUATION.sub(" ", text.casefold())
+    text = _normalize_dates(text)
     normalized = " ".join(text.split())
+    # Strip leading honorific / royal titles (e.g. "queen sirikit" -> "sirikit").
+    normalized = _TITLE_PREFIX.sub("", normalized)
+    # Strip trailing redundant award / prize suffix words (e.g. "... of the year
+    # award" -> "... of the year").
+    normalized = _REDUNDANT_SUFFIX.sub("", normalized)
+    # Expand common abbreviations, aliases and nationality adjectives (e.g.
+    # "singaporean" -> "singapore", "ussr" -> "soviet union", "nyc" -> "new york city").
+    normalized = _expand_aliases(normalized)
     # JSON mode often serializes Boolean answers as strings.  The benchmark
     # convention uses yes/no, so preserve the semantic value before EM/F1.
     if normalized == "true":
@@ -94,8 +264,10 @@ def triple_f1(
     )
 
 
-def plan_relation_recall(predicted: QueryPlan | None, oracle: QueryPlan | None) -> float | None:
-    if oracle is None:
+def plan_relation_recall(
+    predicted: QueryPlan | GraphQueryPlan | None, oracle: GraphQueryPlan | None,
+) -> float | None:
+    if oracle is None or isinstance(predicted, QueryPlan):
         return None
     gold = {normalize_answer(pattern.relation_key) for pattern in oracle.patterns}
     if not gold:
@@ -112,7 +284,8 @@ def _v5_predicted_answer(result: dict[str, Any]) -> Any:
 
 
 def _v5_source_refs(result: dict[str, Any]) -> set[str]:
-    refs: set[str] = set()
+    refs = {ref for fact in (result.get("evidence_pack") or {}).get("facts", [])
+            for ref in fact.get("source_refs", [fact["source_ref"]] if "source_ref" in fact else [])}
     for claim in (result.get("evidence_pack") or {}).get("claims", []):
         for assertion in claim.get("evidence_assertions", []):
             source_ref = assertion.get("source_ref")
@@ -272,7 +445,7 @@ def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, A
     cross_window_promoted = event_counts.get("CROSS_WINDOW_DEFERRED_PROMOTED", 0)
     non_early_promoted = event_counts.get("NON_EARLY_DEFERRED_PROMOTED", 0)
     verifier = verifier_metrics(result.get("events", []), sample.evidences)
-    return {
+    scored = {
         **result,
         "prediction": prediction,
         "gold_answers": gold,
@@ -309,6 +482,66 @@ def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, A
         **verifier,
         "run_success": result.get("status") == "OK",
     }
+    plan_events = _event_items(result, "PLAN_CREATED")
+    recall_protocol = any(event["payload"].get("recall_admission_mode") == "RECALL_SELECTION"
+                          for event in plan_events)
+    if result.get("plan_format") == "subqueries" or "queries" in state.get("plan", {}) or recall_protocol:
+        promotions = _event_items(result, "FACT_PROMOTED")
+        deferred_promotions = [event for event in promotions if event["payload"].get("origin") == "CANDIDATE"]
+        deferred_events = event_counts.get("FACT_DEFERRED", 0)
+        lookups = _event_items(result, "DEFER_WORKSPACE_LOOKUP")
+        cross_window = sum(bool(event["payload"].get("cross_window")) for event in promotions)
+        uses = [use for query_uses in state.get("uses", {}).values() for use in query_uses.values()]
+        recall_admission = (recall_protocol or result.get("recall_admission", {}).get("mode") == "RECALL_SELECTION"
+                            or any(use.get("acceptance") == "RECALL" for use in uses))
+        selections = _event_items(result, "DEFER_CANDIDATES_SELECTED")
+        verdicts = [verdict for event in _event_items(result, "MEMORY_VERIFY_COMPLETED")
+                    for verdict in event["payload"].get("verdicts", {}).values()]
+        # Prose facts have no gold triple alignment. Do not report fabricated
+        # zero precision/recall for metrics defined only on the graph format.
+        for key in (*verifier, "graph_triple_precision", "graph_triple_recall",
+                    "graph_triple_f1", "triple_event_precision", "triple_event_recall", "triple_event_f1"):
+            scored[key] = None
+        scored.update({
+            "protocol_valid": result.get("protocol_valid", not event_counts.get("PROTOCOL_REPAIR_EXHAUSTED", 0)),
+            "protocol_repair_failure_count": event_counts.get("PROTOCOL_REPAIR_EXHAUSTED", 0),
+            "update_rejected_line_count": event_counts.get("UPDATE_LINE_REJECTED", 0),
+            "memory_rejected_line_count": event_counts.get("MEMORY_LINE_REJECTED", 0),
+            "binding_held_count": event_counts.get("BINDING_HELD", 0),
+            "deferred_count": sum(len(ids) for ids in state.get("defer_workspace", {}).values()),
+            "pending_count": 0,
+            "verified_count": (None if recall_admission else
+                               sum(use.get("status") == "ACCEPTED" and use.get("acceptance") == "PROMOTE"
+                                   for use in uses)),
+            "recalled_admitted_count": sum(use.get("status") == "ACCEPTED" and use.get("acceptance") == "RECALL"
+                                           for use in uses),
+            "recall_admission_event_count": sum(event["payload"].get("admission_mode") == "RECALL_SELECTION"
+                                                for event in promotions),
+            "recall_candidates_scanned_count": sum(event["payload"].get("scanned", 0) for event in selections),
+            "recall_selected_count": sum(len(event["payload"].get("fact_ids", [])) for event in selections),
+            "memory_verify_call_count": sum(event["payload"].get("interface") == "MEMORY_VERIFY"
+                                             for event in _event_items(result, "AGENT_CALLED")),
+            "memory_verify_support_count": verdicts.count("SUPPORT"),
+            "memory_verify_contradict_count": verdicts.count("CONTRADICT"),
+            "memory_verify_insufficient_count": verdicts.count("INSUFFICIENT"),
+            "committed_count": event_counts.get("FACT_COMMITTED", 0),
+            "working_memory_fact_count": len(state.get("working_memory", {}).get("facts", [])),
+            "working_memory_link_count": len(state.get("working_memory", {}).get("links", [])),
+            "callback_count": len(lookups),
+            "callback_hit_rate": sum(bool(event["payload"].get("fact_ids")) for event in lookups) / len(lookups) if lookups else 0.0,
+            "promoted_count": len(promotions),
+            "deferred_promoted_count": len(deferred_promotions),
+            "revalidated_count": len(promotions) - len(deferred_promotions),
+            "deferred_to_promoted": len(deferred_promotions) / deferred_events if deferred_events else 0.0,
+            "cross_window_deferred_promoted_count": cross_window,
+            "non_early_deferred_promoted_count": len(deferred_promotions) - cross_window,
+            "cross_window_deferred_to_promoted": cross_window / deferred_events if deferred_events else 0.0,
+            "conflict_count": sum(bool(execution.get("conflicts")) for execution in state.get("executions", {}).values()),
+        })
+    if sample.context is not None and not sample.supporting_facts:
+        for key in ("supporting_precision", "supporting_recall", "supporting_f1"):
+            scored[key] = None
+    return scored
 
 
 def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -325,9 +558,10 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
     summaries: list[dict[str, Any]] = []
     for (method, order), items in sorted(groups.items()):
         status_counts = Counter(str(item.get("runtime_status", "UNKNOWN")) for item in items)
-        verifier_tp = sum(int(item.get("verifier_tp", 0)) for item in items)
-        verifier_fp = sum(int(item.get("verifier_fp", 0)) for item in items)
-        verifier_fn = sum(int(item.get("verifier_fn", 0)) for item in items)
+        verifier_items = [item for item in items if item.get("verifier_tp") is not None]
+        verifier_tp = sum(int(item.get("verifier_tp") or 0) for item in verifier_items)
+        verifier_fp = sum(int(item.get("verifier_fp") or 0) for item in verifier_items)
+        verifier_fn = sum(int(item.get("verifier_fn") or 0) for item in verifier_items)
         verifier_micro_precision = (
             verifier_tp / (verifier_tp + verifier_fp)
             if verifier_tp + verifier_fp
@@ -362,19 +596,29 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "verifier_micro_precision": verifier_micro_precision,
                 "verifier_micro_recall": verifier_micro_recall,
                 "verifier_micro_f1": verifier_micro_f1,
-                "verifier_tp": verifier_tp,
-                "verifier_fp": verifier_fp,
-                "verifier_fn": verifier_fn,
+                "verifier_tp": verifier_tp if verifier_items else None,
+                "verifier_fp": verifier_fp if verifier_items else None,
+                "verifier_fn": verifier_fn if verifier_items else None,
                 "verifier_candidate_count": mean(items, "verifier_candidate_count"),
                 "verifier_gold_candidate_count": mean(items, "verifier_gold_candidate_count"),
                 "windows_processed": mean(items, "windows_processed"),
                 "streaming_protocol_valid_rate": mean(items, "streaming_protocol_valid"),
                 "plan_valid": mean(items, "plan_valid"),
+                "protocol_valid_rate": mean(items, "protocol_valid"),
                 "plan_relation_recall": mean(items, "plan_relation_recall"),
                 "early_latent_evidence_recall": mean(items, "early_latent_evidence_recall"),
                 "deferred_count": mean(items, "deferred_count"),
                 "callback_count": mean(items, "callback_count"),
                 "promoted_count": mean(items, "promoted_count"),
+                "verified_count": mean(items, "verified_count"),
+                "recalled_admitted_count": mean(items, "recalled_admitted_count"),
+                "recall_admission_event_count": mean(items, "recall_admission_event_count"),
+                "recall_candidates_scanned_count": mean(items, "recall_candidates_scanned_count"),
+                "recall_selected_count": mean(items, "recall_selected_count"),
+                "memory_verify_call_count": mean(items, "memory_verify_call_count"),
+                "memory_verify_support_count": mean(items, "memory_verify_support_count"),
+                "memory_verify_contradict_count": mean(items, "memory_verify_contradict_count"),
+                "memory_verify_insufficient_count": mean(items, "memory_verify_insufficient_count"),
                 "deferred_to_promoted": mean(items, "deferred_to_promoted"),
                 "cross_window_deferred_promoted_count": mean(
                     items, "cross_window_deferred_promoted_count"

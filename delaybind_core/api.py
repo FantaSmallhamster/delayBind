@@ -6,10 +6,16 @@ import asyncio
 import hashlib
 import json
 import time
+import ipaddress
+import math
+import socket
+from email.utils import parsedate_to_datetime
+from http.client import HTTPSConnection
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .schema import ModelCall
@@ -26,17 +32,54 @@ class APIConfig:
     api_key: str
     model: str
     temperature: float = 0.0
+    top_p: float | None = None
     seed: int | None = 4
     timeout_seconds: float = 120.0
     max_retries: int = 2
     max_tokens: int = 4096
     enable_thinking: bool = False
+    connect_ip: str | None = None
+    rate_limit_backoff_seconds: float = 15.0
+    rate_limit_backoff_max_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        if not (math.isfinite(self.rate_limit_backoff_seconds)
+                and math.isfinite(self.rate_limit_backoff_max_seconds)
+                and 0 < self.rate_limit_backoff_seconds <= self.rate_limit_backoff_max_seconds):
+            raise ValueError("rate limit backoff must be finite, positive, and max >= initial")
 
 
 class OpenAICompatibleClient:
     def __init__(self, config: APIConfig, *, store: SQLiteEventStore | None = None):
         self.config = config
         self.store = store
+
+    def _retry_delay(self, exc: Exception, attempt: int) -> float:
+        # _call_sync wraps HTTPError; inspect its cause instead of parsing a
+        # provider's error text. The fixed-address transport preserves it too.
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, HTTPError) and current.code == 429:
+                delay = min(self.config.rate_limit_backoff_seconds * 2 ** min(attempt - 1, 20),
+                            self.config.rate_limit_backoff_max_seconds)
+                value = current.headers.get("Retry-After") if current.headers else None
+                if value:
+                    try:
+                        retry_after = float(value)
+                    except (ValueError, TypeError):
+                        try:
+                            retry_after = parsedate_to_datetime(value).timestamp() - time.time()
+                        except (ValueError, TypeError, OverflowError):
+                            retry_after = 0.0
+                    if math.isfinite(retry_after):
+                        # A provider's requested wait is a lower bound, even
+                        # when longer than our fallback backoff cap.
+                        delay = max(delay, retry_after)
+                return delay
+            current = current.__cause__
+        return min(2 ** min(attempt - 1, 20), 4)
 
     def _request_payload(
         self,
@@ -55,6 +98,8 @@ class OpenAICompatibleClient:
         }
         if self.config.seed is not None:
             payload["seed"] = self.config.seed
+        if self.config.top_p is not None:
+            payload["top_p"] = self.config.top_p
         if response_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -80,6 +125,8 @@ class OpenAICompatibleClient:
         else:
             url = f"{base}/v1/chat/completions"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if self.config.connect_ip is not None:
+            return self._call_fixed_address(url, body)
         request = Request(
             url,
             data=body,
@@ -97,6 +144,43 @@ class OpenAICompatibleClient:
             raise ModelAPIError(str(exc)) from exc
         return result, (time.perf_counter() - started) * 1000.0
 
+    def _call_fixed_address(self, url: str, body: bytes) -> tuple[dict[str, Any], float]:
+        """Select a connection IP while retaining the URL's Host and TLS SNI.
+
+        This affects only this connection; system DNS and other clients are
+        untouched. HTTPSConnection still checks the original hostname's cert.
+        """
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ModelAPIError("connect_ip requires an HTTPS URL")
+        address = str(ipaddress.ip_address(self.config.connect_ip))
+        port = parsed.port or 443
+        connection = HTTPSConnection(parsed.hostname, port, timeout=self.config.timeout_seconds)
+        connection._create_connection = lambda _endpoint, timeout, source_address=None: socket.create_connection(
+            (address, port), timeout=timeout, source_address=source_address,
+        )
+        started = time.perf_counter()
+        try:
+            path = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+            connection.request("POST", path, body=body, headers={
+                "Content-Type": "application/json", "Authorization": f"Bearer {self.config.api_key}",
+            })
+            peer_ip = connection.sock.getpeername()[0]
+            response = connection.getresponse()
+            raw = response.read()
+            if response.status >= 400:
+                cause = HTTPError(url, response.status, response.reason, response.headers, None)
+                raise ModelAPIError(f"HTTP {response.status}: {raw.decode(errors='replace')[:1000]}") from cause
+            result = json.loads(raw)
+            result["_client_transport"] = {
+                "connect_ip": address, "peer_ip": peer_ip, "tls_hostname": parsed.hostname,
+                "http_status": response.status,
+                "trace_id": response.getheader("x-siliconcloud-trace-id"),
+            }
+            return result, (time.perf_counter() - started) * 1000.0
+        finally:
+            connection.close()
+
     async def complete(
         self,
         *,
@@ -105,9 +189,10 @@ class OpenAICompatibleClient:
         messages: list[dict[str, str]],
         response_schema: dict[str, Any] | None = None,
         extra: dict[str, Any] | None = None,
+        agent_role: str | None = None,
     ) -> str:
         payload = self._request_payload(interface, messages, response_schema=response_schema, extra=extra)
-        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        serialized = json.dumps({"payload": payload, "agent_role": agent_role}, ensure_ascii=False, sort_keys=True)
         request_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         prompt_hash = hashlib.sha256(
             json.dumps(messages, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -138,6 +223,7 @@ class OpenAICompatibleClient:
                             call_id=call_id,
                             run_id=run_id,
                             interface=interface,  # type: ignore[arg-type]
+                            agent_role=agent_role,
                             request_hash=request_hash,
                             model=self.config.model,
                             parameters=payload,
@@ -160,6 +246,7 @@ class OpenAICompatibleClient:
                             call_id=call_id,
                             run_id=run_id,
                             interface=interface,  # type: ignore[arg-type]
+                            agent_role=agent_role,
                             request_hash=request_hash,
                             model=self.config.model,
                             parameters=payload,
@@ -173,5 +260,5 @@ class OpenAICompatibleClient:
                     )
                 if attempt > self.config.max_retries:
                     break
-                await asyncio.sleep(min(2**(attempt - 1), 4))
+                await asyncio.sleep(self._retry_delay(exc, attempt))
         raise ModelAPIError(f"{interface} failed after retries: {last_error}") from last_error

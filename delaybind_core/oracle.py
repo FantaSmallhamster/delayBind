@@ -13,7 +13,7 @@ from .data import CanonicalSample
 from .plan_validation import PlanValidationError, ensure_valid_plan
 from .profiler import infer_answer_contract
 from .relation_semantics import relation_signature
-from .schema import OperatorSpec, Pattern, QueryPlan, RelationSpec
+from .schema import OperatorSpec, Pattern, GraphQueryPlan, RelationSpec
 
 
 class OraclePlanError(ValueError):
@@ -50,7 +50,7 @@ def _without_bundle_metadata(value: Any) -> Any:
     return {key: item for key, item in value.items() if key not in {"sample_id", "id"}}
 
 
-def load_oracle_plans(path: str | Path) -> dict[str, QueryPlan]:
+def load_oracle_plans(path: str | Path) -> dict[str, GraphQueryPlan]:
     """Load JSON/JSONL plans keyed by canonical sample ID.
 
     Accepted JSON forms are ``{sample_id: plan}``, ``[{sample_id, plan}]`` and
@@ -70,10 +70,10 @@ def load_oracle_plans(path: str | Path) -> dict[str, QueryPlan]:
         parsed = json.loads(path.read_text(encoding="utf-8"))
     else:
         raise OraclePlanError(f"unsupported Oracle Plan format: {path.suffix}")
-    plans: dict[str, QueryPlan] = {}
+    plans: dict[str, GraphQueryPlan] = {}
     for sample_id, raw_plan in _plan_items(parsed):
         try:
-            plan = QueryPlan.model_validate(_without_bundle_metadata(raw_plan))
+            plan = GraphQueryPlan.model_validate(_without_bundle_metadata(raw_plan))
         except Exception as exc:
             raise OraclePlanError(f"invalid Oracle Plan for {sample_id}: {exc}") from exc
         try:
@@ -86,7 +86,7 @@ def load_oracle_plans(path: str | Path) -> dict[str, QueryPlan]:
     return plans
 
 
-def write_oracle_plans(plans: dict[str, QueryPlan], path: str | Path) -> None:
+def write_oracle_plans(plans: dict[str, GraphQueryPlan], path: str | Path) -> None:
     """Write a deterministic, human-reviewable JSON Oracle Plan bundle."""
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -173,7 +173,7 @@ def _comparison_operator(question: str) -> str:
     return "ARGMIN"
 
 
-def compile_oracle_plan(sample: CanonicalSample) -> QueryPlan:
+def compile_oracle_plan(sample: CanonicalSample) -> GraphQueryPlan:
     """Compile a gold-only Oracle Plan from 2Wiki evidence triples.
 
     The compiler uses gold evidence topology and the gold answer only to select
@@ -405,7 +405,7 @@ def compile_oracle_plan(sample: CanonicalSample) -> QueryPlan:
         contract = contract.model_copy(update={"target": answer_target})
 
     digest = hashlib.sha256(sample.sample_id.encode("utf-8")).hexdigest()[:12]
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id=f"oracle-{digest}",
         patterns=patterns,
         relation_specs=relation_specs,
@@ -419,8 +419,8 @@ def compile_oracle_plan(sample: CanonicalSample) -> QueryPlan:
         raise OraclePlanError(f"compiled Oracle Plan failed for {sample.sample_id}: {exc}") from exc
 
 
-def compile_oracle_plans(samples: Iterable[CanonicalSample]) -> dict[str, QueryPlan]:
-    plans: dict[str, QueryPlan] = {}
+def compile_oracle_plans(samples: Iterable[CanonicalSample]) -> dict[str, GraphQueryPlan]:
+    plans: dict[str, GraphQueryPlan] = {}
     for sample in samples:
         plans[sample.sample_id] = compile_oracle_plan(sample)
     return plans

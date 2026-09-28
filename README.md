@@ -1,3 +1,5 @@
+> DelayBind C 阶段实验包：前置原文核验，128 题成绩 92/128，低于 B 的 94/128；C 未通过准确率门槛。代码、配置、逐题结果与轨迹见 [C 阶段发布说明](C_RELEASE.md)。
+
 # [ICLR 2026] Look Back to Reason Forward: Revisitable Memory for Long-Context LLM Agents
 
 This repo contains the official implementation of ICLR 2026 paper **ReMemR1**: `Look Back to Reason Forward: Revisitable Memory for Long-Context LLM Agents`.
@@ -58,12 +60,12 @@ pip install hydra-core accelerate tensordict torchdata wandb "tensordict<=0.6.2"
 
 ## Data Processing
 
-**Trianing Data:** 
+**Trianing Data:**
 This research use the same training data as [MemAgent](https://github.com/BytedTsinghua-SIA/MemAgent).
 The data files are publicly available, and can be downloaded from [huggingface](https://huggingface.co/datasets/BytedTsinghua-SIA/hotpotqa/tree/main).
 After the download is finished, put `hotpotqa_train_32k.parquet` and `hotpotqa_dev.parquet` under `data/train/`.
 
-**Data for Evaluation:** 
+**Data for Evaluation:**
 The data for evaluation is sourced from HotpotQA and 2WikiMultiHopQA.
 To process the data for long-context QA, simply run:
 ```bash
@@ -118,6 +120,21 @@ This project is licensed under the MIT License.
 It includes components from [MemAgent](https://github.com/BytedTsinghua-SIA/MemAgent), licensed under the Apache License 2.0. Thanks for their awesome work!
 
 ## V5 Design and Implementation
+
+The completed V5.1 protocol-v4 experiment on 128 seed-4 2Wiki questions (50 documents each)
+is archived with **52.34% EM and 59.21% F1**. See the
+[report](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/REPORT.md),
+[all 128 question trajectories](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/TRAJECTORIES.md),
+and [artifact guide](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/README.md).
+This is a standalone evaluation of the current V5.1 runtime; it is not an exact reproduction of the paper's main experiment.
+
+The default V5.1 runner uses a high-level planning/memory agent and a low-level
+reading/deferred-review agent, natural-language subqueries, and source-fact memory.
+ReMemR1-style `input`/`context` records can be passed directly, without preparing a
+Manifest. See [`SUBQUERY_RUNTIME.md`](SUBQUERY_RUNTIME.md) for the current plan,
+reading protocol, state transitions, and [`configs/subqueries_smoke.json`](configs/subqueries_smoke.json)
+for a streaming experiment. Historical graph experiments explicitly select
+`plan_format="graph"`.
 
 The complete V5 specification, terminology, module mapping, runtime state
 machine, 2Wiki evaluation protocol, training plan, reproducibility rules, and

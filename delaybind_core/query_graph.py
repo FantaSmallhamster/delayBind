@@ -1,4 +1,4 @@
-"""Compile legacy QueryPlan envelopes into executable open query graphs."""
+"""Compile legacy GraphQueryPlan envelopes into executable open query graphs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .schema import (
     QueryNode,
     QueryNodeKind,
     QueryOperatorNode,
-    QueryPlan,
+    GraphQueryPlan,
 )
 from .relation_semantics import relation_signature
 
@@ -38,7 +38,7 @@ def _string_symbols(value: Any) -> list[str]:
     return []
 
 
-def _infer_answer_target(plan: QueryPlan) -> str | None:
+def _infer_answer_target(plan: GraphQueryPlan) -> str | None:
     if plan.answer_contract and plan.answer_contract.target:
         return plan.answer_contract.target
     operator_outputs = [
@@ -59,7 +59,7 @@ def _infer_answer_target(plan: QueryPlan) -> str | None:
     return unique[0] if len(unique) == 1 else None
 
 
-def compile_open_query_graph(plan: QueryPlan) -> OpenQueryGraph:
+def compile_open_query_graph(plan: GraphQueryPlan) -> OpenQueryGraph:
     """Deduplicate pattern endpoints into nodes and preserve edge topology."""
     answer_target = _infer_answer_target(plan)
     nodes: dict[str, QueryNode] = {}

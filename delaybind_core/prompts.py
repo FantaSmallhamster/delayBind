@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .schema import AnswerResponse, QueryPlan, UpdateResponse, VerifyDecision
+from .schema import AnswerResponse, GraphQueryPlan, UpdateResponse, VerifyDecision
 
 
 PROMPT_VERSION = "v2"
@@ -15,7 +15,10 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2)
 
 
-def plan_prompt(
+from .agent_prompts import plan_prompt, reading_prompt
+
+
+def graph_plan_prompt(
     question: str,
     *,
     schema: dict[str, Any],
@@ -75,7 +78,7 @@ Return only JSON matching this schema:
 
 def update_prompt(
     question: str,
-    plan: QueryPlan,
+    plan: GraphQueryPlan,
     graph: dict[str, Any],
     entries: list[dict[str, Any]],
     *,
@@ -101,11 +104,9 @@ adjectival nationality such as "Chinese"). When an endpoint lists multiple
 binding candidates, facts grounded in any listed candidate are relevant; the
 Runtime selects a path only after downstream evidence is verified.
 For a NATIONALITY object, extract nationality/demonym adjectives directly
-attached to the grounded person. If the text explicitly gives a compound
-identity with multiple nationality components, emit each component in source
-order rather than silently choosing one. For a PERSON relation, the document
-title can supply a pronoun's subject: in a document titled A, "He succeeded
-his father B" directly supports (A, father, B).
+attached to the grounded person. For a PERSON relation, the document title can
+supply a pronoun's subject: in a document titled A, "He succeeded his father B"
+directly supports (A, father, B).
 For DATE objects, biographical lead forms such as "A (d. 20 March 851)"
 directly express date of death and "A (born 9 February 1976)" expresses date
 of birth. For LOCATION objects, "was assassinated/died in X" directly
@@ -209,9 +210,8 @@ the supplied edge ID. Do not emit facts for another edge. A concrete endpoint
 may match any value in subject_candidates/object_candidates, not only the
 currently selected subject/object. Respect subject_type and object_type.
 For object_type=NATIONALITY, adjective forms attached to the person are direct
-evidence; split an explicit compound nationality into separate events in
-source order. For a PERSON edge, resolve "he/she/his/her" to the supplied
-document title when the title is the grounded subject.
+evidence. For a PERSON edge, resolve "he/she/his/her" to the supplied document
+title when the title is the grounded subject.
 For object_type=DATE, extract dates from lead-parenthetical abbreviations such
 as "d." (date of death) and "b."/"born" (date of birth). For
 object_type=LOCATION, death wording such as "assassinated in X" supports place
@@ -248,9 +248,45 @@ operator EXECUTED, treat it as the deterministic graph result and return that
 value. Return the minimal canonical entity at the granularity requested by the
 question. For a place-of-birth/death question, prefer the city or municipality
 over a concatenated neighborhood-plus-city phrase; return a country only when
-the question asks for a country. Return every source_ref actually used; each must be copied exactly from
-an EvidenceAssertion in the pack. If the pack cannot determine the answer,
-return answer=null and an empty source_refs list.
+the question asks for a country. Do not append a country or region suffix to a
+city answer (e.g. return "Stockholm", not "Stockholm, Sweden") unless the
+question explicitly asks for the country. Do not add honorific or royal titles
+(e.g. return "Sirikit", not "Queen Sirikit") unless the title is part of the
+canonical name used in the evidence. Never output LaTeX markup such as
+\text{...}; write dates and names as plain text. Make sure your final answer
+matches the type the question asks for (place, date, name, number, yes/no). For comparison questions,
+explicitly list both values and their entities, state the requested comparison
+direction (earlier/later, older/younger, same/different), then compare and
+select the entity matching that direction; double-check you did not select the
+opposite. If one value is missing from the EvidencePack, do not guess; answer
+only from available evidence. For yes/no comparison questions (e.g. "are X and Y
+the same?", "did both A and B...", "is X older than Y?"), explicitly state both
+values you are comparing, then conclude with "they match -> yes" or "they differ
+-> no" as your final answer. Do not leave the yes/no conclusion implicit; write
+it out explicitly. For questions asking about a relative or associate (father,
+mother, spouse, child, sibling, predecessor, successor, teacher, student, etc.),
+first explicitly identify the person named in the question, then find the requested
+relative — do NOT output the named person themselves as the answer. Verify the
+relation direction carefully: if asked "who is X's father", the answer is X's
+parent (male), not X's child; if asked "who is X's mother", the answer is X's
+parent (female), not X's daughter. For multi-hop relation questions, trace each
+hop explicitly and verify the relation direction at each step. Use ONLY assertions present in the EvidencePack.
+Do not use historical knowledge, world knowledge, or name-based inferences.
+Knowing a person's identity does NOT imply you know their attributes
+(nationality, occupation, workplace, etc.); those must be explicitly stated in
+the EvidencePack. Base your answer on the available assertions and reason from
+them as fully as possible. Do not fabricate specific details absent from the
+EvidencePack, but always give the best-supported answer from what is available
+rather than returning null. Return every source_ref
+actually used; each must be copied exactly from an EvidenceAssertion in the
+pack. You MUST output a concrete answer. Never use refusal phrases such as
+"unknown", "information not available", "cannot be determined", "not mentioned",
+"not found", "insufficient information", or any similar refusal. The answer must
+always contain a concrete entity name, date, number, place, or yes/no value. If
+the EvidencePack has partial information, use it to select the most likely answer.
+Even if the EvidencePack seems incomplete or the information appears missing, you
+MUST output your best-supported guess based on whatever assertions are available.
+Never refuse to answer or state that information is unavailable.
 
 Question:
 {question}

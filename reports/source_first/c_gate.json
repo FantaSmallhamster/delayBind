@@ -1,0 +1,126 @@
+{
+  "stage": "C",
+  "compared_to": "B",
+  "status": "BLOCKED",
+  "baseline_run": "results/source_first/b-memory-raw-c8",
+  "candidate_run": "results/source_first/c-source-verify-c8-r2",
+  "sample_count": 128,
+  "baseline": {
+    "exact": 94,
+    "f1": 0.7624627976190477,
+    "errors": 3,
+    "resource_limits": 0,
+    "protocol_failures": 0,
+    "model_calls": 1295,
+    "input_tokens": 2540404,
+    "output_tokens": 247015,
+    "latency_ms": 10821331.095204456,
+    "by_type": {
+      "inference": {
+        "correct": 13,
+        "count": 16
+      },
+      "compositional": {
+        "correct": 25,
+        "count": 53
+      },
+      "comparison": {
+        "correct": 35,
+        "count": 35
+      },
+      "bridge_comparison": {
+        "correct": 21,
+        "count": 24
+      }
+    }
+  },
+  "candidate": {
+    "exact": 92,
+    "f1": 0.735453869047619,
+    "errors": 1,
+    "resource_limits": 0,
+    "protocol_failures": 0,
+    "model_calls": 1340,
+    "input_tokens": 2805224,
+    "output_tokens": 304370,
+    "latency_ms": 17681847.640795168,
+    "by_type": {
+      "inference": {
+        "correct": 13,
+        "count": 16
+      },
+      "compositional": {
+        "correct": 25,
+        "count": 53
+      },
+      "comparison": {
+        "correct": 35,
+        "count": 35
+      },
+      "bridge_comparison": {
+        "correct": 19,
+        "count": 24
+      }
+    }
+  },
+  "gains": [
+    "dev_1456",
+    "dev_11285",
+    "dev_3343",
+    "dev_3448"
+  ],
+  "losses": [
+    "dev_10616",
+    "dev_8009",
+    "dev_7403",
+    "dev_7146",
+    "dev_2261",
+    "dev_432"
+  ],
+  "audit_counts": {
+    "AGENT_CALLED": 1348,
+    "PLAN_CREATED": 128,
+    "QUERY_STATE_UPDATED": 819,
+    "QUERY_ACTIVATED": 353,
+    "MEMORY_VIEW_MEASURED": 754,
+    "SOURCE_REFERENCES_NORMALIZED": 208,
+    "FACT_STORED": 520,
+    "FACT_COMMITTED": 358,
+    "FACT_DEFERRED": 187,
+    "ACTIVE_VIEW_UPDATED": 386,
+    "MEMORY_EVIDENCE_PREPARED": 386,
+    "MEMORY_VERIFY_COMPLETED": 377,
+    "verdict_SUPPORTED": 1052,
+    "QUERY_BOUND": 296,
+    "DEFER_WORKSPACE_LOOKUP": 162,
+    "DEFER_CANDIDATES_SELECTED": 115,
+    "FACT_PROMOTED": 131,
+    "BINDING_LINK_CREATED": 283,
+    "verdict_SOURCE_DIFF": 222,
+    "RAW_SOURCE_RECHECKED": 128,
+    "RUN_STATUS": 127,
+    "calls_PLAN": 132,
+    "calls_UPDATE": 247,
+    "calls_MEMORY_VERIFY": 396,
+    "calls_MEMORY": 362,
+    "calls_RECALL": 127,
+    "calls_ANSWER": 153,
+    "UPDATE_LINE_REJECTED": 46,
+    "UPDATE_LINES_DROPPED": 31,
+    "DEFER_BUCKET_EMPTY": 47,
+    "MEMORY_SOURCE_SCOPE_REJECTED": 71,
+    "MEMORY_SOURCE_CHECK_REJECTED": 414,
+    "verdict_UNRESOLVED": 170,
+    "UPDATE_LINE_IGNORED": 51,
+    "MEMORY_LINE_REJECTED": 7,
+    "AGENT_RESPONSE_INVALID": 10,
+    "ANSWER_POST_PROCESSED": 3,
+    "FACT_USE_INVALIDATED": 47,
+    "BINDING_LINK_REMOVED": 47,
+    "RECALL_CONTEXT_IDS_IGNORED": 5,
+    "BINDING_HELD": 3
+  },
+  "violations": {},
+  "data_sha256": "c8bdf141c889766ef7a1aa0e4e8421ddcabe0c1995bf592ff2608b7a6484eeff",
+  "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+}

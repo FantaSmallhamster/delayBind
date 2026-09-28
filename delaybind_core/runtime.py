@@ -25,7 +25,7 @@ from .schema import (
     OpenQueryGraph,
     QueryEdge,
     QueryEdgeStatus,
-    QueryPlan,
+    GraphQueryPlan,
     RuntimeEvent,
     RuntimeStatus,
     TripleEvent,
@@ -64,7 +64,7 @@ def _canonical_event_id(event: TripleEvent) -> str:
 
 @dataclass
 class RuntimeState:
-    plan: QueryPlan
+    plan: GraphQueryPlan
     query_graph: OpenQueryGraph
     query_graph_mode: str = "open"
     bindings: dict[str, Any] = field(default_factory=dict)
@@ -183,7 +183,7 @@ class EvidenceRuntime:
         self,
         *,
         run_id: str,
-        plan: QueryPlan,
+        plan: GraphQueryPlan,
         archive: RawArchive,
         store: SQLiteEventStore,
         verify_committed: bool = False,

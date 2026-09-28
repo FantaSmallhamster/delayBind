@@ -1,0 +1,73 @@
+{
+  "input": "data/test/filtered_seed4_128/eval_2wikimultihopqa_50.json",
+  "output_dir": "results/source_first/b-memory-raw-c8",
+  "experiment_id": "source-first-b-memory-raw-c8",
+  "dataset_id": "2wiki",
+  "methods": [
+    "v5_predicted"
+  ],
+  "orders": [
+    "original"
+  ],
+  "sample_start": 0,
+  "sample_count": null,
+  "sample_ids": [],
+  "seed": 4,
+  "max_concurrency": 8,
+  "resume": false,
+  "retry_errors": true,
+  "fail_fast": false,
+  "oracle_plans": null,
+  "compile_oracle": false,
+  "tokenizer_path": "models/Qwen3.5-9B-tokenizer/tokenizer.json",
+  "expected_data_sha256": "c8bdf141c889766ef7a1aa0e4e8421ddcabe0c1995bf592ff2608b7a6484eeff",
+  "expected_total_samples": 128,
+  "expected_documents": 50,
+  "runner": {
+    "plan_format": "subqueries",
+    "chunk_size": 5000,
+    "answer_mode": "runtime",
+    "max_windows": 100000,
+    "max_verify_candidates": 1000,
+    "max_plan_retries": 1,
+    "max_model_calls": 1000,
+    "snapshot_every_windows": 1,
+    "verify_committed": true,
+    "max_graph_claims": 128,
+    "defer_unbound": true,
+    "max_verify_expansions": 1,
+    "verify_expansion_limit": 32,
+    "require_evidence_sources": true,
+    "min_streaming_windows": 0,
+    "query_graph_mode": "open",
+    "require_source_span": true,
+    "callback_retrieval_limit": 16,
+    "max_targeted_updates": 16,
+    "candidate_batch_size": 32,
+    "max_response_retries": 1,
+    "memory_token_budget": 8192,
+    "memory_char_budget": 24000,
+    "answer_format": "boxed",
+    "enable_defer_callback": true,
+    "memory_source_mode": "raw_before_memory",
+    "memory_source_token_budget": 8192
+  },
+  "api": {
+    "model": "Qwen/Qwen3.5-9B",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "temperature": 0.0,
+    "top_p": 0.95,
+    "seed": 4,
+    "max_tokens": 4096,
+    "enable_thinking": false,
+    "connect_ip": null
+  },
+  "api_runtime": {
+    "timeout_seconds": 120.0,
+    "max_retries": 6,
+    "rate_limit_backoff_seconds": 15.0,
+    "rate_limit_backoff_max_seconds": 60.0
+  },
+  "reader_api": null,
+  "config_fingerprint": "ddaf14fb189d1f18900089abdd65654bded184b1075228eb63a562a6a068d9d8"
+}
