@@ -76,6 +76,12 @@ class SourceCheckResult:
     rejected_lines: tuple[dict[str, str], ...]
 
 
+@dataclass(frozen=True)
+class GroundedMemoryResult:
+    checks: SourceCheckResult
+    memory: MemoryUpdate
+
+
 def _lines(raw: str) -> list[str]:
     raw = raw.strip()
     if raw.startswith("```") and raw.endswith("```"):
@@ -479,3 +485,29 @@ def parse_source_checks(raw: str, allowed_refs: dict[tuple[str, str], set[str]])
         checks=tuple(checks[key] for key in sorted(checks)),
         rejected_lines=tuple(rejected),
     )
+def parse_grounded_memory(raw: str, allowed_refs: dict[tuple[str, str], set[str]],
+                          query_ids: set[str]) -> GroundedMemoryResult:
+    """Parse both sections before any binding can be considered for admission."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    malformed = False
+    for line in _lines(raw):
+        header = line.rstrip(":").upper()
+        if header in {"CHECKS", "BINDINGS"}:
+            if header in sections:
+                malformed = True
+            current = header
+            sections.setdefault(header, [])
+        elif current is None:
+            malformed = True
+        else:
+            sections[current].append(line)
+    if malformed or set(sections) != {"CHECKS", "BINDINGS"}:
+        checks = parse_source_checks("", allowed_refs)
+        return GroundedMemoryResult(checks, MemoryUpdate(rejected_lines=[{
+            "line": raw, "reason": "grounded MEMORY requires one CHECKS and one BINDINGS section",
+        }]))
+    checks = parse_source_checks("\n".join(sections["CHECKS"]), allowed_refs)
+    binding_lines = [line for line in sections["BINDINGS"] if line.upper() != "NONE"]
+    memory = normalize_memory_queries(parse_memory("\n".join(binding_lines), recover=True), query_ids)
+    return GroundedMemoryResult(checks, memory)

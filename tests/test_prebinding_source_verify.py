@@ -2,7 +2,7 @@
 
 import unittest
 
-from delaybind_core.fact_protocol import parse_source_checks
+from delaybind_core.fact_protocol import parse_grounded_memory, parse_source_checks
 
 
 class SourceCheckParserTests(unittest.TestCase):
@@ -70,6 +70,37 @@ class SourceCheckParserTests(unittest.TestCase):
         verdicts, result = self.check("BIND | Q1 | Ada | F1")
         self.assertEqual(set(verdicts.values()), {"UNRESOLVED"})
         self.assertTrue(result.rejected_lines)
+
+    def test_grounded_response_requires_both_sections(self):
+        result = parse_grounded_memory(
+            "CHECKS\nQ1 | F1 | SUPPORTED | s1 | faithful\nBIND | Q1 | Ada | F1",
+            self.allowed, {"Q1"},
+        )
+        self.assertFalse(result.memory.bindings)
+        self.assertTrue(result.memory.rejected_lines)
+
+    def test_grounded_bad_check_does_not_discard_independent_query(self):
+        result = parse_grounded_memory(
+            "CHECKS\n"
+            "Q1 | F1 | SUPPORTED | s2 | wrong source\n"
+            "Q2 | F2 | SOURCE_DIFF | s2 | corrected by source\n"
+            "BINDINGS\n"
+            "BIND | Q1 | Ada | F1\n"
+            "BIND | Q2 | Larchport | F2",
+            self.allowed, {"Q1", "Q2"},
+        )
+        verdicts = {(c.query_id, c.fact_id): c.verdict for c in result.checks.checks}
+        self.assertEqual(verdicts[("Q1", "F1")], "UNRESOLVED")
+        self.assertEqual(verdicts[("Q2", "F2")], "SOURCE_DIFF")
+        self.assertEqual(len(result.memory.bindings), 2)
+
+    def test_grounded_duplicate_header_fails_closed(self):
+        result = parse_grounded_memory(
+            "CHECKS\nQ1 | F1 | SUPPORTED | s1 | faithful\n"
+            "BINDINGS\nBIND | Q1 | Ada | F1\nBINDINGS\nNONE",
+            self.allowed, {"Q1"},
+        )
+        self.assertFalse(result.memory.bindings)
 
 
 if __name__ == "__main__":

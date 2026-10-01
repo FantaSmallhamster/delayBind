@@ -399,7 +399,7 @@ class ModelCall(StrictModel):
     schema_version: Literal["v1"] = SCHEMA_VERSION
     call_id: str
     run_id: str
-    interface: Literal["PLAN", "UPDATE", "MEMORY", "MEMORY_VERIFY", "RECALL", "VERIFY", "ANSWER"]
+    interface: Literal["PLAN", "UPDATE", "MEMORY", "MEMORY_VERIFY", "MEMORY_GROUNDED", "RECALL", "VERIFY", "ANSWER"]
     agent_role: Literal["HIGH", "LOW"] | None = None
     request_hash: str
     model: str

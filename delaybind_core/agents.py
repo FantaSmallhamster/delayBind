@@ -23,7 +23,7 @@ class Agent:
 
 class HighLevelAgent(Agent):
     role = "HIGH"
-    interfaces = frozenset({"PLAN", "MEMORY", "MEMORY_VERIFY"})
+    interfaces = frozenset({"PLAN", "MEMORY", "MEMORY_VERIFY", "MEMORY_GROUNDED"})
 
 
 class LowLevelAgent(Agent):

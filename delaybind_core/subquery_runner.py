@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from .agent_prompts import (final_answer_prompt, lookup_prompt, memory_prompt,
+from .agent_prompts import (final_answer_prompt, grounded_memory_prompt, lookup_prompt, memory_prompt,
                             memory_recheck_prompt, memory_verify_prompt,
                             plan_prompt, query_view, reading_prompt, reading_repair_prompt)
 from .agents import HighLevelAgent, LowLevelAgent
@@ -18,7 +18,8 @@ from .api import OpenAICompatibleClient
 from .archive import FutureSourceAccessError, RawArchive
 from .cursor import ReadCursor, TextReadCursor, TextTokenizer
 from .data import CanonicalSample, build_manifest
-from .fact_protocol import (FactUpdate, MemoryUpdate, ProtocolError, parse_memory, parse_source_checks,
+from .fact_protocol import (FactUpdate, MemoryUpdate, ProtocolError, parse_grounded_memory,
+                            parse_memory, parse_source_checks,
                             parse_plan, parse_selection, parse_update, normalize_memory_queries,
                             parse_verification_recover)
 from .manifest import Manifest
@@ -223,15 +224,7 @@ def _memory_recheck_contract(proposed: MemoryUpdate, runtime: SubqueryRuntime,
 
 def _source_check_prompt(question: str, queries: list[dict[str, Any]], memory: str,
                          evidence: PreparedEvidence, runtime: SubqueryRuntime) -> str:
-    rows = []
-    for qid, scope in sorted(evidence.query_scopes.items()):
-        for fid in scope.allowed_fact_ids:
-            fact = runtime.state.facts[fid]
-            rows.append({
-                "query_id": qid, "fact_id": fid, "fact_text": fact.text,
-                "allowed_target_refs": fact.source_refs,
-                "allowed_context_refs": evidence.context_for(qid, fid),
-            })
+    rows = _source_check_rows(evidence, runtime)
     return f"""<MEMORY_VERIFY role=HIGH mode=SOURCE_PRECHECK>
 Check the fidelity of each listed fact against its supplied original source excerpts.
 Do not answer the queries or propose binding values. Do not output BIND or
@@ -260,6 +253,19 @@ Facts to check:\n{json.dumps(rows, ensure_ascii=False)}
 
 Original source excerpts:\n{evidence.raw_context or 'NONE'}
 </MEMORY_VERIFY>"""
+
+
+def _source_check_rows(evidence: PreparedEvidence, runtime: SubqueryRuntime) -> list[dict[str, Any]]:
+    rows = []
+    for qid, scope in sorted(evidence.query_scopes.items()):
+        for fid in scope.allowed_fact_ids:
+            fact = runtime.state.facts[fid]
+            rows.append({
+                "query_id": qid, "fact_id": fid, "fact_text": fact.text,
+                "allowed_target_refs": fact.source_refs,
+                "allowed_context_refs": evidence.context_for(qid, fid),
+            })
+    return rows
 
 
 def _validate_memory_recheck(response: MemoryUpdate,
@@ -564,7 +570,7 @@ async def run_subqueries(
         evidence: PreparedEvidence | None = None
         source_checks = None
         checked_support: set[tuple[str, str]] | None = None
-        if config.memory_source_mode in {"raw_before_memory", "source_verify_before_memory"}:
+        if config.memory_source_mode in {"raw_before_memory", "source_verify_before_memory", "joint_source_memory"}:
             try:
                 evidence = prepare_memory_evidence(
                     runtime, archive, view, eof=eof,
@@ -591,6 +597,49 @@ async def run_subqueries(
         if signature == memory_signature:
             return False
         memory_signature = signature
+        if config.memory_source_mode == "joint_source_memory":
+            assert evidence is not None
+            allowed_refs = {key: set(refs) for key, refs in evidence.fact_context_refs.items()}
+            eligible_queries = set(evidence.query_scopes)
+            latest = parse_grounded_memory("", allowed_refs, eligible_queries)
+
+            def grounded_response(raw: str):
+                nonlocal latest
+                latest = parse_grounded_memory(raw, allowed_refs, eligible_queries)
+                return latest
+
+            grounded = await high.call(
+                "MEMORY_GROUNDED",
+                grounded_memory_prompt(
+                    sample.question, queries(), view, hints=runtime.state.hints, eof=eof,
+                    evidence_contract=evidence.contract(),
+                    facts_to_check=_source_check_rows(evidence, runtime),
+                    raw_context=evidence.raw_context,
+                ),
+                parser=grounded_response, on_invalid=lambda: latest,
+            )
+            for rejected in grounded.checks.rejected_lines:
+                log("MEMORY_SOURCE_CHECK_REJECTED", rejected)
+            for ignored in grounded.memory.ignored_lines:
+                log("MEMORY_LINE_IGNORED", ignored)
+            for rejected in grounded.memory.rejected_lines:
+                log("MEMORY_LINE_REJECTED", rejected)
+            checked_support = {
+                (check.query_id, check.fact_id) for check in grounded.checks.checks
+                if check.verdict in {"SUPPORTED", "SOURCE_DIFF"}
+            }
+            log("MEMORY_VERIFY_COMPLETED", {
+                "mode": "joint_source_memory",
+                "snapshot_keys": {
+                    qid: scope.snapshot_key for qid, scope in evidence.query_scopes.items()
+                },
+                "checks": [check.model_dump(mode="json") for check in grounded.checks.checks],
+                "window_index": windows,
+            })
+            response = filter_evidence_response(grounded.memory, evidence, eof=eof,
+                                                checked_support=checked_support)
+            return apply_memory(response, eof=eof, evidence=evidence,
+                                checked_support=checked_support)
         if config.memory_source_mode == "source_verify_before_memory":
             assert evidence is not None
             allowed_refs = {
@@ -856,7 +905,7 @@ async def run_subqueries(
             committed = runtime.ingest(update, window_index=windows,
                                         allowed_refs={entry.source_ref for entry in window.entries} | visible_refs)
             eof = cursor.exhausted
-            if (config.memory_source_mode in {"raw_before_memory", "source_verify_before_memory"} or committed or update.hints
+            if (config.memory_source_mode in {"raw_before_memory", "source_verify_before_memory", "joint_source_memory"} or committed or update.hints
                     or (eof and any(query.requires_complete_set for query in runtime.state.plan.queries))):
                 await maintain(eof=eof)
                 await process_activations(eof=eof)

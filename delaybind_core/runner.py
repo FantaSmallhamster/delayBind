@@ -84,8 +84,8 @@ class RunnerConfig:
             raise ValueError("retry limit must be nonnegative")
         if self.memory_char_budget <= 0 or self.memory_token_budget is not None and self.memory_token_budget <= 0:
             raise ValueError("memory budgets must be positive")
-        if self.memory_source_mode not in {"postverify", "raw_before_memory", "source_verify_before_memory"}:
-            raise ValueError("memory_source_mode must be postverify, raw_before_memory, or source_verify_before_memory")
+        if self.memory_source_mode not in {"postverify", "raw_before_memory", "source_verify_before_memory", "joint_source_memory"}:
+            raise ValueError("memory_source_mode must be postverify, raw_before_memory, source_verify_before_memory, or joint_source_memory")
         if self.memory_source_token_budget <= 0:
             raise ValueError("memory_source_token_budget must be positive")
 
