@@ -7,7 +7,6 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from .data import CanonicalSample
-from .schema import GraphQueryPlan, QueryPlan
 
 
 _PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
@@ -262,20 +261,6 @@ def triple_f1(
         {_normalized_triple(item) for item in predicted},
         {_normalized_triple(item) for item in gold},
     )
-
-
-def plan_relation_recall(
-    predicted: QueryPlan | GraphQueryPlan | None, oracle: GraphQueryPlan | None,
-) -> float | None:
-    if oracle is None or isinstance(predicted, QueryPlan):
-        return None
-    gold = {normalize_answer(pattern.relation_key) for pattern in oracle.patterns}
-    if not gold:
-        return 1.0
-    if predicted is None:
-        return 0.0
-    observed = {normalize_answer(pattern.relation_key) for pattern in predicted.patterns}
-    return len(gold & observed) / len(gold)
 
 
 def _v5_predicted_answer(result: dict[str, Any]) -> Any:

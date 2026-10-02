@@ -1,4 +1,4 @@
-"""Reproducible multi-method experiment harness for 2Wiki evaluation."""
+"""Reproducible V08 experiment harness for the frozen 2Wiki benchmark."""
 
 from __future__ import annotations
 
@@ -14,26 +14,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .api import APIConfig, OpenAICompatibleClient
-from .config_compat import without_removed_runner_options
 from .data import CanonicalSample, build_manifest, load_records
 from .cursor import TextTokenizer
-from .direct import run_direct_full_context
-from .metrics import gold_source_refs, plan_relation_recall, score_result, summarize_results
-from .oracle import compile_oracle_plans, load_oracle_plans, write_oracle_plans
+from .metrics import gold_source_refs, score_result, summarize_results
 from .runner import RunnerConfig, V5Runner
-from .schema import GraphQueryPlan, parse_query_plan
 from .storage import SQLiteEventStore
 
 
-SUPPORTED_METHODS = {
-    "direct_full_context",
-    "v5_predicted",
-    "v5_oracle",
-    "v5_oracle_no_defer",
-    "v5_oracle_flat",
-    "v5_oracle_flat_no_defer",
-}
-SUPPORTED_ORDERS = {"original", "reverse", "interleaved", "distant", "shuffle"}
+SUPPORTED_METHODS = {"v5_predicted"}
+SUPPORTED_ORDERS = {"original"}
 
 
 @dataclass(frozen=True)
@@ -42,11 +31,8 @@ class ExperimentConfig:
     output_dir: str
     experiment_id: str = "v5-smoke"
     dataset_id: str = "2wiki"
-    methods: tuple[str, ...] = (
-        "direct_full_context",
-        "v5_predicted",
-    )
-    orders: tuple[str, ...] = ("original", "reverse")
+    methods: tuple[str, ...] = ("v5_predicted",)
+    orders: tuple[str, ...] = ("original",)
     sample_start: int = 0
     sample_count: int | None = 16
     sample_ids: tuple[str, ...] = ()
@@ -55,8 +41,6 @@ class ExperimentConfig:
     resume: bool = True
     retry_errors: bool = True
     fail_fast: bool = False
-    oracle_plans: str | None = None
-    compile_oracle: bool = False
     tokenizer_path: str | None = None
     expected_data_sha256: str | None = None
     expected_total_samples: int | None = None
@@ -65,28 +49,17 @@ class ExperimentConfig:
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ExperimentConfig":
-        value = without_removed_runner_options(value)
         runner_raw = value.get("runner") or value
         runner = RunnerConfig(
             plan_format=str(runner_raw.get("plan_format", "subqueries")),
             chunk_size=int(runner_raw.get("chunk_size", 5000)),
-            answer_mode=str(runner_raw.get("answer_mode", "runtime")),
             max_windows=int(runner_raw.get("max_windows", 100000)),
             max_verify_candidates=int(runner_raw.get("max_verify_candidates", 1000)),
             max_plan_retries=int(runner_raw.get("max_plan_retries", 1)),
             max_model_calls=int(runner_raw.get("max_model_calls", 1000)),
             snapshot_every_windows=int(runner_raw.get("snapshot_every_windows", 1)),
-            verify_committed=bool(runner_raw.get("verify_committed", True)),
-            max_graph_claims=int(runner_raw.get("max_graph_claims", 128)),
             defer_unbound=bool(runner_raw.get("defer_unbound", True)),
-            max_verify_expansions=int(runner_raw.get("max_verify_expansions", 1)),
-            verify_expansion_limit=int(runner_raw.get("verify_expansion_limit", 32)),
-            require_evidence_sources=bool(runner_raw.get("require_evidence_sources", True)),
             min_streaming_windows=int(runner_raw.get("min_streaming_windows", 0)),
-            query_graph_mode=str(runner_raw.get("query_graph_mode", "open")),
-            require_source_span=bool(runner_raw.get("require_source_span", True)),
-            callback_retrieval_limit=int(runner_raw.get("callback_retrieval_limit", 16)),
-            max_targeted_updates=int(runner_raw.get("max_targeted_updates", 16)),
             candidate_batch_size=int(runner_raw.get("candidate_batch_size", 32)),
             max_response_retries=int(runner_raw.get("max_response_retries", 1)),
             memory_token_budget=(int(runner_raw["memory_token_budget"]) if runner_raw.get("memory_token_budget") is not None else None),
@@ -126,8 +99,6 @@ class ExperimentConfig:
             resume=bool(value.get("resume", True)),
             retry_errors=bool(value.get("retry_errors", True)),
             fail_fast=bool(value.get("fail_fast", False)),
-            oracle_plans=value.get("oracle_plans"),
-            compile_oracle=bool(value.get("compile_oracle", False)),
             tokenizer_path=value.get("tokenizer_path"),
             expected_data_sha256=value.get("expected_data_sha256"),
             expected_total_samples=(int(value["expected_total_samples"]) if value.get("expected_total_samples") is not None else None),
@@ -287,20 +258,6 @@ class ExperimentHarness:
             raise ValueError("experiment sample selection is empty")
         return samples
 
-    def _oracle_plans(self, samples: list[CanonicalSample]) -> dict[str, GraphQueryPlan]:
-        requires_oracle = any("oracle" in method for method in self.config.methods)
-        if not requires_oracle:
-            return {}
-        if self.config.oracle_plans:
-            return load_oracle_plans(self.config.oracle_plans)
-        if not self.config.compile_oracle:
-            raise ValueError(
-                "Oracle methods require oracle_plans or compile_oracle=true"
-            )
-        plans = compile_oracle_plans(samples)
-        write_oracle_plans(plans, self.output_dir / "oracle_plans.compiled.json")
-        return plans
-
     async def run(self) -> dict[str, Any]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "trajectories").mkdir(exist_ok=True)
@@ -314,7 +271,6 @@ class ExperimentHarness:
                     "resume configuration differs from config.resolved.json; use a new output_dir or resume=false"
                 )
         samples = self._samples()
-        oracle_plans = self._oracle_plans(samples)
         results_path = self.output_dir / "results.jsonl"
         existing = _read_jsonl(results_path) if self.config.resume else []
         completed = {
@@ -333,7 +289,7 @@ class ExperimentHarness:
 
         async def guarded(sample: CanonicalSample, method: str, order: str) -> dict[str, Any]:
             async with semaphore:
-                return await self._run_condition(sample, method, order, oracle_plans)
+                return await self._run_condition(sample, method, order)
 
         new_rows: list[dict[str, Any]] = []
         if self.config.fail_fast:
@@ -382,7 +338,6 @@ class ExperimentHarness:
         sample: CanonicalSample,
         method: str,
         order: str,
-        oracle_plans: dict[str, GraphQueryPlan],
     ) -> dict[str, Any]:
         manifest = build_manifest(
             sample, dataset_id=self.config.dataset_id, seed=self.config.seed, order=order
@@ -401,37 +356,18 @@ class ExperimentHarness:
         started = time.perf_counter()
         plan_valid: bool | None = None
         try:
-            if method == "direct_full_context":
-                result = await run_direct_full_context(
-                    run_id=run_id,
-                    question=sample.question,
-                    manifest=manifest,
-                    client=client,
-                    store=store,
-                )
-            else:
-                oracle_plan = oracle_plans.get(sample.sample_id)
-                if "oracle" in method and oracle_plan is None:
-                    raise ValueError(f"missing Oracle Plan for sample {sample.sample_id}")
-                plan = oracle_plan if "oracle" in method else None
-                if plan is not None:
-                    plan_valid = True
-                runner_config = replace(
-                    self.config.runner,
-                    defer_unbound=not method.endswith("no_defer"),
-                    query_graph_mode=("flat" if "_flat" in method else self.config.runner.query_graph_mode),
-                )
-                reader_client = (OpenAICompatibleClient(self.reader_api_config, store=store)
-                                 if self.reader_api_config else None)
-                result = await V5Runner(client, config=runner_config, reader_client=reader_client, tokenizer=self.tokenizer).run(
-                    run_id=run_id,
-                    sample=sample,
-                    manifest=None if sample.context is not None and runner_config.plan_format == "subqueries" else manifest,
-                    store=store,
-                    plan=plan,
-                )
-                result["method"] = method
-                plan_valid = True
+            runner_config = replace(self.config.runner, defer_unbound=True)
+            reader_client = (OpenAICompatibleClient(self.reader_api_config, store=store)
+                             if self.reader_api_config else None)
+            result = await V5Runner(client, config=runner_config, reader_client=reader_client, tokenizer=self.tokenizer).run(
+                run_id=run_id,
+                sample=sample,
+                manifest=None if sample.context is not None and runner_config.plan_format == "subqueries" else manifest,
+                store=store,
+                plan=None,
+            )
+            result["method"] = method
+            plan_valid = True
             result.update(
                 {
                     "sample_id": sample.sample_id,
@@ -494,16 +430,7 @@ class ExperimentHarness:
         result["early_latent_evidence_recall"] = (
             len(early_gold & deferred_refs) / len(early_gold) if early_gold else None
         )
-        oracle = oracle_plans.get(sample.sample_id)
-        predicted_plan = None
-        if (result.get("state") or {}).get("plan"):
-            predicted_plan = parse_query_plan(result["state"]["plan"])
-        elif event_counts.get("PLAN_CREATED"):
-            plan_event = next(
-                event for event in events if event["event_type"] == "PLAN_CREATED"
-            )
-            predicted_plan = parse_query_plan(plan_event["payload"]["plan"])
-        result["plan_relation_recall"] = plan_relation_recall(predicted_plan, oracle)
+        result["plan_relation_recall"] = None
         scored = score_result(result, sample)
         trajectory_path = self.output_dir / "trajectories" / f"{run_id}.json"
         trajectory_path.parent.mkdir(parents=True, exist_ok=True)

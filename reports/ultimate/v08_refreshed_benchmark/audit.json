@@ -1,0 +1,298 @@
+{
+  "status": "ONE_RUN_COMPLETE",
+  "stage": "V08 unchanged on refreshed benchmark",
+  "run": "results/ultimate/v08_refreshed_benchmark_full128_r1",
+  "metrics": {
+    "correct": 112,
+    "accuracy": 0.875,
+    "f1": 0.8964247557997558,
+    "statuses": {
+      "OK": 125,
+      "ERROR": 3
+    },
+    "runtime_statuses": {
+      "ANSWERED": 125,
+      "ERROR": 3
+    },
+    "cost": {
+      "records": 879,
+      "cache_hits": 0,
+      "network_attempts": 879,
+      "retries": 8,
+      "failed_attempts": 8,
+      "input_tokens": 2290381,
+      "output_tokens": 313252,
+      "logical_calls": 871
+    },
+    "interfaces": {
+      "PLAN": {
+        "records": 129,
+        "cache_hits": 0,
+        "network_attempts": 129,
+        "retries": 0,
+        "failed_attempts": 0,
+        "input_tokens": 32984,
+        "output_tokens": 11886,
+        "logical_calls": 129
+      },
+      "UPDATE": {
+        "records": 244,
+        "cache_hits": 0,
+        "network_attempts": 244,
+        "retries": 2,
+        "failed_attempts": 2,
+        "input_tokens": 1197287,
+        "output_tokens": 56300,
+        "logical_calls": 242
+      },
+      "MEMORY_GROUNDED": {
+        "records": 325,
+        "cache_hits": 0,
+        "network_attempts": 325,
+        "retries": 2,
+        "failed_attempts": 2,
+        "input_tokens": 685133,
+        "output_tokens": 168009,
+        "logical_calls": 323
+      },
+      "ANSWER": {
+        "records": 135,
+        "cache_hits": 0,
+        "network_attempts": 135,
+        "retries": 4,
+        "failed_attempts": 4,
+        "input_tokens": 355750,
+        "output_tokens": 76209,
+        "logical_calls": 131
+      },
+      "RECALL": {
+        "records": 46,
+        "cache_hits": 0,
+        "network_attempts": 46,
+        "retries": 0,
+        "failed_attempts": 0,
+        "input_tokens": 19227,
+        "output_tokens": 848,
+        "logical_calls": 46
+      }
+    },
+    "latency_p50_ms": 59989.81839546468,
+    "latency_p95_ms": 213790.12601471023,
+    "by_type": {
+      "bridge_comparison": {
+        "count": 21,
+        "correct": 18,
+        "f1": 0.8571428571428571,
+        "wrong": 3,
+        "accuracy": 0.8571428571428571,
+        "errors": 1
+      },
+      "comparison": {
+        "count": 60,
+        "correct": 59,
+        "f1": 0.9833333333333333,
+        "wrong": 1,
+        "accuracy": 0.9833333333333333,
+        "errors": 1
+      },
+      "compositional": {
+        "count": 26,
+        "correct": 22,
+        "f1": 0.8461538461538461,
+        "wrong": 4,
+        "accuracy": 0.8461538461538461,
+        "errors": 0
+      },
+      "inference": {
+        "count": 21,
+        "correct": 13,
+        "f1": 0.7496366067794639,
+        "wrong": 8,
+        "accuracy": 0.6190476190476191,
+        "errors": 1
+      }
+    },
+    "events": {
+      "AGENT_CALLED": 871,
+      "PLAN_CREATED": 127,
+      "QUERY_STATE_UPDATED": 775,
+      "QUERY_ACTIVATED": 347,
+      "MEMORY_VIEW_MEASURED": 594,
+      "UPDATE_JSON_RESPONSE_METADATA": 242,
+      "UPDATE_JSON_PARSED": 234,
+      "FACT_STORED": 571,
+      "FACT_COMMITTED": 284,
+      "ACTIVE_VIEW_UPDATED": 359,
+      "MEMORY_EVIDENCE_PREPARED": 359,
+      "MEMORY_GROUNDED_JSON_RESPONSE_METADATA": 323,
+      "SOURCE_ASSESSED": 1151,
+      "MEMORY_VERIFY_COMPLETED": 321,
+      "QUERY_BOUND": 291,
+      "BINDING_LINK_CREATED": 291,
+      "DEFER_WORKSPACE_LOOKUP": 136,
+      "DEFER_BUCKET_EMPTY": 90,
+      "MEMORY_SOURCE_SCOPE_REJECTED": 166,
+      "RAW_SOURCE_RECHECKED": 127,
+      "FINAL_EVIDENCE_PACK_BUILT": 127,
+      "FINAL_ANSWER_REQUEST_MEASURED": 127,
+      "RUN_STATUS": 125,
+      "PLAN_HINT_RECORDED": 247,
+      "FACT_DEFERRED": 57,
+      "DEFER_CANDIDATES_SELECTED": 46,
+      "FACT_PROMOTED": 47,
+      "MEMORY_GROUNDED_JSON_REJECTED": 2,
+      "AGENT_RESPONSE_INVALID": 18,
+      "MEMORY_LINE_REJECTED": 34,
+      "ANSWER_POST_PROCESSED": 5,
+      "MEMORY_SOURCE_CHECK_REJECTED": 26,
+      "UPDATE_LINE_REJECTED": 7,
+      "UPDATE_LINES_DROPPED": 6,
+      "UPDATE_JSON_REJECTED": 8,
+      "UPDATE_REPAIR_REQUESTED": 7,
+      "RECALL_CONTEXT_IDS_IGNORED": 3,
+      "BINDING_HELD": 1,
+      "PROTOCOL_REPAIR_EXHAUSTED": 1,
+      "BINDING_LINK_REMOVED": 2
+    },
+    "errors": [
+      {
+        "sample_id": "dev_11285",
+        "error": "boxed answer missing"
+      },
+      {
+        "sample_id": "dev_266",
+        "error": "invalid output variable '?321_release_date'"
+      },
+      {
+        "sample_id": "dev_4288",
+        "error": "boxed answer missing"
+      }
+    ],
+    "update_protocol": {
+      "responses": 242,
+      "parsed_fact_rows": 358,
+      "hint_rows": 248,
+      "rejected_rows": 0,
+      "responses_without_rejected_rows": 240,
+      "forbidden_bindings": 0,
+      "unparseable_responses": 2
+    },
+    "replayed_states": 125,
+    "violations": []
+  },
+  "groups": {
+    "kept_98": {
+      "count": 98,
+      "correct": 86,
+      "accuracy": 0.8775510204081632,
+      "f1": 0.8860980289551719,
+      "statuses": {
+        "OK": 96,
+        "ERROR": 2
+      }
+    },
+    "added_30": {
+      "count": 30,
+      "correct": 26,
+      "accuracy": 0.8666666666666667,
+      "f1": 0.9301587301587302,
+      "statuses": {
+        "OK": 29,
+        "ERROR": 1
+      }
+    }
+  },
+  "retained_question_comparison": {
+    "count": 98,
+    "old_correct": 93,
+    "new_correct": 86,
+    "gains": [
+      "dev_5416",
+      "dev_5853",
+      "dev_6785"
+    ],
+    "losses": [
+      "dev_10616",
+      "dev_7920",
+      "dev_4288",
+      "dev_11285",
+      "dev_448",
+      "dev_4237",
+      "dev_4021",
+      "dev_9193",
+      "dev_738",
+      "dev_3448"
+    ]
+  },
+  "error_diagnostics": [
+    {
+      "sample_id": "dev_11285",
+      "error": "boxed answer missing",
+      "last_interface": "ANSWER",
+      "calls": [
+        {
+          "finish_reason": "length",
+          "output_tokens": 4096,
+          "network_error": null
+        },
+        {
+          "finish_reason": "length",
+          "output_tokens": 4096,
+          "network_error": null
+        }
+      ]
+    },
+    {
+      "sample_id": "dev_266",
+      "error": "invalid output variable '?321_release_date'",
+      "last_interface": "PLAN",
+      "calls": [
+        {
+          "finish_reason": "stop",
+          "output_tokens": 96,
+          "network_error": null
+        },
+        {
+          "finish_reason": "stop",
+          "output_tokens": 98,
+          "network_error": null
+        }
+      ]
+    },
+    {
+      "sample_id": "dev_4288",
+      "error": "boxed answer missing",
+      "last_interface": "ANSWER",
+      "calls": [
+        {
+          "finish_reason": "length",
+          "output_tokens": 4096,
+          "network_error": null
+        },
+        {
+          "finish_reason": "length",
+          "output_tokens": 4096,
+          "network_error": null
+        }
+      ]
+    }
+  ],
+  "old_dataset_metrics_reference_only": {
+    "correct": 98,
+    "accuracy": 0.765625,
+    "f1": 0.7805059523809523,
+    "statuses": {
+      "OK": 127,
+      "ERROR": 1
+    }
+  },
+  "final_evidence_audit": {
+    "packs": 127,
+    "requests_measured": 127,
+    "source_assessments": 1151,
+    "budget_failures": 0,
+    "violations": []
+  },
+  "source_unchanged": true,
+  "dataset_sha256": "90cb0c3d4e10513083f15baa2e9d767f659a632348691bd9f47c7776fdcbd8b7"
+}

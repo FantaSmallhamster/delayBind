@@ -18,7 +18,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from delaybind_core import cli
 from delaybind_core.evaluation import ExperimentConfig, ExperimentHarness
-from delaybind_core.agents import LowLevelAgent
 
 
 def main():
@@ -52,8 +51,11 @@ def main():
         "python": sys.version, "dependencies": {name: importlib.metadata.version(name)
                                                   for name in ("pydantic", "tokenizers")},
         "max_concurrency": config.max_concurrency,
-        "mechanisms": {"evidence_rescue": False, "recall_verify": "VERIFY" in LowLevelAgent.interfaces,
-                       "raw_archive_fallback": getattr(config.runner, "enable_raw_archive_fallback", False)},
+        "mechanisms": {"plan_format": config.runner.plan_format,
+                       "update_protocol": config.runner.update_protocol,
+                       "memory_protocol": config.runner.memory_protocol,
+                       "memory_source_mode": config.runner.memory_source_mode,
+                       "final_evidence_pack": True},
         "instrumentation": "CLI experiment; journal original _run_condition return values only",
     }
     (output / "code_manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")

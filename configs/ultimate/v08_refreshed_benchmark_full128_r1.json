@@ -1,0 +1,58 @@
+{
+  "input": "data/test/filtered_seed4_128_refresh_v08/eval_2wikimultihopqa_50.json",
+  "output_dir": "results/ultimate/v08_refreshed_benchmark_full128_r1",
+  "experiment_id": "v08-refreshed-benchmark-full128-r1",
+  "dataset_id": "2wiki",
+  "methods": [
+    "v5_predicted"
+  ],
+  "orders": [
+    "original"
+  ],
+  "sample_start": 0,
+  "sample_count": null,
+  "sample_ids": [],
+  "seed": 4,
+  "max_concurrency": 8,
+  "resume": false,
+  "retry_errors": true,
+  "fail_fast": false,
+  "tokenizer_path": "models/Qwen3.5-9B-tokenizer/tokenizer.json",
+  "expected_data_sha256": "90cb0c3d4e10513083f15baa2e9d767f659a632348691bd9f47c7776fdcbd8b7",
+  "expected_total_samples": 128,
+  "expected_documents": 50,
+  "runner": {
+    "plan_format": "subqueries",
+    "chunk_size": 5000,
+    "max_windows": 100000,
+    "max_verify_candidates": 1000,
+    "max_plan_retries": 1,
+    "max_model_calls": 1000,
+    "snapshot_every_windows": 1,
+    "defer_unbound": true,
+    "candidate_batch_size": 32,
+    "max_response_retries": 1,
+    "memory_token_budget": 8192,
+    "memory_char_budget": 24000,
+    "answer_format": "boxed",
+    "enable_defer_callback": true,
+    "memory_source_mode": "joint_source_memory",
+    "memory_source_token_budget": 8192,
+    "update_protocol": "json",
+    "update_json_mode": "json_schema",
+    "memory_protocol": "json",
+    "memory_json_mode": "json_schema"
+  },
+  "api": {
+    "model": "Qwen/Qwen3.5-9B",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "temperature": 0.0,
+    "top_p": 0.95,
+    "enable_thinking": false,
+    "model_seed": 4,
+    "max_output_tokens": 4096,
+    "api_max_retries": 6,
+    "rate_limit_backoff_seconds": 15,
+    "rate_limit_backoff_max_seconds": 60
+  }
+}

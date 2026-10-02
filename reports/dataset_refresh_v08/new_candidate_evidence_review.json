@@ -1,0 +1,107 @@
+[
+  {"sample_id":"dev_8305","type":"inference","verdict":"REJECT","reason":"George 的父亲 Thomas 明确，但 Thomas 段落只有堂兄 William 的继承关系，没有其父亲 William 的关系。不能用结构化 gold 三元组补入正文缺失的证据。","proof":["George: the seventh surviving son of Thomas Cochrane, 8th Earl of Dundonald","Thomas: acceded ... on the death of his cousin, William Cochrane, 7th Earl of Dundonald"],"human_answer":null},
+  {"sample_id":"dev_9710","type":"inference","verdict":"ACCEPT","reason":"两段明确父子关系：Ferdinand 的父亲 William，William 的父亲 Edward Fortunatus，父系祖父链完整。","proof":["Ferdinand Maximilian: oldest son of William, Margrave of Baden-Baden","William: eldest son of Margrave Edward Fortunatus of Baden"],"human_answer":"Edward Fortunatus"},
+  {"sample_id":"dev_3238","type":"inference","verdict":"ACCEPT","reason":"Waldemar 的父亲 Christian 明确；Christian 的母亲 Princess Louise 明确，姓名和年代对应同一人。","proof":["Waldemar: a son of Prince Christian of Schaumburg-Lippe and Princess Feodora of Denmark","Christian (1898–1974): ... child of Frederick ... and his first wife Princess Louise of Denmark"],"human_answer":"Princess Louise of Denmark"},
+  {"sample_id":"dev_3894","type":"inference","verdict":"ACCEPT","reason":"Friedrich Sigismund 的母亲 Louise Sophie 与她的母亲 Adelheid 均直接写明，母系祖母链完整。","proof":["Friedrich Sigismund: son of ... Princess Louise Sophie of Schleswig-Holstein-Sonderburg-Augustenburg","Louise Sophie: a daughter of Frederick VIII ... and Princess Adelheid of Hohenlohe-Langenburg"],"human_answer":"Princess Adelheid of Hohenlohe-Langenburg"},
+  {"sample_id":"dev_6027","type":"inference","verdict":"REJECT","reason":"上下文父系祖父链完整，但第三次无上下文回答 William de Bohun 已给出正确人物；因 gold 的伯爵头衔与别名缺失造成 EM=0，不满足实质四次不会答，保守排除。","proof":["Eleanor: daughter ... Humphrey de Bohun, 7th Earl of Hereford","Humphrey: son of William de Bohun, 1st Earl of Northampton","third no-context answer: William de Bohun"],"human_answer":"William de Bohun, 1st Earl of Northampton"},
+  {"sample_id":"dev_832","type":"inference","verdict":"REJECT","reason":"上下文祖父链完整，但第二次无上下文回答 Sir William Henry Fellowes, 1st Baronet 已给出 gold 的完整姓名并加了错误爵位，难以保证是实质答错而非多余头衔导致 EM=0，保守排除。","proof":["Edward Fellowes: De Ramsey was the son of William Henry Fellowes","Edward Fellowes: Their younger son Ailwyn Fellowes ... elevated ... Baron Ailwyn in 1921","second no-context answer: Sir William Henry Fellowes, 1st Baronet"],"human_answer":"William Henry Fellowes"},
+  {"sample_id":"dev_375","type":"inference","verdict":"ACCEPT","reason":"George 的出生段落明确父亲 Leopold；Leopold 段落写父亲 Jerome，且其子 George 成为政治人物的描述再次确认身份，祖父链完整。","proof":["George: born ... to pastoralist Leopold Fane De Salis and Charlotte Macdonald","Leopold: Born in Florence to Jerome, 4th Count de Salis-Soglio and Henrietta Foster","Leopold: two of whom (George and Leopold) would later become politicians"],"human_answer":"Jerome, 4th Count de Salis-Soglio"},
+  {"sample_id":"dev_3528","type":"comparison","verdict":"ACCEPT","reason":"两位人物的完整生卒日期明确；Henrique 1864 年出生，比 Jimmy Garth 1922 年更早，因此 older。","proof":["James Russell Garth: 1 May 1922 – June 1972","Henrique José Monteiro de Mendonça: 4 February 1864 – 1 November 1942"],"human_answer":"Henrique De Mendonça"},
+  {"sample_id":"dev_9700","type":"inference","verdict":"ACCEPT","reason":"Gavin 父亲 John Hamilton, 1st Baron 的完整身份与其段落吻合；John 的父亲 Archibald James 明确，两跳链完整。","proof":["Gavin: eldest surviving son of John Hamilton, 1st Baron Hamilton of Dalzell","John: the only son of Archibald James Hamilton, 12th of Orbiston"],"human_answer":"Archibald James Hamilton"},
+  {"sample_id":"dev_9537","type":"inference","verdict":"REJECT","reason":"正文只写 James 是 Lloyd 的父亲、Lillian 是 Lloyd 的母亲，未证明两人结婚；共有孩子不能严格推出 spouse 关系。","proof":["James Corrigan: the father of actor Lloyd Corrigan","Lloyd Corrigan: The son of actress Lillian Elliott"],"human_answer":null},
+  {"sample_id":"dev_8731","type":"inference","verdict":"REJECT","reason":"正文证明 Paal 曾与 Harriet 结婚、Øystein 是 Harriet 的儿子，但未给出儿子的父亲，无法判断其为 Paal 的亲生儿子还是继子。","proof":["Paal Bog: married ... Harriet ... from 1944 to 1950","Harriet Holter: her son Øystein Gullvåg Holter"],"human_answer":null},
+  {"sample_id":"dev_266","type":"comparison","verdict":"ACCEPT","reason":"两张专辑首次发行日期均明确，1998 早于 2017。","proof":["Issa Album: released on July 7, 2017","3.2.1.: released on July 23, 1998"],"human_answer":"3.2.1."},
+  {"sample_id":"dev_4959","type":"comparison","verdict":"ACCEPT","reason":"明确出生日期 1552 与 1956，William Cavendish 更早。","proof":["William Cavendish: 27 December 1552 – 3 March 1626","Thomas Pernes: 25 February 1956 – 26 February 2018"],"human_answer":"William Cavendish, 1St Earl Of Devonshire"},
+  {"sample_id":"dev_11030","type":"comparison","verdict":"ACCEPT","reason":"原文给出两部影片年份 1971 与 1993，比较方向明确。","proof":["The Death of Black King: a 1971 Czechoslovak film","Indradhanura Chhai: a 1993 Indian Oriya film"],"human_answer":"The Death Of Black King"},
+  {"sample_id":"dev_2651","type":"comparison","verdict":"ACCEPT","reason":"两人完整生卒日期明确，Despré 约 79 岁，Webster 约 52 岁，前者寿命更长。","proof":["Jean-Baptiste-Denis Despré: 24 June 1752 – 2 March 1832","Lucien Bonaparte Webster: March 17, 1801 – November 4, 1853"],"human_answer":"Jean-Baptiste-Denis Despré"},
+  {"sample_id":"dev_9425","type":"comparison","verdict":"ACCEPT","reason":"别名 Kakan 与人物 Hermansson 的对应明确，1981 早于 1990。","proof":["Karin Signhild Hermansson: born 7 August 1981, better known as Kakan Hermansson","Mian Hussain: born July 10, 1990"],"human_answer":"Kakan Hermansson"},
+  {"sample_id":"dev_4598","type":"comparison","verdict":"ACCEPT","reason":"影片年份 1992 与 2002 明确，Ek Ladka Ek Ladki 更早；段落同时明确其上映日。","proof":["Ek Ladka Ek Ladki: released on 19 June 1992","The Original Latin Kings of Comedy: a 2002 stand-up comedy film"],"human_answer":"Ek Ladka Ek Ladki"},
+  {"sample_id":"dev_7620","type":"comparison","verdict":"ACCEPT","reason":"出生日期与 Angela 的艺名对应均明确，1949 早于 1955。","proof":["Angela Maria Diniz Gonçalves: born ... December 5, 1949, best known ... Angela Ro Ro","Caridad Canelón: born May 16, 1955"],"human_answer":"Angela Ro Ro"},
+  {"sample_id":"dev_8077","type":"comparison","verdict":"ACCEPT","reason":"出生日期明确，1977 年的 Spaull 比 1971 年的 Bosso 更年轻。","proof":["John Spaull: born 20 August 1977","Ezio Bosso: born September 13, 1971"],"human_answer":"John Spaull"},
+  {"sample_id":"dev_10853","type":"comparison","verdict":"REJECT","reason":"Dorian Gray 段落有 Italian title 和伦敦背景，但未明确影片来源国家；意大利语标题不能证明意大利制作。","proof":["Dorian Gray: The Italian title translates as A God Called Dorian","Before the Jury: a 1931 Italian crime film"],"human_answer":null},
+  {"sample_id":"dev_126","type":"comparison","verdict":"ACCEPT","reason":"影片年代明确，Ulti Ganga 1942 早于 I Am Breathing 2013。","proof":["Ulti Ganga: It was released in 1942","I am Breathing: a 2013 ... documentary feature film"],"human_answer":"Ulti Ganga"},
+  {"sample_id":"dev_2078","type":"comparison","verdict":"ACCEPT","reason":"导演直接列名，Molly & Gina 一位，Shopping for Fangs 两位；编剧不计作导演。","proof":["Molly & Gina: directed by Paul Leder","Shopping for Fangs: directed by Quentin Lee and Justin Lin"],"human_answer":"Shopping For Fangs"},
+  {"sample_id":"dev_7846","type":"comparison","verdict":"ACCEPT","reason":"影片年份和后者上映日明确，2009 比 1962 更近。","proof":["Nua Bou: a 1962 Indian Odia film","The Damned United: released ... on 27 March 2009"],"human_answer":"The Damned United"},
+  {"sample_id":"dev_401","type":"comparison","verdict":"REJECT","reason":"有上下文时 1961 与 2010 可以比较，但两次无上下文回答 Amelie 已可能指向问题中完整片名；不能把答案别名缺失导致的 EM=0 当作实质四次不会答。本批保守排除。","proof":["Amelie or The Time to Love: a 1961 French drama film","Beginners: premiered at the 2010 Toronto International Film Festival","two no-context answers: Amelie"],"human_answer":"Amelie Or The Time To Love"},
+  {"sample_id":"dev_10011","type":"comparison","verdict":"ACCEPT","reason":"年份明确，The White Planet 2006 比 The Glass Sphinx 1967 更新。","proof":["The White Planet: a 2006 documentary","The Glass Sphinx: an Italian-American 1967 adventure film"],"human_answer":"The White Planet"},
+  {"sample_id":"dev_482","type":"comparison","verdict":"ACCEPT","reason":"出生日期明确，1961 早于 1980。","proof":["Overill Dwyer-Brown: born 4 January 1961","Dragan Načevski: born 27 January 1980"],"human_answer":"Overill Dwyer-Brown"},
+  {"sample_id":"dev_2989","type":"comparison","verdict":"ACCEPT","reason":"两部影片年份明确，1940 早于 1942。","proof":["Allá en el trópico: a 1940 Mexican comedy musical film","The Moon and Sixpence: a 1942 film adaptation"],"human_answer":"Allá En El Trópico"},
+  {"sample_id":"dev_4593","type":"comparison","verdict":"ACCEPT","reason":"Gallivant 明确 1996 上映，Divine Food 明确 1998，前者更早。","proof":["Gallivant: Released in 1996","Divine Food: a 1998 American documentary film"],"human_answer":"Gallivant"},
+  {"sample_id":"dev_5429","type":"comparison","verdict":"ACCEPT","reason":"影片年代明确，1975 早于 2000。","proof":["Las tecnologías pesqueras: a 1975 Mexican film","Devil in the Flesh 2: the 2000 erotic thriller sequel"],"human_answer":"Las Tecnologías Pesqueras"},
+  {"sample_id":"dev_7697","type":"comparison","verdict":"ACCEPT","reason":"两人死亡日期明确，Cressman 的 2008 比 Anthony 的 1968 更晚。","proof":["George Cressman: Oct. 7, 1919 – April 17, 2008","Herbert Douglas Anthony: 24 June 1892 – 10 June 1968"],"human_answer":"George Cressman"},
+  {"sample_id":"dev_7064","type":"comparison","verdict":"ACCEPT","reason":"Se Nada Mais Der Certo 明确 2009，Heroes 1977；故事发生于 1937 不替代影片年份。","proof":["Se Nada Mais Der Certo: a Brazilian film of 2009","Heroes of the Eastern Skies: a 1977 Taiwanese war film"],"human_answer":"Se Nada Mais Der Certo"},
+  {"sample_id":"dev_2407","type":"comparison","verdict":"ACCEPT","reason":"Kalavar King 2010 上映，Ogro 为 1979，后者更早；剧情年代不影响。","proof":["Kalavar King: released on 26 February 2010","Operación Ogro: a 1979 Spanish and Italian drama film"],"human_answer":"Ogro"},
+  {"sample_id":"dev_12443","type":"comparison","verdict":"ACCEPT","reason":"两部影片来源明确且不相交：西德/奥地利与美国，因此 no；拍摄地点不作来源国家。","proof":["The Last Ride to Santa Cruz: a 1964 West German-Austrian Western film","North of the Rio Grande: a lost 1922 American silent western film"],"human_answer":"no"},
+  {
+    "sample_id": "dev_313",
+    "type": "comparison",
+    "verdict": "ACCEPT",
+    "reason": "两位人物和出生日期均明确；1949 年出生的 Bernard Chambaz 比 1935 年出生的 Tibor Pézsa 更年轻，方向与 gold 一致。",
+    "proof": ["Bernard Chambaz: born 18 May 1949", "Tibor Pézsa: born 15 November 1935"],
+    "human_answer": "Bernard Chambaz"
+  },
+  {
+    "sample_id": "dev_5579",
+    "type": "comparison",
+    "verdict": "ACCEPT",
+    "reason": "两部电影及年份明确。Die Pratermizzi 明确于 1927 年上映，早于 1996 年的 The King of Masks；拍摄于 1926 年也不会改变比较方向。",
+    "proof": ["The King of Masks: 1996 film", "Die Pratermizzi: released in January 1927"],
+    "human_answer": "Die Pratermizzi"
+  },
+  {
+    "sample_id": "dev_5597",
+    "type": "comparison",
+    "verdict": "ACCEPT",
+    "reason": "两人出生日期明确；1972 年的 Uvis Helmanis 早于 1990 年的 Atthaphon Daengchanthuek。",
+    "proof": ["Uvis Helmanis: born June 10, 1972", "Atthaphon Daengchanthuek: born 19 December 1990"],
+    "human_answer": "Uvis Helmanis"
+  },
+  {
+    "sample_id": "dev_10294",
+    "type": "comparison",
+    "verdict": "ACCEPT",
+    "reason": "两村所在国家均直接写明；Iran 与 Botswana 不同，因此 no。",
+    "proof": ["Ramesht: Kurdistan Province, Iran", "Salajwe: Kweneng District of Botswana"],
+    "human_answer": "no"
+  },
+  {
+    "sample_id": "dev_2779",
+    "type": "comparison",
+    "verdict": "ACCEPT",
+    "reason": "提供的段落明确为 2005 年的 Just Friends 与 1982 年的 Enkeyo Ketta Kural，后者更早。电影重拍年份不会影响原片比较。",
+    "proof": ["Just Friends: released on November 23, 2005", "Enkeyo Ketta Kural: a 1982 film"],
+    "human_answer": "Enkeyo Ketta Kural"
+  },
+  {
+    "sample_id": "dev_1955",
+    "type": "comparison",
+    "verdict": "REJECT",
+    "reason": "Watson 的段落给出 U.S. Representative 的职位和出生/工作地点，没有直接写明国籍。为避免重新引入职位或地点代替国籍的弱证据题，本批严格证据复核不采用。",
+    "proof": ["Cooper K. Watson: was a U.S. Representative from Ohio", "Jimmy Van Ostrand: is a Canadian baseball player"],
+    "human_answer": null
+  },
+  {
+    "sample_id": "dev_3553",
+    "type": "comparison",
+    "verdict": "REJECT",
+    "reason": "两部影片为 Soviet-German 与 Swiss-German，共享 German 可按任一共同国家读出 yes，但完整来源国家集合并不相同；为避免 same country 的合拍片语义歧义，本批不用。",
+    "proof": ["To Kill a Dragon: a 1989 Soviet-German film", "Tannenberg: a 1932 Swiss-German film"],
+    "human_answer": "yes"
+  },
+  {
+    "sample_id": "dev_9427",
+    "type": "comparison",
+    "verdict": "REJECT",
+    "reason": "The Big Blue 的段落写英语语言、法国电影风格、法国导演和上映市场，没有明确给出影片制作/来源国家。为避免从语言、导演或市场代替 country of origin 的弱证据，本批不采用。",
+    "proof": ["The Big Blue: an English-language film in the French Cinéma du look visual style, made by French director Luc Besson", "Baxter: a 1989 French horror film"],
+    "human_answer": null
+  },
+  {
+    "sample_id": "dev_9746",
+    "type": "comparison",
+    "verdict": "ACCEPT",
+    "reason": "两人的死亡日期明确；Ivo Pelay 的 1959 年早于 Anđelko Habazin 的 1978 年。",
+    "proof": ["Ivo Pelay: May 5, 1893 – August 28, 1959", "Anđelko Habazin: 7 November 1924 – 6 October 1978"],
+    "human_answer": "Ivo Pelay"
+  }
+]

@@ -10,15 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from .api import APIConfig, OpenAICompatibleClient
-from .config_compat import without_removed_runner_options
 from .data import build_manifest, canonicalize_record, load_records
 from .fact_protocol import parse_plan
 from .evaluation import ExperimentConfig, run_experiment
-from .oracle import compile_oracle_plans, write_oracle_plans
-from .profiler import profile_dataset
 from .replay import replay_events
-from .runner import RunnerConfig, V5Runner, load_manifest
-from .schema import RuntimeEvent, parse_query_plan
+from .runner import V5Runner, load_manifest
+from .schema import QueryPlan, RuntimeEvent
 from .storage import SQLiteEventStore
 
 
@@ -90,7 +87,7 @@ def _api_config(config: dict[str, Any], *, default_seed: int = 4) -> APIConfig:
 
 def _run_from_config(config_path: str | Path) -> dict[str, Any]:
     _load_env_file()
-    config = without_removed_runner_options(_load_config(config_path))
+    config = _load_config(config_path)
     dataset_id = str(config.get("dataset_id", "2wiki"))
     if config.get("item") is not None:
         samples = [canonicalize_record(config["item"], dataset_id=dataset_id)]
@@ -135,40 +132,12 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
     if config.get("plan") or config.get("plan_path"):
         plan_path = config.get("plan") or config.get("plan_path")
         plan_text = Path(plan_path).read_text(encoding="utf-8")
-        plan = parse_query_plan(json.loads(plan_text)) if plan_text.lstrip().startswith("{") else parse_plan(plan_text)
+        plan = QueryPlan.model_validate(json.loads(plan_text)) if plan_text.lstrip().startswith("{") else parse_plan(plan_text)
     runner = V5Runner(
         client,
         reader_client=reader_client,
         tokenizer=tokenizer,
-        config=RunnerConfig(
-            plan_format=str(config.get("plan_format", "subqueries")),
-            chunk_size=int(config.get("chunk_size", 5000)),
-            answer_mode=str(config.get("answer_mode", "runtime")),
-            max_windows=int(config.get("max_windows", 100000)),
-            max_verify_candidates=int(config.get("max_verify_candidates", 1000)),
-            max_plan_retries=int(config.get("max_plan_retries", 1)),
-            max_model_calls=int(config.get("max_model_calls", 1000)),
-            snapshot_every_windows=int(config.get("snapshot_every_windows", 1)),
-            verify_committed=bool(config.get("verify_committed", True)),
-            max_graph_claims=int(config.get("max_graph_claims", 128)),
-            defer_unbound=bool(config.get("defer_unbound", True)),
-            max_verify_expansions=int(config.get("max_verify_expansions", 1)),
-            verify_expansion_limit=int(config.get("verify_expansion_limit", 32)),
-            require_evidence_sources=bool(config.get("require_evidence_sources", True)),
-            min_streaming_windows=int(config.get("min_streaming_windows", 0)),
-            query_graph_mode=str(config.get("query_graph_mode", "open")),
-            require_source_span=bool(config.get("require_source_span", True)),
-            callback_retrieval_limit=int(config.get("callback_retrieval_limit", 16)),
-            max_targeted_updates=int(config.get("max_targeted_updates", 16)),
-            candidate_batch_size=int(config.get("candidate_batch_size", 32)),
-            max_response_retries=int(config.get("max_response_retries", 1)),
-            memory_token_budget=(int(config["memory_token_budget"]) if config.get("memory_token_budget") is not None else None),
-            memory_char_budget=int(config.get("memory_char_budget", 24000)),
-            answer_format=str(config.get("answer_format", "auto")),
-            enable_defer_callback=bool(config.get("enable_defer_callback", True)),
-            memory_source_mode=str(config.get("memory_source_mode", "postverify")),
-            memory_source_token_budget=int(config.get("memory_source_token_budget", 8192)),
-        ),
+        config=ExperimentConfig.from_mapping({**config, "input": str(config.get("input", ""))}).runner,
     )
     run_id = str(config.get("run_id") or f"{sample.sample_id}-{manifest.manifest_id if manifest else 'text'}")
     result = asyncio.run(
@@ -213,11 +182,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="original",
     )
 
-    profile = sub.add_parser("profile")
-    profile.add_argument("--input", required=True)
-    profile.add_argument("--output", required=True)
-    profile.add_argument("--dataset-id", default="2wiki")
-
     replay = sub.add_parser("replay")
     replay.add_argument("--events", required=True)
     replay.add_argument("--output", required=True)
@@ -228,12 +192,6 @@ def build_parser() -> argparse.ArgumentParser:
     experiment = sub.add_parser("experiment")
     experiment.add_argument("--config", required=True)
 
-    oracle = sub.add_parser("compile-oracle-plans")
-    oracle.add_argument("--input", required=True)
-    oracle.add_argument("--output", required=True)
-    oracle.add_argument("--dataset-id", default="2wiki")
-    oracle.add_argument("--sample-start", type=int, default=0)
-    oracle.add_argument("--sample-count", type=int)
     return parser
 
 
@@ -250,10 +208,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         manifest.to_json(args.output)
         return 0
-    if args.command == "profile":
-        result = profile_dataset(load_records(args.input, dataset_id=args.dataset_id))
-        Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        return 0
     if args.command == "replay":
         raw = json.loads(Path(args.events).read_text(encoding="utf-8"))
         events = [RuntimeEvent.model_validate(item) for item in raw]
@@ -263,16 +217,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         result = _run_from_config(args.config)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "compile-oracle-plans":
-        samples = list(load_records(args.input, dataset_id=args.dataset_id))
-        end = None if args.sample_count is None else args.sample_start + args.sample_count
-        selected = samples[args.sample_start:end]
-        if not selected:
-            raise SystemExit("Oracle Plan sample selection is empty")
-        plans = compile_oracle_plans(selected)
-        write_oracle_plans(plans, args.output)
-        print(json.dumps({"plans": len(plans), "output": args.output}, ensure_ascii=False))
         return 0
     if args.command == "experiment":
         _load_env_file()

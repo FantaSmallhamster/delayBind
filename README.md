@@ -1,180 +1,60 @@
-> DelayBind C 阶段实验包：前置原文核验，128 题成绩 92/128，低于 B 的 94/128；C 未通过准确率门槛。代码、配置、逐题结果与轨迹见 [C 阶段发布说明](C_RELEASE.md)。
+# DelayBind V08
 
-# [ICLR 2026] Look Back to Reason Forward: Revisitable Memory for Long-Context LLM Agents
+当前工作树是 V08 精简版：保留子问题规划、JSON 事实抽取、原文与记忆联合核验、确认绑定、原文回看和最终证据包。旧 graph/oracle 执行器、ReMemR1/verl 训练工程、历史阶段脚本、配置、题集及运行产物已移除。
 
-This repo contains the official implementation of ICLR 2026 paper **ReMemR1**: `Look Back to Reason Forward: Revisitable Memory for Long-Context LLM Agents`.
+## 保留内容
 
-[![ICLR 2026](https://img.shields.io/badge/ICLR-2026-blue)]()
-[![arXiv](https://img.shields.io/badge/arXiv-2509.23040-b31b1b.svg)](https://arxiv.org/abs/2509.23040)
-[![Model on HF](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue)](https://huggingface.co/yrshi/ReMemR1-7B)
-[![Project Page](https://img.shields.io/badge/Project-Page-green)](https://syr-cn.github.io/ReMemR1/)
-[![Paper page](https://huggingface.co/datasets/huggingface/badges/resolve/main/paper-page-sm-dark.svg)](https://huggingface.co/papers/2509.23040)
+- `delaybind_core/`：V08 核心及 API、存储、判分、离线重放。
+- `data/test/filtered_seed4_128_refresh_v08/`：最新冻结的 128 题，每题 50 篇文档，以及来源记录、筛选决策和替换映射。
+- `models/Qwen3.5-9B-tokenizer/`：切块和预算计算所用 tokenizer。
+- `configs/ultimate/`：V08 和完整上下文直接回答的运行配置。
+- `scripts/ultimate/run_experiment.py`：V08 批量运行；`run_direct_raw_context.py`：完整上下文直接回答。
+- `scripts/verify_v08.py`：独立离线核验当前题集、筛选记录、两批结果及 V08 轨迹。
+- `tests/`：当前功能测试。JSON、确认绑定等早期阶段引入的功能已纳入 V08，测试按功能命名。
+- `results/ultimate/`、`reports/`：最新题集的两次评测和题集构建依据。
 
-## News
-- [Apr 2026] Added [`.claude/`](.claude/CLAUDE.md) AI-assisted development support with skill files for algorithm, reward, training, evaluation, and task extension 🤖.
-- [Apr 2026] Our [Project Page](https://syr-cn.github.io/ReMemR1/) is now live 🌐.
-- [Feb 2026] Our Checkpoint has been released on [Huggingface🤗](https://huggingface.co/yrshi/ReMemR1-7B) 🎉.
-- [Jan 2026] Our paper get accepted by [ICLR 2026](https://openreview.net/forum?id=1cymflI2Lh) 🎉🎉🎉
-- [Jan 2026] Nvidia propose [GDPO](https://arxiv.org/abs/2601.05242), which shares the same design logic as our multi-level reward aggregation
-- [Sep 2025] Our paper is released on [Huggingface](https://huggingface.co/papers/2509.23040) and [Alphaxiv](https://www.alphaxiv.org/abs/2509.23040). Please upvote our paper if you like this work :)
+## 当前题集上的结果
 
-## Overview
+模型均为 **Qwen/Qwen3.5-9B**，SiliconFlow API，并发 8，temperature=0，top_p=0.95，seed=4，enable_thinking=false，输出上限 4096。
 
-- **Conceptual Example:** wheat gleaning in the field
+| 方式 | EM | F1 | OK / ERROR |
+| --- | ---: | ---: | ---: |
+| V08 | 112/128（87.50%） | 0.896425 | 125 / 3 |
+| 完整上下文直接回答 | 74/128（57.8125%） | 0.653487 | 128 / 0 |
 
-<p align="center">
-  <img width="600" alt="image" src="./conceptual_example.png" />
-</p>
+[最新题集](data/test/filtered_seed4_128_refresh_v08/README.md) · [V08 测试报告](reports/ultimate/v08_refreshed_benchmark/README.md) · [直接回答报告](reports/ultimate/direct_raw_refreshed_full128_t0/README.md) · [清理核验](reports/v08_cleanup/README.md)
 
-- Q1: How we address the constraints in linear doc scan?
-- A1: We introduce **Callback Mechanism** to allow non-linear memory re-visit.
+这些是清理前已完成的模型评测结果。清理后进行了离线验证，没有再次调用模型跑 128 题；结果目录内的历史代码 manifest 保持原样。核心提示词、子问题运行、事实/记忆协议和答案判分函数保持原有内容，具体文件及函数核对记录见清理报告。
 
-<p align="center">
-  <img width="600" alt="image" src="./teaser.png" />
-</p>
+## 安装与离线检查
 
-<p align="center">
-  <img width="600" alt="image" src="./framework.png" />
-</p>
-
-- Q2: How we precisely reward callback/update behaviors?
-- A2: We introduce Multi-Level Rewarding, aggregated at advantage level.
-
-<p align="center">
-  <img width="600" alt="image" src="./reward_design.png" />
-</p>
-
-
-## Installation
+Python 3.11+。已有 `.venv` 可继续使用；新环境安装：
 
 ```bash
-conda create -n rememr1 python=3.11
-conda activate rememr1
-pip install httpx==0.23.1 aiohttp -U ray[serve,default] vllm
-
-pip install nltk pyyaml beautifulsoup4 html2text wonderwords tenacity fire
-pip install vllm==0.9 --index-url https://download.pytorch.org/whl/cu126
-pip install "sglang==0.4.6"
-pip install hydra-core accelerate tensordict torchdata wandb "tensordict<=0.6.2"
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[test,tokenizer_json]'
+.venv/bin/python -m pytest -q
+.venv/bin/python scripts/verify_v08.py
+.venv/bin/python scripts/ultimate/run_direct_raw_context.py \
+  --config configs/ultimate/direct_raw_refreshed_full128_t0_r1.json --prepare-only
 ```
 
-## Data Processing
+以上核验不需要 API 密钥，不发模型请求。
 
-**Trianing Data:**
-This research use the same training data as [MemAgent](https://github.com/BytedTsinghua-SIA/MemAgent).
-The data files are publicly available, and can be downloaded from [huggingface](https://huggingface.co/datasets/BytedTsinghua-SIA/hotpotqa/tree/main).
-After the download is finished, put `hotpotqa_train_32k.parquet` and `hotpotqa_dev.parquet` under `data/train/`.
+## 后续运行
 
-**Data for Evaluation:**
-The data for evaluation is sourced from HotpotQA and 2WikiMultiHopQA.
-To process the data for long-context QA, simply run:
-```bash
-bash scripts/0_run_data_process.sh
-```
-
-## Training
-
-### Prepare for Multi-Node Training
-
-You may skip this step if you only want to start a single-node trianing.
-
-To start multi-node training, you should first ray servers on the head and worker nodes.
-```bash
-# head node
-ray start --head --dashboard-host=0.0.0.0
-```
+V08 配置入口为 `configs/ultimate/v08_refreshed_benchmark_full128_r1.json`。
+每次新运行先复制配置并修改 `experiment_id` 和 `output_dir`；现有输出目录已有结果，运行器会拒绝覆盖。随后执行：
 
 ```bash
-# worker node
-ray start --address=<head_node_address>
-```
-More references can be found in ray's documentation [here](https://verl.readthedocs.io/en/latest/start/multinode.html).
-
-### Start the Training
-
-After all the nodes are ready (or you prefer single-node training), the training can be launched via:
-```bash
-bash scripts/1_run_train_ReMemR1_3B.sh
-bash scripts/1_run_train_ReMemR1_7B.sh
+.venv/bin/python scripts/ultimate/run_experiment.py \
+  --config configs/ultimate/v08_next_run.json --expected-samples 128
 ```
 
-You might adjust the `N_NODE` variable to match your number of devices.
+直接回答使用对应配置副本及 `scripts/ultimate/run_direct_raw_context.py --config <配置路径>`。API 密钥通过隐藏输入或 `MODEL_API_KEY` 环境变量提供，不写入配置。
 
-## Evaluation
+`V5Runner`、`v5_predicted` 等保留标识用于现有轨迹和存储格式；当前入口只运行 V08 子问题流程。
 
-Once the training is converged, use `scripts/merge_ckpt.sh` to merge the checkpoints before evaluation.
-For example,
-```bash
-bash scripts/merge_ckpt.sh "results/memory_agent/ReMemR1_3B/global_step_200/actor"
-```
-This will automatically put the merged checkpoint into `results/memory_agent/ReMemR1_3B/global_step_200/actor/hf_ckpt`.
+## 许可
 
-Once the checkpoint merging is done, run the below script for evaluation:
-```bash
-bash scripts/2_run_eval_ReMemR1.sh
-```
-
-## Licensing
-
-This project is licensed under the MIT License.
-It includes components from [MemAgent](https://github.com/BytedTsinghua-SIA/MemAgent), licensed under the Apache License 2.0. Thanks for their awesome work!
-
-## V5 Design and Implementation
-
-The completed V5.1 protocol-v4 experiment on 128 seed-4 2Wiki questions (50 documents each)
-is archived with **52.34% EM and 59.21% F1**. See the
-[report](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/REPORT.md),
-[all 128 question trajectories](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/TRAJECTORIES.md),
-and [artifact guide](results/v51-2wiki50-seed4-full128-node199-protocol-v4-retry5/README.md).
-This is a standalone evaluation of the current V5.1 runtime; it is not an exact reproduction of the paper's main experiment.
-
-The default V5.1 runner uses a high-level planning/memory agent and a low-level
-reading/deferred-review agent, natural-language subqueries, and source-fact memory.
-ReMemR1-style `input`/`context` records can be passed directly, without preparing a
-Manifest. See [`SUBQUERY_RUNTIME.md`](SUBQUERY_RUNTIME.md) for the current plan,
-reading protocol, state transitions, and [`configs/subqueries_smoke.json`](configs/subqueries_smoke.json)
-for a streaming experiment. Historical graph experiments explicitly select
-`plan_format="graph"`.
-
-The complete V5 specification, terminology, module mapping, runtime state
-machine, 2Wiki evaluation protocol, training plan, reproducibility rules, and
-the decisions consolidated from the 208-question design review are documented
-in [`V5_DESIGN_AND_IMPLEMENTATION.md`](V5_DESIGN_AND_IMPLEMENTATION.md).
-The executable Direct/V5/Oracle/no-DEFER evaluation matrix and artifact format
-are documented in [`EXPERIMENTS.md`](EXPERIMENTS.md).
-For a first Direct-only run, use [`configs/direct_only.json`](configs/direct_only.json).
-
-## AI-Assisted Development
-
-This project includes a `.claude/` directory with structured guidance for AI coding agents (Claude Code, Codex, etc.):
-
-- **`.claude/CLAUDE.md`** — Project overview, architecture, key abstractions, and coding conventions
-- **`.claude/skills/modify-algorithm.md`** — Guide for modifying the MemoryAgent and callback mechanism
-- **`.claude/skills/modify-reward.md`** — Guide for modifying the multi-level reward system
-- **`.claude/skills/run-training.md`** — Guide for configuring and launching training runs
-- **`.claude/skills/run-evaluation.md`** — Guide for running evaluation and interpreting results
-- **`.claude/skills/add-new-task.md`** — Guide for adding new tasks and datasets
-
-These files help AI agents understand the codebase structure and make targeted modifications without extensive context exploration.
-
-## Citation
-
-```latex
-@article{rememr1,
-  author       = {Yaorui Shi and
-                  Yuxin Chen and
-                  Siyuan Wang and
-                  Sihang Li and
-                  Hengxing Cai and
-                  Qi Gu and
-                  Xiang Wang and
-                  An Zhang},
-  title        = {Look Back to Reason Forward: Revisitable Memory for Long-Context {LLM}
-                  Agents},
-  journal      = {CoRR},
-  volume       = {abs/2509.23040},
-  year         = {2025},
-  eprinttype    = {arXiv},
-  eprint       = {2509.23040},
-}
-```
+本项目使用 [MIT License](LICENSE)。继承代码的 Apache 许可与声明保存在 [THIRD_PARTY](THIRD_PARTY)。
