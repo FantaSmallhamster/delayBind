@@ -318,33 +318,42 @@ def _validate_memory_recheck(response: MemoryUpdate,
     return checked
 
 
-def _reread_source_context(archive: RawArchive, source_refs: set[str], *, stage: str,
-                           log: Callable[[str, dict[str, Any]], None]) -> tuple[str, set[str]]:
-    """Fetch each target sentence plus its adjacent sentence units."""
+def _source_context_text(archive: RawArchive, source_refs: set[str]) -> tuple[str, set[str], list[dict[str, str]]]:
+    """Render deduplicated source neighborhoods without emitting runtime events."""
     entries: dict[str, Any] = {}
     target_refs: set[str] = set()
+    failures: list[dict[str, str]] = []
     for source_ref in sorted(source_refs):
         try:
             context = archive.fetch_sentence_context(source_ref, neighborhood=1, same_document=True)
         except (FutureSourceAccessError, KeyError, ValueError) as exc:
-            log("RAW_SOURCE_RECHECK_FAILED", {"stage": stage, "source_ref": source_ref,
-                                                "error": str(exc)})
+            failures.append({"source_ref": source_ref, "error": str(exc)})
             continue
         target_refs.add(source_ref)
         for entry in context:
             entries[entry.source_ref] = entry
     ordered = sorted(entries.values(), key=lambda entry: entry.stream_position)
-    log("RAW_SOURCE_RECHECKED", {
-        "stage": stage,
-        "target_refs": sorted(target_refs),
-        "context_refs": [entry.source_ref for entry in ordered],
-        "neighborhood": 1,
-    })
     lines = []
     for entry in ordered:
         role = "TARGET" if entry.source_ref in target_refs else "NEIGHBOR"
         lines.append(f"[{role}] {entry.source_ref} | {entry.title} | sentence={entry.sentence_id} | {entry.text}")
-    return "\n".join(lines), set(entries)
+    return "\n".join(lines), set(entries), failures
+
+
+def _reread_source_context(archive: RawArchive, source_refs: set[str], *, stage: str,
+                           log: Callable[[str, dict[str, Any]], None]) -> tuple[str, set[str]]:
+    """Fetch each target sentence plus its adjacent sentence units."""
+    text, context_refs, failures = _source_context_text(archive, source_refs)
+    for failure in failures:
+        log("RAW_SOURCE_RECHECK_FAILED", {"stage": stage, **failure})
+    target_refs = sorted(source_refs - {failure["source_ref"] for failure in failures})
+    log("RAW_SOURCE_RECHECKED", {
+        "stage": stage,
+        "target_refs": target_refs,
+        "context_refs": sorted(context_refs),
+        "neighborhood": 1,
+    })
+    return text, context_refs
 
 
 async def run_subqueries(
@@ -679,6 +688,11 @@ async def run_subqueries(
                 (check.query_id, check.fact_id) for check in grounded.checks.checks
                 if check.verdict in {"SUPPORTED", "SOURCE_DIFF"}
             }
+            runtime.record_source_assessments(
+                grounded.checks.checks,
+                scope_keys={qid: scope.snapshot_key for qid, scope in evidence.query_scopes.items()},
+                window_index=windows,
+            )
             log("MEMORY_VERIFY_COMPLETED", {
                 "mode": "joint_source_memory",
                 "snapshot_keys": {
@@ -709,6 +723,11 @@ async def run_subqueries(
                 (check.query_id, check.fact_id) for check in source_checks
                 if check.verdict in {"SUPPORTED", "SOURCE_DIFF"}
             }
+            runtime.record_source_assessments(
+                source_checks,
+                scope_keys={qid: scope.snapshot_key for qid, scope in evidence.query_scopes.items()},
+                window_index=windows,
+            )
             for rejected in checked.rejected_lines:
                 log("MEMORY_SOURCE_CHECK_REJECTED", rejected)
             log("MEMORY_VERIFY_COMPLETED", {
@@ -1024,27 +1043,70 @@ async def run_subqueries(
     final_format = config.answer_format
     if final_format == "auto":
         final_format = "boxed" if sample.context is not None else "json"
-    pack = runtime.evidence_pack()
+    pack = runtime.final_evidence_pack(supplemental_fact_ids=set(), hint_indexes=set())
     try:
-        final_memory = memory_text(final=True)
-        # Re-read only the final evidence chain.  Each cited sentence is
-        # accompanied by its adjacent sentence units so ANSWER can resolve
-        # pronouns, identity and relation direction against the raw text.
-        support_fact_ids = set()
-        for execution in runtime.state.executions.values():
-            if execution.status == "RESOLVED":
-                support_fact_ids.update(execution.support_fact_ids)
-        final_source_refs: set[str] = set()
-        for fact in pack["facts"]:
-            if fact.get("fact_id") not in support_fact_ids:
+        # Start with all currently accepted, unbound context and saved hints.
+        # Trim only these non-proof sections if the complete ANSWER request is
+        # over budget; the confirmed result chain is never silently removed.
+        seed = runtime.final_evidence_pack()
+        supplemental_ids = list(seed["available_supplemental_fact_ids"])
+        hint_indexes = list(seed["available_hint_indexes"])
+        trimmed_supplemental: list[str] = []
+        trimmed_hints: list[int] = []
+        while True:
+            pack = runtime.final_evidence_pack(
+                supplemental_fact_ids=set(supplemental_ids),
+                hint_indexes=set(hint_indexes),
+            )
+            final_memory = runtime.render_final_evidence_pack(pack)
+            final_source_refs = set(pack["source_refs"])
+            candidate_raw_context, _, _ = _source_context_text(archive, final_source_refs)
+            candidate_prompt = final_answer_prompt(
+                sample.question, final_memory, answer_format=final_format,
+                raw_context=candidate_raw_context, hints=pack["hints"],
+            )
+            request_size = measure(candidate_prompt)
+            if memory_limit is None or request_size <= memory_limit:
+                break
+            if supplemental_ids:
+                trimmed_supplemental.append(supplemental_ids.pop())
                 continue
-            final_source_refs.update(fact.get("source_refs", []))
+            if hint_indexes:
+                trimmed_hints.append(hint_indexes.pop())
+                continue
+            log("FINAL_EVIDENCE_BUDGET_EXCEEDED", {
+                "size": request_size, "limit": memory_limit, "unit": unit,
+                "confirmed_results": len(pack["results"]),
+                "confirmed_facts": len(pack["confirmed_facts"]),
+            })
+            raise MemoryBudgetExceeded("FINAL_EVIDENCE_REQUEST_BUDGET")
+
         raw_context, _ = _reread_source_context(archive, final_source_refs, stage="ANSWER", log=log)
+        answer_prompt = final_answer_prompt(
+            sample.question, final_memory, answer_format=final_format,
+            raw_context=raw_context, hints=pack["hints"],
+        )
+        request_size = measure(answer_prompt)
+        log("FINAL_EVIDENCE_PACK_BUILT", {
+            "results": len(pack["results"]),
+            "confirmed_facts": len(pack["confirmed_facts"]),
+            "supplemental_facts": len(pack["supplemental_context"]),
+            "hints": len(pack["hints"]),
+            "raw_sources": len(pack["raw_sources"]),
+            "rejected_links": pack["rejected_links"],
+            "trimmed_supplemental_fact_ids": trimmed_supplemental,
+            "trimmed_hint_indexes": trimmed_hints,
+        })
+        log("FINAL_ANSWER_REQUEST_MEASURED", {
+            "size": request_size, "unit": unit, "limit": memory_limit,
+        })
+        if memory_limit is not None and request_size > memory_limit:
+            raise MemoryBudgetExceeded("FINAL_EVIDENCE_REQUEST_BUDGET")
+
         def final(raw: str) -> AnswerResponse:
             nonlocal raw_answer
             parsed = parse_final_answer(raw, final_format)
-            permitted = {ref for fact in pack["facts"] for ref in fact["source_refs"]}
-            permitted.update(ref for hint in runtime.state.hints for ref in hint.get("source_refs", []))
+            permitted = set(pack["source_refs"])
             if parsed.source_refs:
                 sources = VisibleSources(archive.entry(ref).model_dump(mode="json") for ref in sorted(permitted))
                 parsed.source_refs = list(dict.fromkeys(ref for value in parsed.source_refs for ref in sources.resolve(value)))
@@ -1053,9 +1115,7 @@ async def run_subqueries(
             raw_answer = raw
             return parsed
         answer = await low.call(
-            "ANSWER", final_answer_prompt(sample.question, final_memory,
-                                          answer_format=final_format, raw_context=raw_context,
-                                          hints=runtime.state.hints),
+            "ANSWER", answer_prompt,
             parser=final,
             schema=AnswerResponse.model_json_schema() if final_format == "json" else None,
         )
@@ -1074,7 +1134,7 @@ async def run_subqueries(
         ]
         evidence_texts.extend(
             str(hint.get("text", ""))
-            for hint in runtime.state.hints
+            for hint in pack.get("hints", [])
             if hint.get("text")
         )
         normalized_answer = post_process_answer(

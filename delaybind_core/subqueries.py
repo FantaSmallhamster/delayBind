@@ -10,11 +10,12 @@ from uuid import uuid4
 from pydantic import Field
 
 from .archive import FutureSourceAccessError, RawArchive
-from .fact_protocol import BindingProposal, FactUpdate
+from .fact_protocol import BindingProposal, FactUpdate, SourceCheck
 from .plan_validation import QUERY_VARIABLE, ensure_valid_plan
 from .schema import QueryPlan, RuntimeEvent, RuntimeStatus, StrictModel, Subquery
 from .storage import SQLiteEventStore
-from .working_memory import BindingLink, FactNode, FactUse, QueryExecution, render_fact_memory
+from .working_memory import (BindingLink, FactNode, FactUse, QueryExecution,
+                             SourceAssessment, render_fact_memory)
 from .source_refs import VisibleSources
 
 
@@ -24,6 +25,7 @@ class SubqueryState(StrictModel):
     uses: dict[str, dict[str, FactUse]] = Field(default_factory=dict)
     executions: dict[str, QueryExecution] = Field(default_factory=dict)
     links: dict[str, BindingLink] = Field(default_factory=dict)
+    source_assessments: dict[str, SourceAssessment] = Field(default_factory=dict)
     active_fact_ids: list[str] = Field(default_factory=list)
     # Historical low-level verdicts, retained only for old event/snapshot replay.
     review_results: dict[str, str] = Field(default_factory=dict)
@@ -119,6 +121,9 @@ class SubqueryState(StrictModel):
             self.links[link.link_id] = link
         elif event.event_type == "BINDING_LINK_REMOVED":
             self.links.pop(payload["link_id"], None)
+        elif event.event_type == "SOURCE_ASSESSED":
+            assessment = SourceAssessment.model_validate(payload["assessment"])
+            self.source_assessments[assessment.assessment_id] = assessment
         elif event.event_type == "ACTIVE_VIEW_UPDATED":
             self.active_fact_ids = list(payload["fact_ids"])
         elif event.event_type == "CANDIDATE_REVIEWED":
@@ -157,6 +162,73 @@ class SubqueryRuntime:
     def _set_query(self, query_id: str, **changes: Any) -> None:
         execution = self.state.executions[query_id].model_copy(update=changes)
         self.emit("QUERY_STATE_UPDATED", {"query_id": query_id, "state": execution.model_dump(mode="json")})
+
+    @staticmethod
+    def _source_version_payload(entry: Any) -> dict[str, Any]:
+        return {
+            "source_ref": entry.source_ref,
+            "title": entry.title,
+            "sentence_id": entry.sentence_id,
+            "stream_position": entry.stream_position,
+            "text": entry.text,
+        }
+
+    def _source_version(self, refs: list[str]) -> str:
+        payload = [self._source_version_payload(self.archive.entry(ref)) for ref in sorted(set(refs))]
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def _source_versions(self, refs: list[str]) -> dict[str, str]:
+        return {ref: self._source_version([ref]) for ref in sorted(set(refs))}
+
+    def record_source_assessments(self, checks: list[SourceCheck] | tuple[SourceCheck, ...], *,
+                                  scope_keys: dict[str, str], window_index: int) -> None:
+        """Persist source checks without mutating the fact text or its hash ID."""
+        pending: list[SourceAssessment] = []
+        for check in checks:
+            if check.query_id not in self.state.executions or check.fact_id not in self.state.facts:
+                continue
+            execution = self.state.executions[check.query_id]
+            refs = list(dict.fromkeys(check.source_refs))
+            if check.verdict != "UNRESOLVED" and not refs:
+                continue
+            if refs and not all(self.archive.contains(ref) for ref in refs):
+                continue
+            context_version = self._source_version(refs)
+            data = {
+                "query_id": check.query_id,
+                "fact_id": check.fact_id,
+                "verdict": check.verdict,
+                "source_refs": refs,
+                "note": check.note,
+                "context_version": context_version,
+                "scope_key": scope_keys.get(check.query_id, ""),
+                "query_version": execution.version,
+                "binding_version": execution.binding_version,
+                "observed_window": window_index,
+            }
+            identity = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+            pending.append(SourceAssessment(assessment_id="A" + identity, **data))
+        for assessment in pending:
+            prior = self.state.source_assessments.get(assessment.assessment_id)
+            if prior is None:
+                self.emit("SOURCE_ASSESSED", {"assessment": assessment.model_dump(mode="json")})
+
+    def current_assessments(self, fact_id: str, *, query_id: str | None = None) -> list[SourceAssessment]:
+        values = []
+        for assessment in self.state.source_assessments.values():
+            if assessment.fact_id != fact_id or query_id is not None and assessment.query_id != query_id:
+                continue
+            execution = self.state.executions.get(assessment.query_id)
+            if not execution or assessment.query_version != execution.version \
+                    or assessment.binding_version != execution.binding_version:
+                continue
+            try:
+                if assessment.context_version != self._source_version(assessment.source_refs):
+                    continue
+            except FutureSourceAccessError:
+                continue
+            values.append(assessment)
+        return sorted(values, key=lambda item: (item.query_id, item.observed_window, item.assessment_id))
 
     def dependency_ids(self, query_id: str) -> set[str]:
         queries = {query.id: query for query in self.state.plan.queries}
@@ -315,6 +387,10 @@ class SubqueryRuntime:
             for dependency in query.depends_on
             if self.state.executions[dependency].status == "RESOLVED"
         }
+        source_refs = sorted({
+            ref for fact_id in execution.support_fact_ids
+            for ref in self.state.facts[fact_id].source_refs
+        })
         data = {
             "kind": "CONFIRMED_BINDING",
             "query_id": query_id,
@@ -323,10 +399,8 @@ class SubqueryRuntime:
             "rendered_query": self.state.query_projection(query_id)["rendered_query"],
             "effective_upstream_bindings": upstream_bindings,
             "support_fact_ids": sorted(execution.support_fact_ids),
-            "source_refs": sorted({
-                ref for fact_id in execution.support_fact_ids
-                for ref in self.state.facts[fact_id].source_refs
-            }),
+            "source_refs": source_refs,
+            "source_versions": self._source_versions(source_refs),
             "upstream_query_ids": list(query.depends_on),
             "query_version": execution.version,
             "binding_version": execution.binding_version,
@@ -515,6 +589,174 @@ class SubqueryRuntime:
 
     def evidence_pack(self) -> dict[str, Any]:
         return self.state.memory()
+
+    def _effective_confirmed_links(self) -> tuple[list[BindingLink], list[dict[str, str]]]:
+        accepted = self.state.accepted_ids()
+        effective: list[BindingLink] = []
+        rejected: list[dict[str, str]] = []
+        order = {query.id: index for index, query in enumerate(self.state.plan.queries)}
+        for link in self.state.links.values():
+            reason = None
+            execution = self.state.executions.get(link.query_id)
+            if link.kind != "CONFIRMED_BINDING":
+                reason = "NOT_CONFIRMED"
+            elif not execution or execution.status != "RESOLVED":
+                reason = "QUERY_NOT_RESOLVED"
+            elif (link.query_version, link.binding_version, link.resolved_version) != (
+                    execution.version, execution.binding_version, execution.resolved_version):
+                reason = "STALE_BINDING_VERSION"
+            elif sorted(link.support_fact_ids) != sorted(execution.support_fact_ids):
+                reason = "STALE_SUPPORT"
+            elif not set(link.support_fact_ids) <= accepted:
+                reason = "SUPPORT_NOT_CURRENTLY_ACCEPTED"
+            else:
+                current_refs = sorted({
+                    ref for fact_id in link.support_fact_ids
+                    for ref in self.state.facts[fact_id].source_refs
+                })
+                if current_refs != sorted(link.source_refs):
+                    reason = "SOURCE_SET_CHANGED"
+                elif not link.source_versions:
+                    reason = "SOURCE_VERSION_MISSING"
+                else:
+                    try:
+                        current_versions = self._source_versions(current_refs)
+                    except FutureSourceAccessError:
+                        reason = "SOURCE_NOT_READABLE"
+                    else:
+                        if current_versions != link.source_versions:
+                            reason = "SOURCE_VERSION_CHANGED"
+            if reason is None:
+                effective.append(link)
+            else:
+                rejected.append({"link_id": link.link_id, "query_id": link.query_id, "reason": reason})
+        effective.sort(key=lambda link: (order.get(link.query_id, len(order)), link.link_id))
+        return effective, rejected
+
+    def final_evidence_pack(self, *, supplemental_fact_ids: set[str] | None = None,
+                            hint_indexes: set[int] | None = None) -> dict[str, Any]:
+        """Build a read-only answer view from current binding and source versions."""
+        links, rejected_links = self._effective_confirmed_links()
+        confirmed_ids = {fact_id for link in links for fact_id in link.support_fact_ids}
+        accepted_ids = self.state.accepted_ids()
+        available_supplemental = accepted_ids - confirmed_ids
+        if supplemental_fact_ids is None:
+            supplemental_ids = available_supplemental
+        else:
+            supplemental_ids = available_supplemental & supplemental_fact_ids
+        included_ids = confirmed_ids | supplemental_ids
+
+        results = [{
+            "query_id": link.query_id,
+            "rendered_query": link.rendered_query,
+            "variable": link.variable,
+            "value": link.value,
+            "effective_upstream_bindings": link.effective_upstream_bindings,
+            "support_fact_ids": link.support_fact_ids,
+            "source_refs": link.source_refs,
+            "query_version": link.query_version,
+            "binding_version": link.binding_version,
+            "resolved_version": link.resolved_version,
+        } for link in links]
+
+        fact_views = []
+        supplemental = []
+        relevant_assessments: dict[str, SourceAssessment] = {}
+        for fact_id in self.state.facts:
+            if fact_id not in included_ids:
+                continue
+            fact = self.state.facts[fact_id]
+            uses = sorted(
+                query_id for query_id, by_fact in self.state.uses.items()
+                if fact_id in by_fact and by_fact[fact_id].status == "ACCEPTED"
+                and by_fact[fact_id].query_version == self.state.executions[query_id].version
+                and by_fact[fact_id].binding_version == self.state.executions[query_id].binding_version
+            )
+            assessments = self.current_assessments(fact_id)
+            relevant_assessments.update((item.assessment_id, item) for item in assessments)
+            verdicts = {item.verdict for item in assessments}
+            fidelity = ("SOURCE_DIFF" if "SOURCE_DIFF" in verdicts else
+                        "SUPPORTED" if "SUPPORTED" in verdicts else
+                        "UNRESOLVED" if "UNRESOLVED" in verdicts else "UNCHECKED")
+            view = {
+                **fact.model_dump(mode="json"),
+                "query_ids": uses,
+                "fidelity": fidelity,
+                "assessment_ids": [item.assessment_id for item in assessments],
+                "proof_status": "CONFIRMED_SUPPORT" if fact_id in confirmed_ids else "SUPPLEMENTAL_NOT_BOUND",
+            }
+            (fact_views if fact_id in confirmed_ids else supplemental).append(view)
+
+        selected_hints = [
+            dict(hint) for index, hint in enumerate(self.state.hints)
+            if hint_indexes is None or index in hint_indexes
+        ]
+        source_refs = {
+            ref for fact in [*fact_views, *supplemental] for ref in fact["source_refs"]
+        }
+        source_refs.update(
+            ref for assessment in relevant_assessments.values() for ref in assessment.source_refs
+        )
+        source_refs.update(ref for hint in selected_hints for ref in hint.get("source_refs", []))
+        raw_sources = []
+        for ref in sorted(source_refs):
+            try:
+                raw_sources.append(self._source_version_payload(self.archive.entry(ref)))
+            except FutureSourceAccessError:
+                rejected_links.append({"link_id": "", "query_id": "", "reason": f"SOURCE_NOT_READABLE:{ref}"})
+
+        return {
+            # Backward-compatible fields retained for metrics and result readers.
+            "facts": [self.state.facts[fid].model_dump(mode="json") for fid in self.state.facts if fid in included_ids],
+            "links": [link.model_dump(mode="json") for link in links],
+            "results": results,
+            "confirmed_facts": fact_views,
+            "supplemental_context": supplemental,
+            "hints": selected_hints,
+            "source_assessments": [item.model_dump(mode="json") for item in relevant_assessments.values()],
+            "raw_sources": raw_sources,
+            "source_refs": sorted(source_refs),
+            "rejected_links": rejected_links,
+            "available_supplemental_fact_ids": [fid for fid in self.state.facts if fid in available_supplemental],
+            "available_hint_indexes": list(range(len(self.state.hints))),
+        }
+
+    @staticmethod
+    def render_final_evidence_pack(pack: dict[str, Any]) -> str:
+        lines = ["CURRENT EFFECTIVE RESULTS:"]
+        if pack["results"]:
+            for result in pack["results"]:
+                lines.append(
+                    f"{result['query_id']} | {result['rendered_query']} | "
+                    f"{result['variable']} = {json.dumps(result['value'], ensure_ascii=False)} | "
+                    f"support={','.join(result['support_fact_ids'])} | "
+                    f"sources={','.join(result['source_refs'])} | "
+                    f"inputs={json.dumps(result['effective_upstream_bindings'], ensure_ascii=False, sort_keys=True)} | "
+                    f"version={result['query_version']}:{result['binding_version']}:{result['resolved_version']}"
+                )
+        else:
+            lines.append("NONE")
+        lines.append("\nCONFIRMED SUPPORT FACTS:")
+        if pack["confirmed_facts"]:
+            for fact in pack["confirmed_facts"]:
+                warning = " SAVED_WORDING_INACCURATE_USE_RAW_SOURCE" if fact["fidelity"] == "SOURCE_DIFF" else ""
+                lines.append(
+                    f"{fact['fact_id']} | fidelity={fact['fidelity']}{warning} | "
+                    f"sources={','.join(fact['source_refs'])} | {fact['text']}"
+                )
+        else:
+            lines.append("NONE")
+        lines.append("\nSUPPLEMENTAL CONTEXT (NOT BINDING PROOF):")
+        if pack["supplemental_context"]:
+            for fact in pack["supplemental_context"]:
+                warning = " SAVED_WORDING_INACCURATE_USE_RAW_SOURCE" if fact["fidelity"] == "SOURCE_DIFF" else ""
+                lines.append(
+                    f"{fact['fact_id']} | fidelity={fact['fidelity']}{warning} | "
+                    f"queries={','.join(fact['query_ids'])} | sources={','.join(fact['source_refs'])} | {fact['text']}"
+                )
+        else:
+            lines.append("NONE")
+        return "\n".join(lines)
 
     def memory_text(self, *, visible_only: bool = True, exclude_fact_ids: set[str] | None = None) -> str:
         memory = self.state.memory(visible_only=visible_only, exclude_fact_ids=exclude_fact_ids)

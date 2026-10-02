@@ -57,11 +57,29 @@ class BindingLink(StrictModel):
     effective_upstream_bindings: dict[str, Any] = Field(default_factory=dict)
     support_fact_ids: list[str] = Field(default_factory=list)
     source_refs: list[str] = Field(default_factory=list)
+    source_versions: dict[str, str] = Field(default_factory=dict)
     upstream_query_ids: list[str] = Field(default_factory=list)
     # Pre-V07 replay compatibility only.
     upstream_fact_ids: list[str] = Field(default_factory=list)
     downstream_fact_id: str | None = None
     upstream_query_id: str | None = None
+
+
+class SourceAssessment(StrictModel):
+    """Versioned fidelity judgment for one fact use and its immutable sources."""
+
+    assessment_id: str
+    query_id: str
+    fact_id: str
+    verdict: Literal["SUPPORTED", "SOURCE_DIFF", "UNRESOLVED"]
+    source_refs: list[str] = Field(default_factory=list)
+    # Diagnostic only. This text is never promoted to evidence.
+    note: str = ""
+    context_version: str
+    scope_key: str
+    query_version: int
+    binding_version: int
+    observed_window: int
 
 
 class QueryExecution(StrictModel):

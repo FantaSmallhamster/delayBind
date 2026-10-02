@@ -629,13 +629,18 @@ def final_answer_prompt(question: str, memory: str, *, answer_format: str,
         "json": 'Return JSON with answer, answer_type and source_refs, using the existing AnswerResponse contract.',
     }[answer_format]
     return f"""<ANSWER role=LOW version={VERSION}>
-Answer the original question using the current working memory. Perform the
+Answer the original question using the read-only Final Evidence Pack. Perform the
 necessary comparison, reasoning, synthesis or calculation. Unresolved subqueries
 do not prevent an attempt. Distinguish identities, dates and scope; do not treat
 missing evidence as an established fact. The original source recheck below is
 authoritative. TARGET rows are cited sentence units; NEIGHBOR rows are context
 only and must be used to check identity, relation direction, dates, negation and
-scope before answering.
+scope before answering. CURRENT EFFECTIVE RESULTS are version-checked bindings.
+CONFIRMED SUPPORT FACTS are their proof. SUPPLEMENTAL CONTEXT may help interpret
+the question but is explicitly not a completed binding or proof of a result.
+When a saved fact is marked SOURCE_DIFF, do not trust its saved wording; use the
+cited original source excerpt instead. Assessment notes are diagnostics and are
+never independent evidence.
 
 Return the minimal canonical entity at the granularity requested by the question.
 For a place-of-birth or place-of-death question, prefer the city or municipality;
@@ -684,7 +689,7 @@ asked "who is X's mother", the answer is X's parent (female), not X's daughter.
 For multi-hop relation questions (e.g. "who is the father of X's mother?"), trace
 each hop explicitly and verify the relation direction at each step.
 
-Use ONLY facts present in the working memory. Do not use historical knowledge,
+Use ONLY facts present in the Final Evidence Pack. Do not use historical knowledge,
 world knowledge, name-based inferences, or any information outside the working
 memory. Knowing a person's identity (e.g. their name) does NOT imply you know
 their attributes (nationality, occupation, workplace, birth/death dates, etc.);
@@ -712,7 +717,7 @@ unavailable.
 Question:
 {question}
 
-Working memory:
+Final Evidence Pack:
 {memory}
 
 Source-backed hints not yet attached to a specific query:
