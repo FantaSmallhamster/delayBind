@@ -70,8 +70,24 @@ class SubqueryState(StrictModel):
         if exclude_fact_ids:
             ids -= exclude_fact_ids
         facts = [fact.model_dump(mode="json") for fid, fact in self.facts.items() if fid in ids]
-        links = [link.model_dump(mode="json") for link in self.links.values()
-                 if link.downstream_fact_id in ids and set(link.upstream_fact_ids) <= ids]
+        links = []
+        for link in self.links.values():
+            if link.kind == "CONFIRMED_BINDING":
+                execution = self.executions.get(link.query_id)
+                effective = bool(
+                    execution and execution.status == "RESOLVED"
+                    and link.query_version == execution.version
+                    and link.binding_version == execution.binding_version
+                    and link.resolved_version == execution.resolved_version
+                    and set(link.support_fact_ids) <= ids
+                )
+            else:
+                # Replay compatibility for snapshots created before V07.
+                effective = bool(
+                    link.downstream_fact_id in ids and set(link.upstream_fact_ids) <= ids
+                )
+            if effective:
+                links.append(link.model_dump(mode="json"))
         return {"facts": facts, "links": links}
 
     def export(self) -> dict[str, Any]:
@@ -215,7 +231,6 @@ class SubqueryRuntime:
                       source_ref=fact.source_refs[0])
             if not defer:
                 committed.append(fact.fact_id)
-                self._connect(use)
         for hint in update.hints:
             if set(hint.source_refs) <= allowed_refs and all(self.archive.contains(ref) for ref in hint.source_refs):
                 fact = FactNode.create(hint.text, hint.source_refs, window_index)
@@ -278,27 +293,75 @@ class SubqueryRuntime:
                 "cross_window": prior.status == "CANDIDATE" and prior.observed_window < execution.activation_window,
                 "admission_mode": "RECALL_SELECTION", "source_verified": False,
             }, source_ref=fact.source_refs[0])
-            self._connect(use)
             admitted.append(fact.fact_id)
         return admitted
 
-    def _connect(self, use: FactUse) -> None:
-        query = next(query for query in self.state.plan.queries if query.id == use.query_id)
-        for dependency in query.depends_on:
-            upstream = next(query for query in self.state.plan.queries if query.id == dependency)
-            execution = self.state.executions[dependency]
-            if not execution.support_fact_ids:
+    def _remove_binding_links(self, query_ids: set[str], *, reason: str,
+                              include_dependents: bool = False) -> None:
+        for link_id, link in list(self.state.links.items()):
+            if link.query_id in query_ids or (include_dependents and set(link.upstream_query_ids) & query_ids):
+                self.emit("BINDING_LINK_REMOVED", {"link_id": link_id, "reason": reason})
+
+    def _record_confirmed_link(self, query_id: str) -> None:
+        """Publish only a successfully committed binding as an evidence relation."""
+        query = next(query for query in self.state.plan.queries if query.id == query_id)
+        execution = self.state.executions[query_id]
+        if execution.status != "RESOLVED" or not execution.support_fact_ids:
+            return
+        self._remove_binding_links({query_id}, reason="CONFIRMED_BINDING_REPLACED")
+        upstream_bindings = {
+            next(item for item in self.state.plan.queries if item.id == dependency).output:
+                self.state.executions[dependency].result
+            for dependency in query.depends_on
+            if self.state.executions[dependency].status == "RESOLVED"
+        }
+        data = {
+            "kind": "CONFIRMED_BINDING",
+            "query_id": query_id,
+            "variable": query.output,
+            "value": execution.result,
+            "rendered_query": self.state.query_projection(query_id)["rendered_query"],
+            "effective_upstream_bindings": upstream_bindings,
+            "support_fact_ids": sorted(execution.support_fact_ids),
+            "source_refs": sorted({
+                ref for fact_id in execution.support_fact_ids
+                for ref in self.state.facts[fact_id].source_refs
+            }),
+            "upstream_query_ids": list(query.depends_on),
+            "query_version": execution.version,
+            "binding_version": execution.binding_version,
+            "resolved_version": execution.resolved_version,
+        }
+        identity = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+        link = BindingLink(link_id=identity, **data)
+        self.emit("BINDING_LINK_CREATED", {"link": link.model_dump(mode="json")})
+
+    def _refresh_descendant_support(self, query_id: str, *, old: set[str], new: set[str]) -> None:
+        """Propagate an unchanged value's revised proof without reopening descendants."""
+        removed, added = old - new, new - old
+        if not removed and not added:
+            return
+        descendants = self.descendants(query_id)
+        for query in self.state.plan.queries:
+            if query.id not in descendants:
                 continue
-            data = {
-                "upstream_fact_ids": sorted(execution.support_fact_ids), "downstream_fact_id": use.fact_id,
-                "upstream_query_id": dependency, "query_id": use.query_id,
-                "variable": upstream.output, "value": execution.result,
-                "query_version": use.query_version, "binding_version": use.binding_version,
-            }
-            identity = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
-            if identity not in self.state.links:
-                link = BindingLink(link_id=identity, **data)
-                self.emit("BINDING_LINK_CREATED", {"link": link.model_dump(mode="json")})
+            execution = self.state.executions[query.id]
+            if execution.status != "RESOLVED":
+                continue
+            locally_accepted = self.state.accepted_ids(query.id)
+            removable = removed - locally_accepted
+            support = sorted((set(execution.support_fact_ids) - removable) | added)
+            if support == execution.support_fact_ids:
+                continue
+            self._set_query(query.id, support_fact_ids=support)
+            self.emit("DEPENDENT_SUPPORT_UPDATED", {
+                "query_id": query.id,
+                "upstream_query_id": query_id,
+                "removed_fact_ids": sorted(removable),
+                "added_fact_ids": sorted(added),
+                "supporting_fact_ids": support,
+            })
+            self._record_confirmed_link(query.id)
 
     def resolve_support(self, query_id: str, refs: list[str]) -> list[str]:
         allowed = self.state.accepted_ids(query_id)
@@ -353,7 +416,10 @@ class SubqueryRuntime:
                 raise ValueError("BIND cannot replace a resolved binding; use REBIND")
             if execution.result == proposal.value and execution.support_fact_ids == support:
                 return False
-            self.invalidate(self.descendants(query_id), reason="UPSTREAM_BINDING_CHANGED", window_index=window_index)
+            same_value = execution.result == proposal.value
+            old_support = set(execution.support_fact_ids)
+            if not same_value:
+                self.invalidate(self.descendants(query_id), reason="UPSTREAM_BINDING_CHANGED", window_index=window_index)
             for fact_id in set(execution.support_fact_ids) - set(support):
                 use = self.state.uses.get(query_id, {}).get(fact_id)
                 if use and use.status == "ACCEPTED":
@@ -366,6 +432,9 @@ class SubqueryRuntime:
         self.emit("QUERY_BOUND", {"query_id": query_id, "variable": query.output, "value": proposal.value,
                   "supporting_fact_ids": support, "window_index": window_index,
                   "resolved_version": execution.resolved_version + 1})
+        self._record_confirmed_link(query_id)
+        if execution.status == "RESOLVED" and same_value:
+            self._refresh_descendant_support(query_id, old=old_support, new=set(support))
         self._activate_ready(window_index=window_index, from_binding=True)
         return True
 
@@ -387,9 +456,7 @@ class SubqueryRuntime:
                     self.emit("FACT_USE_INVALIDATED", {"use": invalid.model_dump(mode="json"), "reason": reason})
             self._set_query(query_id, status="DORMANT", result=None, support_fact_ids=[], review_pending=False,
                             binding_version=execution.binding_version + 1, conflicts=[])
-        for link_id, link in list(self.state.links.items()):
-            if link.query_id in query_ids or link.upstream_query_id in query_ids:
-                self.emit("BINDING_LINK_REMOVED", {"link_id": link_id, "reason": reason})
+        self._remove_binding_links(query_ids, reason=reason, include_dependents=True)
         self._activations = [qid for qid in self._activations if qid not in query_ids]
 
     def patch_queries(self, patches: dict[str, dict[str, Any]], *, window_index: int) -> None:
@@ -430,9 +497,7 @@ class SubqueryRuntime:
         if set(fact_ids) & set(execution.support_fact_ids):
             self.invalidate(self.descendants(query_id), reason="UPSTREAM_SUPPORT_RETRACTED", window_index=window_index)
             self._set_query(query_id, result=None, support_fact_ids=[], status="ACTIVE", conflicts=[])
-        for link_id, link in list(self.state.links.items()):
-            if link.downstream_fact_id in fact_ids and link.query_id == query_id:
-                self.emit("BINDING_LINK_REMOVED", {"link_id": link_id, "reason": "FACT_RETRACTED"})
+            self._remove_binding_links({query_id}, reason="FACT_RETRACTED")
 
     def route_candidates(self, query_id: str, fact_ids: list[str], *, window_index: int = 0) -> None:
         if query_id not in self.state.executions or not set(fact_ids) <= self.state.facts.keys():

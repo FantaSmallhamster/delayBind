@@ -1,0 +1,194 @@
+{
+  "stage": "V07",
+  "status": "ONE_RUN_COMPLETE",
+  "candidate_run": "results/ultimate/v07_confirmed_links_full128_r1",
+  "parent_run": "results/ultimate/v06b_memory_json_full128_r1_retry3",
+  "candidate": {
+    "correct": 92,
+    "accuracy": 0.71875,
+    "f1": 0.7402615613553114,
+    "statuses": {
+      "OK": 127,
+      "ERROR": 1
+    },
+    "runtime_statuses": {
+      "ANSWERED": 127,
+      "ERROR": 1
+    },
+    "cost": {
+      "records": 892,
+      "cache_hits": 0,
+      "network_attempts": 892,
+      "retries": 18,
+      "failed_attempts": 18,
+      "input_tokens": 2319524,
+      "output_tokens": 361586,
+      "logical_calls": 874
+    },
+    "interfaces": {
+      "PLAN": {
+        "records": 128,
+        "cache_hits": 0,
+        "network_attempts": 128,
+        "retries": 0,
+        "failed_attempts": 0,
+        "input_tokens": 32686,
+        "output_tokens": 10754,
+        "logical_calls": 128
+      },
+      "UPDATE": {
+        "records": 246,
+        "cache_hits": 0,
+        "network_attempts": 246,
+        "retries": 1,
+        "failed_attempts": 1,
+        "input_tokens": 1321928,
+        "output_tokens": 51387,
+        "logical_calls": 245
+      },
+      "MEMORY_GROUNDED": {
+        "records": 311,
+        "cache_hits": 0,
+        "network_attempts": 311,
+        "retries": 6,
+        "failed_attempts": 6,
+        "input_tokens": 646049,
+        "output_tokens": 164364,
+        "logical_calls": 305
+      },
+      "ANSWER": {
+        "records": 144,
+        "cache_hits": 0,
+        "network_attempts": 144,
+        "retries": 11,
+        "failed_attempts": 11,
+        "input_tokens": 292818,
+        "output_tokens": 134003,
+        "logical_calls": 133
+      },
+      "RECALL": {
+        "records": 63,
+        "cache_hits": 0,
+        "network_attempts": 63,
+        "retries": 0,
+        "failed_attempts": 0,
+        "input_tokens": 26043,
+        "output_tokens": 1078,
+        "logical_calls": 63
+      }
+    },
+    "latency_p50_ms": 67080.38116642274,
+    "latency_p95_ms": 243401.36505221008,
+    "by_type": {
+      "bridge_comparison": {
+        "count": 24,
+        "correct": 18,
+        "f1": 0.75
+      },
+      "comparison": {
+        "count": 35,
+        "correct": 35,
+        "f1": 1.0
+      },
+      "compositional": {
+        "count": 53,
+        "correct": 26,
+        "f1": 0.5214734950584008
+      },
+      "inference": {
+        "count": 16,
+        "correct": 13,
+        "f1": 0.8822115384615384
+      }
+    },
+    "events": {
+      "AGENT_CALLED": 874,
+      "PLAN_CREATED": 128,
+      "QUERY_STATE_UPDATED": 738,
+      "QUERY_ACTIVATED": 329,
+      "MEMORY_VIEW_MEASURED": 731,
+      "UPDATE_JSON_RESPONSE_METADATA": 245,
+      "UPDATE_JSON_PARSED": 240,
+      "FACT_STORED": 541,
+      "FACT_COMMITTED": 232,
+      "PLAN_HINT_RECORDED": 262,
+      "ACTIVE_VIEW_UPDATED": 363,
+      "MEMORY_EVIDENCE_PREPARED": 363,
+      "MEMORY_GROUNDED_JSON_RESPONSE_METADATA": 305,
+      "MEMORY_VERIFY_COMPLETED": 302,
+      "BINDING_CONFLICT": 1,
+      "MEMORY_SOURCE_CHECK_REJECTED": 41,
+      "MEMORY_SOURCE_SCOPE_REJECTED": 147,
+      "QUERY_BOUND": 270,
+      "BINDING_LINK_CREATED": 270,
+      "DEFER_WORKSPACE_LOOKUP": 139,
+      "DEFER_BUCKET_EMPTY": 76,
+      "MEMORY_GROUNDED_JSON_REJECTED": 4,
+      "AGENT_RESPONSE_INVALID": 15,
+      "RAW_SOURCE_RECHECKED": 128,
+      "RUN_STATUS": 127,
+      "FACT_DEFERRED": 75,
+      "DEFER_CANDIDATES_SELECTED": 63,
+      "FACT_PROMOTED": 65,
+      "MEMORY_LINE_REJECTED": 21,
+      "UPDATE_JSON_REJECTED": 5,
+      "UPDATE_REPAIR_REQUESTED": 5,
+      "BINDING_HELD": 2,
+      "ANSWER_POST_PROCESSED": 5,
+      "UPDATE_LINE_REJECTED": 5,
+      "UPDATE_LINES_DROPPED": 4,
+      "RECALL_CONTEXT_IDS_IGNORED": 2,
+      "PROTOCOL_REPAIR_EXHAUSTED": 1,
+      "FACT_USE_INVALIDATED": 1,
+      "BINDING_LINK_REMOVED": 1
+    },
+    "errors": [
+      {
+        "sample_id": "dev_2261",
+        "error": "boxed answer missing"
+      }
+    ],
+    "update_protocol": {
+      "responses": 245,
+      "parsed_fact_rows": 320,
+      "hint_rows": 263,
+      "rejected_rows": 0,
+      "responses_without_rejected_rows": 244,
+      "forbidden_bindings": 0,
+      "unparseable_responses": 1
+    },
+    "replayed_states": 127,
+    "violations": []
+  },
+  "comparison": {
+    "correct_delta": -3,
+    "accuracy_delta": -0.0234375,
+    "f1_delta": -0.02231284340659334,
+    "gains": [
+      "dev_3890",
+      "dev_9742",
+      "dev_2020",
+      "dev_448",
+      "dev_7217",
+      "dev_4478"
+    ],
+    "losses": [
+      "dev_10616",
+      "dev_4865",
+      "dev_3133",
+      "dev_9193",
+      "dev_10872",
+      "dev_3343",
+      "dev_6782",
+      "dev_2261",
+      "dev_1240"
+    ]
+  },
+  "relation_audit": {
+    "confirmed_links": 270,
+    "candidate_links": 0,
+    "support_refreshes": 0,
+    "violations": []
+  },
+  "strict_stage_acceptance": "Not established: one fresh run was requested."
+}
