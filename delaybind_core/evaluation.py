@@ -95,6 +95,10 @@ class ExperimentConfig:
             enable_defer_callback=bool(runner_raw.get("enable_defer_callback", True)),
             memory_source_mode=str(runner_raw.get("memory_source_mode", "postverify")),
             memory_source_token_budget=int(runner_raw.get("memory_source_token_budget", 8192)),
+            update_protocol=str(runner_raw.get("update_protocol", "text")),
+            update_json_mode=str(runner_raw.get("update_json_mode", "json_schema")),
+            memory_protocol=str(runner_raw.get("memory_protocol", "text")),
+            memory_json_mode=str(runner_raw.get("memory_json_mode", "json_schema")),
         )
         methods = tuple(str(item) for item in value.get("methods", cls.methods))
         orders = tuple(str(item) for item in value.get("orders", cls.orders))

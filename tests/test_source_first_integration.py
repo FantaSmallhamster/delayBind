@@ -28,8 +28,8 @@ class SourceFirstClient:
             refs = {item["title"]: item["source_ref"] for (payload,) in rows
                     for item in [json.loads(payload)]}
             return "\n".join([
-                f"Q1 | {refs['Fern']} | Ada directed Fern. | ACTIVE",
-                f"Q2 | {refs['Ada']} | Ada was born in Larchport. | DORMANT",
+                f"Q1 | {refs['Fern']} | Ada directed Fern.",
+                f"Q2 | {refs['Ada']} | Ada was born in Larchport.",
             ])
         facts = [event.payload["fact"] for event in self.store.list_runtime_events(run_id)
                  if event.event_type == "FACT_STORED"]

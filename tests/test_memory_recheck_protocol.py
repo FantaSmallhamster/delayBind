@@ -116,8 +116,8 @@ class ScriptedClient:
             rows = self.store.connection.execute(
                 'select payload_json from raw_archive where run_id=?', (run_id,))
             sources = {p["title"]: p["source_ref"] for p in (json.loads(row[0]) for row in rows)}
-            return (f'Q1 | {sources["Fern"]} | Ada directed Fern. | ACTIVE\n'
-                    f'Q2 | {sources["Ada"]} | Ada was born in Larchport. | DORMANT')
+            return (f'Q1 | {sources["Fern"]} | Ada directed Fern.\n'
+                    f'Q2 | {sources["Ada"]} | Ada was born in Larchport.')
         if interface == "MEMORY_VERIFY":
             self.rechecks += 1
             if self.mode == "invalid":

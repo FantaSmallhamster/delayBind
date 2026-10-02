@@ -12,7 +12,9 @@ from pydantic import ValidationError
 
 from .agent_prompts import (final_answer_prompt, grounded_memory_prompt, lookup_prompt, memory_prompt,
                             memory_recheck_prompt, memory_verify_prompt,
-                            plan_prompt, query_view, reading_prompt, reading_repair_prompt)
+                            plan_prompt, query_view, reading_prompt, reading_repair_prompt,
+                            reading_json_prompt, reading_json_repair_prompt, memory_json_prompt,
+                            grounded_memory_json_prompt)
 from .agents import HighLevelAgent, LowLevelAgent
 from .api import OpenAICompatibleClient
 from .archive import FutureSourceAccessError, RawArchive
@@ -29,6 +31,9 @@ from .schema import AnswerResponse, QueryPlan, RuntimeEvent, RuntimeStatus
 from .storage import SQLiteEventStore
 from .subqueries import SubqueryRuntime
 from .source_refs import VisibleSources
+from .update_json import UpdateJSONError, parse_update_json, update_response_format
+from .memory_json import (MemoryJSONError, grounded_memory_response_format,
+                          memory_response_format, parse_grounded_memory_json, parse_memory_json)
 
 if TYPE_CHECKING:
     from .runner import RunnerConfig
@@ -368,6 +373,7 @@ async def run_subqueries(
     async def invoke(agent_client: OpenAICompatibleClient, role: str, interface: str, prompt: str,
                      *, parser: Callable[[str], Any], retries: int | None = None,
                      schema: dict[str, Any] | None = None,
+                     request_extra: dict[str, Any] | None = None,
                      on_invalid: Callable[[], Any] | None = None,
                      repair_prompt: Callable[[str, Exception], str] | None = None) -> Any:
         nonlocal calls
@@ -381,12 +387,38 @@ async def run_subqueries(
             raw = await agent_client.complete(
                 run_id=run_id, interface=interface, agent_role=role,
                 messages=[{"role": "user", "content": prompt}], response_schema=schema,
+                **({"extra": request_extra} if request_extra is not None else {}),
             )
             try:
+                json_interface = (
+                    interface == "UPDATE" and config.update_protocol == "json"
+                ) or (
+                    interface in {"MEMORY", "MEMORY_GROUNDED"} and config.memory_protocol == "json"
+                )
+                if json_interface:
+                    stored = store.list_model_calls(run_id)
+                    last = stored[-1] if stored and stored[-1].interface == interface else None
+                    choices = ((last.raw_response or {}).get("choices") or []) if last else []
+                    choice = choices[0] if choices else {}
+                    message = choice.get("message") or {}
+                    log(f"{interface}_JSON_RESPONSE_METADATA", {
+                        "finish_reason": choice.get("finish_reason"),
+                        "refusal": bool(message.get("refusal")), "attempt": attempt + 1,
+                    })
+                    if message.get("refusal") or choice.get("finish_reason") == "content_filter":
+                        error_type = UpdateJSONError if interface == "UPDATE" else MemoryJSONError
+                        raise error_type("REFUSAL", "provider refused this response")
+                    if choice.get("finish_reason") == "length":
+                        error_type = UpdateJSONError if interface == "UPDATE" else MemoryJSONError
+                        raise error_type("TRUNCATED", "output token limit reached; no partial JSON admission")
                 if not isinstance(raw, str):
                     raise ProtocolError("model response must contain text")
                 return parser(raw)
             except (ValueError, ValidationError, PlanValidationError) as exc:
+                if (interface == "UPDATE" and config.update_protocol == "json") or (
+                        interface in {"MEMORY", "MEMORY_GROUNDED"} and config.memory_protocol == "json"):
+                    log(f"{interface}_JSON_REJECTED", {"category": getattr(exc, "category", "INVALID_OUTPUT"),
+                                                       "error": str(exc), "attempt": attempt + 1})
                 log("AGENT_RESPONSE_INVALID", {"role": role, "interface": interface, "error": str(exc)})
                 if attempt >= (config.max_response_retries if retries is None else retries):
                     if on_invalid is not None:
@@ -601,22 +633,41 @@ async def run_subqueries(
             assert evidence is not None
             allowed_refs = {key: set(refs) for key, refs in evidence.fact_context_refs.items()}
             eligible_queries = set(evidence.query_scopes)
+            fact_aliases = {
+                (row["query_id"], row["fact_text"]): row["fact_id"]
+                for row in _source_check_rows(evidence, runtime)
+            }
             latest = parse_grounded_memory("", allowed_refs, eligible_queries)
 
             def grounded_response(raw: str):
                 nonlocal latest
-                latest = parse_grounded_memory(raw, allowed_refs, eligible_queries)
+                latest = (parse_grounded_memory_json(
+                    raw, allowed_refs=allowed_refs, query_ids=eligible_queries,
+                    fact_aliases=fact_aliases,
+                ) if config.memory_protocol == "json" else parse_grounded_memory(
+                    raw, allowed_refs, eligible_queries,
+                ))
                 return latest
 
             grounded = await high.call(
                 "MEMORY_GROUNDED",
-                grounded_memory_prompt(
+                (grounded_memory_json_prompt(
                     sample.question, queries(), view, hints=runtime.state.hints, eof=eof,
                     evidence_contract=evidence.contract(),
                     facts_to_check=_source_check_rows(evidence, runtime),
                     raw_context=evidence.raw_context,
-                ),
+                ) if config.memory_protocol == "json" else grounded_memory_prompt(
+                    sample.question, queries(), view, hints=runtime.state.hints, eof=eof,
+                    evidence_contract=evidence.contract(),
+                    facts_to_check=_source_check_rows(evidence, runtime),
+                    raw_context=evidence.raw_context,
+                )),
                 parser=grounded_response, on_invalid=lambda: latest,
+                request_extra=(
+                    {"response_format": grounded_memory_response_format(config.memory_json_mode)}
+                    if config.memory_protocol == "json" and grounded_memory_response_format(config.memory_json_mode)
+                    else None
+                ),
             )
             for rejected in grounded.checks.rejected_lines:
                 log("MEMORY_SOURCE_CHECK_REJECTED", rejected)
@@ -684,26 +735,60 @@ async def run_subqueries(
             # recheck gate below.
             return latest
 
-        response = await high.call("MEMORY", memory_prompt(
-                                   sample.question, queries(), view, hints=runtime.state.hints, eof=eof,
-                                   raw_context=evidence.raw_context if evidence else "",
-                                   evidence_contract=(
-                                       {qid: {
-                                           **rule,
-                                           "allowed_fact_ids": [
-                                               fid for fid in rule["allowed_fact_ids"]
-                                               if (qid, fid) in checked_support
-                                           ],
-                                           "dependency_support_ids": [
-                                               fid for fid in rule["dependency_support_ids"]
-                                               if (qid, fid) in checked_support
-                                           ],
-                                       } for qid, rule in evidence.contract().items()}
-                                       if evidence and checked_support is not None
-                                       else evidence.contract() if evidence else None),
-                                   source_checks=([check.model_dump(mode="json") for check in source_checks]
-                                                  if source_checks is not None else None)), parser=memory_response,
-                                   on_invalid=lambda: latest)
+        memory_prompt_text = (memory_json_prompt(
+            sample.question, queries(), view, hints=runtime.state.hints, eof=eof,
+            raw_context=evidence.raw_context if evidence else "",
+            evidence_contract=(
+                {qid: {
+                    **rule,
+                    "allowed_fact_ids": [
+                        fid for fid in rule["allowed_fact_ids"]
+                        if (qid, fid) in checked_support
+                    ],
+                    "dependency_support_ids": [
+                        fid for fid in rule["dependency_support_ids"]
+                        if (qid, fid) in checked_support
+                    ],
+                } for qid, rule in evidence.contract().items()}
+                if evidence and checked_support is not None
+                else evidence.contract() if evidence else None),
+            source_checks=([check.model_dump(mode="json") for check in source_checks]
+                           if source_checks is not None else None),
+        ) if config.memory_protocol == "json" else memory_prompt(
+            sample.question, queries(), view, hints=runtime.state.hints, eof=eof,
+            raw_context=evidence.raw_context if evidence else "",
+            evidence_contract=(
+                {qid: {
+                    **rule,
+                    "allowed_fact_ids": [
+                        fid for fid in rule["allowed_fact_ids"]
+                        if (qid, fid) in checked_support
+                    ],
+                    "dependency_support_ids": [
+                        fid for fid in rule["dependency_support_ids"]
+                        if (qid, fid) in checked_support
+                    ],
+                } for qid, rule in evidence.contract().items()}
+                if evidence and checked_support is not None
+                else evidence.contract() if evidence else None),
+            source_checks=([check.model_dump(mode="json") for check in source_checks]
+                           if source_checks is not None else None))
+        )
+        def parsed_memory_response(raw: str) -> MemoryUpdate:
+            if config.memory_protocol == "json":
+                parsed = parse_memory_json(raw, query_ids=set(runtime.state.executions))
+                for rejected in parsed.rejected_lines:
+                    log("MEMORY_LINE_REJECTED", rejected)
+                return parsed
+            return memory_response(raw)
+
+        response = await high.call("MEMORY", memory_prompt_text, parser=parsed_memory_response,
+                                   on_invalid=lambda: latest,
+                                   request_extra=(
+                                       {"response_format": memory_response_format(config.memory_json_mode)}
+                                       if config.memory_protocol == "json" and memory_response_format(config.memory_json_mode)
+                                       else None
+                                   ))
         if evidence is not None:
             response = filter_evidence_response(response, evidence, eof=eof,
                                                 checked_support=checked_support)
@@ -854,14 +939,15 @@ async def run_subqueries(
 
             def reading(raw: str):
                 rejected_lines.clear()
-                response = parse_update(raw, recover=True)
+                response = (parse_update_json(raw, sources=sources, query_ids=set(runtime.state.executions))
+                            if config.update_protocol == "json" else parse_update(raw, recover=True))
                 for ignored in response.ignored_lines:
                     log("UPDATE_LINE_IGNORED", ignored)
                 if response.bindings:
                     response.rejected_lines.append({"line": "BIND", "reason": "the low-level reader cannot BIND; return facts only"})
                 normalized, mappings = sources.normalize_update(response, query_ids=set(runtime.state.executions), recover=True)
                 for fact in normalized.facts:
-                    key = (fact.query_id, tuple(sorted(fact.source_refs)), fact.text, fact.relevance)
+                    key = (fact.query_id, tuple(sorted(fact.source_refs)), fact.text)
                     if key not in fact_keys:
                         fact_keys.add(key)
                         buffered.facts.append(fact)
@@ -889,18 +975,31 @@ async def run_subqueries(
                         "retained_hints": len(normalized.hints),
                         "window_index": windows,
                     })
+                    if config.update_protocol == "json":
+                        raise UpdateJSONError("ITEMS_INVALID", f"{len(rejected_lines)} rejected fact/hint items")
+                if config.update_protocol == "json":
+                    log("UPDATE_JSON_PARSED", {"facts": len(normalized.facts), "hints": len(normalized.hints),
+                                               "retained_facts": len(buffered.facts), "window_index": windows})
                 return buffered
 
             def repair_reading(raw: str, error: Exception) -> str:
                 rejected = rejected_lines or [{"line": str(raw), "reason": str(error)}]
                 log("UPDATE_REPAIR_REQUESTED", {"rejected_lines": rejected,
                     "retained_facts": len(buffered.facts), "window_index": windows})
+                if config.update_protocol == "json":
+                    return reading_json_repair_prompt(sample.question, queries(), list(sources.entries.values()),
+                        rejected_lines=rejected, memory=visible, source_refs=sources.labels(),
+                        whole_response=getattr(error, "category", None) != "ITEMS_INVALID")
                 return reading_repair_prompt(sample.question, queries(), list(sources.entries.values()),
                     rejected_lines=rejected, memory=visible, source_refs=sources.labels())
 
-            update = await low.call("UPDATE", reading_prompt(sample.question, queries(),
+            update_prompt_builder = reading_json_prompt if config.update_protocol == "json" else reading_prompt
+            response_format = update_response_format(config.update_json_mode) if config.update_protocol == "json" else None
+            update = await low.call("UPDATE", update_prompt_builder(sample.question, queries(),
                                     [entry.model_dump(mode="json") for entry in window.entries], memory=visible,
                                     source_refs=sources.labels()), parser=reading, on_invalid=lambda: buffered,
+                                    request_extra={"response_format": response_format} if response_format else None,
+                                    retries=min(config.max_response_retries, 1) if config.update_protocol == "json" else None,
                                     repair_prompt=repair_reading)
             committed = runtime.ingest(update, window_index=windows,
                                         allowed_refs={entry.source_ref for entry in window.entries} | visible_refs)
@@ -945,6 +1044,7 @@ async def run_subqueries(
             nonlocal raw_answer
             parsed = parse_final_answer(raw, final_format)
             permitted = {ref for fact in pack["facts"] for ref in fact["source_refs"]}
+            permitted.update(ref for hint in runtime.state.hints for ref in hint.get("source_refs", []))
             if parsed.source_refs:
                 sources = VisibleSources(archive.entry(ref).model_dump(mode="json") for ref in sorted(permitted))
                 parsed.source_refs = list(dict.fromkeys(ref for value in parsed.source_refs for ref in sources.resolve(value)))
@@ -954,7 +1054,8 @@ async def run_subqueries(
             return parsed
         answer = await low.call(
             "ANSWER", final_answer_prompt(sample.question, final_memory,
-                                          answer_format=final_format, raw_context=raw_context),
+                                          answer_format=final_format, raw_context=raw_context,
+                                          hints=runtime.state.hints),
             parser=final,
             schema=AnswerResponse.model_json_schema() if final_format == "json" else None,
         )
@@ -971,6 +1072,11 @@ async def run_subqueries(
             for fact in pack.get("facts", [])
             if fact.get("text")
         ]
+        evidence_texts.extend(
+            str(hint.get("text", ""))
+            for hint in runtime.state.hints
+            if hint.get("text")
+        )
         normalized_answer = post_process_answer(
             sample.question,
             str(raw_final_answer),

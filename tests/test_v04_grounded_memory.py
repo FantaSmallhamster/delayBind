@@ -23,9 +23,8 @@ class GroundedClient:
             sources = {json.loads(row[0])["title"]: json.loads(row[0])["source_ref"]
                        for row in self.store.connection.execute(
                            "select payload_json from raw_archive where run_id=?", (run_id,))}
-            return (f"Q1 | {sources['Fern']} | Ada directed Fern. | ACTIVE\n"
-                    f"Q2 | {sources['Ada']} | Ada was born in Oldport. | "
-                    + ("ACTIVE" if self.mode == "independent" else "DORMANT"))
+            return (f"Q1 | {sources['Fern']} | Ada directed Fern.\n"
+                    f"Q2 | {sources['Ada']} | Ada was born in Oldport.")
         if interface == "RECALL":
             return prompt.split("Selectable candidate IDs: ", 1)[1].splitlines()[0]
         if interface == "ANSWER":

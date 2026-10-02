@@ -20,7 +20,6 @@ class FactEvent(StrictModel):
     query_id: str
     text: str = Field(min_length=1)
     source_refs: list[str] = Field(min_length=1)
-    relevance: Literal["ACTIVE", "DORMANT"]
 
 
 class BindingProposal(StrictModel):
@@ -194,29 +193,24 @@ def parse_binding(line: str, *, command: str = "BIND") -> BindingProposal:
     return BindingProposal(query_id=fields[1].strip(), value=result, support_refs=_refs(refs))
 
 
+def _update_fields(line: str) -> list[str]:
+    """Split the three-column protocol without splitting escaped literal pipes."""
+    fields: list[str] = []
+    start = 0
+    escaped = False
+    for index, char in enumerate(line):
+        if char == "|" and not escaped:
+            fields.append(line[start:index].strip())
+            start = index + 1
+        escaped = char == "\\" and not escaped
+    fields.append(line[start:].strip())
+    return fields
+
+
 def parse_update(raw: str, *, recover: bool = False) -> FactUpdate:
     if recover:
         result = FactUpdate()
         for line in _lines(raw):
-            # Qwen occasionally uses a semicolon before the routing marker
-            # (``fact; DORMANT``) even though the published protocol uses a
-            # pipe.  Repair only the unambiguous terminal marker; semicolons
-            # inside the fact text remain untouched.
-            line = re.sub(
-                r"\s*[;；]\s*(ACTIVE|DORMANT|COMMIT|DEFER)\s*$",
-                r" | \1",
-                line,
-                flags=re.I,
-            )
-            # Treat a source-free NONE row as an omitted fact.  This is a
-            # harmless no-op and prevents a formatting-only row from forcing
-            # an UPDATE repair.  A source-free positive fact is still
-            # rejected below.
-            none_row = line.split("|", 3)
-            if len(none_row) == 4 and none_row[1].strip().upper() in {"", "NONE", "NULL", "[]"} \
-                    and none_row[3].strip().upper() in {"", "NONE", "NULL"}:
-                result.ignored_lines.append({"line": line, "reason": "NO_EVIDENCE_PLACEHOLDER"})
-                continue
             try:
                 part = parse_update(line)
                 for fact in part.facts:
@@ -236,35 +230,25 @@ def parse_update(raw: str, *, recover: bool = False) -> FactUpdate:
         return response
     for line in lines:
         line = _command_line(line)
-        fields = [field.strip() for field in line.split("|")]
+        fields = _update_fields(line)
         template = [field.casefold() for field in fields]
-        if template == ["query_id", "source_ref1,source_ref2", "complete natural-language fact", "active or dormant"]:
+        if template == ["query_id", "source_ref1,source_ref2", "complete natural-language fact"]:
             response.ignored_lines.append({"line": line, "reason": "COPIED_FORMAT_HEADER"})
             continue
-        if line == "NONE" or (len(fields) == 4 and fields[0] == "NONE" and fields[1] in {"", "NONE"}):
+        if line == "NONE" or (len(fields) == 3 and fields[0] == "NONE" and fields[1] in {"", "NONE"}):
             response.ignored_lines.append({"line": line, "reason": "NO_EVIDENCE_PLACEHOLDER"})
             continue
         if line.startswith("BIND |"):
             response.bindings.append(parse_binding(line))
             continue
         if line.startswith("PLAN_HINT |"):
-            fields = line.split("|", 2)
             if len(fields) != 3:
                 raise ProtocolError(f"invalid PLAN_HINT: {line}")
             response.hints.append(PlanHint(source_refs=_refs(fields[1]), text=_unescape(fields[2].strip())))
             continue
-        compact = re.fullmatch(r"\[([^@\]]+)\s*@\s*([^\]]+)\]\s*(.+?)\s*[（(](defer|commit)[）)]", line, re.I)
-        if compact:
-            query_id, refs, text, action = compact.groups()
-        else:
-            fields = line.split("|", 2)
-            if len(fields) != 3 or "|" not in fields[2]:
-                raise ProtocolError(f"invalid fact line: {line}")
-            query_id, refs = fields[:2]
-            text, action = fields[2].rsplit("|", 1)
-        action = action.strip().upper()
-        if action not in {"ACTIVE", "DORMANT", "COMMIT", "DEFER"}:
-            raise ProtocolError(f"unknown fact routing marker: {action}")
+        if len(fields) != 3:
+            raise ProtocolError(f"UPDATE requires exactly three fields (query | sources | fact), without a state: {line}")
+        query_id, refs, text = fields
         text = _unescape(text.strip())
         # Only source-free, explicit reports of no evidence are no-ops. A
         # cited negative fact must survive; an unsupported assertion must fail.
@@ -282,7 +266,6 @@ def parse_update(raw: str, *, recover: bool = False) -> FactUpdate:
                 continue
         response.facts.append(FactEvent(
             query_id=query_id.strip(), source_refs=_refs(refs), text=text,
-            relevance="DORMANT" if action in {"DORMANT", "DEFER"} else "ACTIVE",
         ))
     return response
 

@@ -74,6 +74,10 @@ class RunnerConfig:
     enable_defer_callback: bool = True
     memory_source_mode: str = "postverify"
     memory_source_token_budget: int = 8192
+    update_protocol: str = "text"
+    update_json_mode: str = "json_schema"
+    memory_protocol: str = "text"
+    memory_json_mode: str = "json_schema"
 
     def __post_init__(self) -> None:
         if self.candidate_batch_size <= 0 or self.chunk_size <= 0:
@@ -88,6 +92,14 @@ class RunnerConfig:
             raise ValueError("memory_source_mode must be postverify, raw_before_memory, source_verify_before_memory, or joint_source_memory")
         if self.memory_source_token_budget <= 0:
             raise ValueError("memory_source_token_budget must be positive")
+        if self.update_protocol not in {"text", "json"}:
+            raise ValueError("update_protocol must be text or json")
+        if self.update_json_mode not in {"json_schema", "json_object", "prompt"}:
+            raise ValueError("update_json_mode must be json_schema, json_object, or prompt")
+        if self.memory_protocol not in {"text", "json"}:
+            raise ValueError("memory_protocol must be text or json")
+        if self.memory_json_mode not in {"json_schema", "json_object", "prompt"}:
+            raise ValueError("memory_json_mode must be json_schema, json_object, or prompt")
 
 
 class ModelBudgetExceeded(RuntimeError):

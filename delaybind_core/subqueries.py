@@ -180,6 +180,7 @@ class SubqueryRuntime:
     def ingest(self, update: FactUpdate, *, window_index: int, allowed_refs: set[str]) -> list[str]:
         """Register all window facts before any binding or callback is applied."""
         committed: list[str] = []
+        routing_states = {qid: execution.status for qid, execution in self.state.executions.items()}
         for event in update.facts:
             if event.query_id not in self.state.executions:
                 self.emit("FACT_SKIPPED", {"reason": "UNKNOWN_QUERY", "event": event.model_dump(mode="json")})
@@ -197,7 +198,7 @@ class SubqueryRuntime:
             if fact.fact_id not in self.state.facts:
                 self.emit("FACT_STORED", {"fact": fact.model_dump(mode="json")}, source_ref=fact.source_refs[0])
             execution = self.state.executions[event.query_id]
-            defer = event.relevance == "DORMANT" or execution.status == "DORMANT"
+            defer = routing_states[event.query_id] == "DORMANT"
             if defer and not self.defer_unbound:
                 self.emit("FACT_SKIPPED", {"reason": "DEFER_DISABLED", "fact_id": fact.fact_id})
                 continue
@@ -210,7 +211,8 @@ class SubqueryRuntime:
                           observed_window=prior.observed_window if prior else window_index,
                           status="CANDIDATE" if defer else "ACCEPTED", acceptance=None if defer else "COMMIT")
             self.emit("FACT_DEFERRED" if defer else "FACT_COMMITTED", {"use": use.model_dump(mode="json"),
-                      "observed_relevance": event.relevance}, source_ref=fact.source_refs[0])
+                      "routing_source": "QUERY_STATE", "query_status": routing_states[event.query_id]},
+                      source_ref=fact.source_refs[0])
             if not defer:
                 committed.append(fact.fact_id)
                 self._connect(use)

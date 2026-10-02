@@ -85,7 +85,7 @@ class VisibleSources:
             except ProtocolError as exc:
                 if not recover:
                     raise
-                result.rejected_lines.append({"line": f"{fact.query_id} | {','.join(fact.source_refs)} | {fact.text} | {fact.relevance}", "reason": str(exc)})
+                result.rejected_lines.append({"line": f"{fact.query_id} | {','.join(fact.source_refs)} | {fact.text}", "reason": str(exc)})
         for hint in update.hints:
             try:
                 result.hints.append(hint.model_copy(update={"source_refs": normalize(hint.source_refs)}))

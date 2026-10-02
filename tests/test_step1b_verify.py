@@ -33,8 +33,8 @@ class ScriptedClient(OpenAICompatibleClient):
             rows = self.store.connection.execute(
                 'select payload_json from raw_archive where run_id=?', (run_id,))
             sources = {p["title"]: p["source_ref"] for p in (json.loads(row[0]) for row in rows)}
-            return (f'Q1 | {sources["Fern"]} | Ada directed Fern. | ACTIVE\n'
-                    f'Q2 | {sources["Ada"]} | Ada was born in Larchport. | DORMANT')
+            return (f'Q1 | {sources["Fern"]} | Ada directed Fern.\n'
+                    f'Q2 | {sources["Ada"]} | Ada was born in Larchport.')
 
         if interface == "MEMORY":
             if "Q1 [ACTIVE]" in prompt:
@@ -177,8 +177,8 @@ class ComparisonClient:
         prompt = messages[0]["content"]
         if interface == "UPDATE":
             row = self.store.connection.execute('select source_ref from raw_archive where run_id=?', (run_id,)).fetchone()
-            return (f'Q1 | {row[0]} | Ada was born in 1961. | ACTIVE\n'
-                    f'Q2 | {row[0]} | Bea was born in 1934. | ACTIVE')
+            return (f'Q1 | {row[0]} | Ada was born in 1961.\n'
+                    f'Q2 | {row[0]} | Bea was born in 1934.')
         facts = [e.payload["fact"] for e in self.store.list_runtime_events(run_id) if e.event_type == "FACT_STORED"]
         ada = next(f["fact_id"] for f in facts if f["text"] == "Ada was born in 1961.")
         bea = next(f["fact_id"] for f in facts if f["text"] == "Bea was born in 1934.")
