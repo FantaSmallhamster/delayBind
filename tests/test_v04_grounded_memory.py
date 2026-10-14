@@ -97,10 +97,15 @@ class GroundedIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             if e.event_type == "MEMORY_VERIFY_COMPLETED"))
 
     async def test_unresolved_bad_sources_missing_checks_and_invalid_actions_cannot_commit(self):
-        for mode in ("unresolved", "bad_source", "malformed", "wrong_action", "bad_support", "partial"):
+        for mode in ("unresolved", "bad_source", "malformed", "bad_support", "partial"):
             with self.subTest(mode=mode):
                 result, _, _ = await self.run_case(mode)
                 self.assertEqual(result["state"]["bindings"], {})
+
+    async def test_action_label_is_normalized_without_bypassing_evidence(self):
+        result, _, events = await self.run_case("wrong_action")
+        self.assertEqual(result["state"]["bindings"], {"?director": "Ada", "?birthplace": "Larchport"})
+        self.assertTrue(any(e.event_type == "MEMORY_ACTION_NORMALIZED" for e in events))
 
     async def test_independent_valid_query_survives_unresolved_pair(self):
         result, _, _ = await self.run_case("independent")

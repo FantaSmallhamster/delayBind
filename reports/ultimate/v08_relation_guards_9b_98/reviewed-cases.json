@@ -1,0 +1,54 @@
+{
+  "dev_10616": {
+    "title": "恢复答案，第二跳仍未绑定",
+    "finding": "Q1正确绑定Jobst，Jobst→Hermann Georg的原文事实也已保存，核验记录认可该关系，但Q2最终仍为ACTIVE。最终ANSWER输出正确祖父。上一轮为输出解析ERROR，不能直接从其结果行恢复完整state；本次属于答案恢复，不能记作两跳绑定完成。"
+  },
+  "dev_1456": {
+    "title": "同头衔不同人物的混淆减轻，来源证明仍不完整",
+    "finding": "父亲从1923年出生的Anthony Noel改为Baptist Noel, 4th Earl，祖父绑定Baptist Noel, 3rd Earl，两跳值与gold所需链一致。但最终证据包保存的Baptist 4th传记只明说4th→3rd，没有明确点名Henry是4th的儿子，核验备注也指出缺少Q1证据。因此不把此题当作完整来源证明链成功。"
+  },
+  "dev_3668": {
+    "title": "主要恢复EM别名匹配，第二跳反而未绑定",
+    "finding": "上一轮已经识别正确外祖母，却输出带Empress、of Russia及née等扩展的名字而EM失分。本轮输出Maria Feodorovna (Dagmar of Denmark)，命中已有gold别名。两跳事实保留，Q2仍ACTIVE。ANSWER prompt及评分规则未改，不能据此宣称新核验机制解决了整条绑定链。"
+  },
+  "dev_4021": {
+    "title": "最终ANSWER纠正了仍然错误的代次绑定",
+    "finding": "保存事实明确Yazdegerd III的父亲是Shahriyar，最终答案也为Shahriyar；但Q2仍RESOLVED为Khosrow II。部分核验备注把原文的grandfather Khosrow II误当作对father Shahriyar的纠正。该题说明新prompt下父亲／祖父的语义混淆仍存在，EM恢复由最终ANSWER完成。"
+  },
+  "dev_10246": {
+    "title": "第一跳身份恢复，晚到事实进入记忆，但未提交第二跳",
+    "finding": "上一轮把Philip的母亲错认成Helvis，本次Q1为Maria Komnene；Maria Komnene→Maria Taronitissa的事实也保留且核验认可。Q2仍ACTIVE，最终ANSWER输出Maria Taronitissa。身份选择改善，但核验认可事实后不提交绑定的问题还在。"
+  },
+  "dev_5351": {
+    "title": "仍错：标签归一化没有提供正确的第二跳证据",
+    "finding": "Q1正确为Leopold I，保存事实只有Joseph→Leopold。Q2却绑定Charles VI，gold是Ferdinand III。核验把继位背景与模型历史知识当作关系证明，原文事实没有提供该值。记录到2次BIND→REBIND归一化，说明动作标签修正不等于语义修正成功。"
+  },
+  "dev_7046": {
+    "title": "仍错：第一跳重复用于第二跳，形成自母亲绑定",
+    "finding": "只保存Caroline→Béatrice的母女事实，缺少Béatrice→Chantal的第二跳。Q1与Q2最终都绑定Béatrice，Q2具体问Béatrice的母亲，因此仍然形成自母亲错误。核验把第一跳当作第二跳的上下文支持，未执行prompt要求的逐边证明。"
+  },
+  "dev_4311": {
+    "title": "退步：导演身份正确，早到出生地丢失，电影国别被当作出生地",
+    "finding": "上一轮Q1错误为Julien Duvivier，但保存Georges Franju出生于Fougères的事实，最终ANSWER答对。本次Q1修正为Georges Franju，最终facts却只剩电影导演关系，未保留Franju出生地。Q2错误绑定France；核验从French film推断导演国籍／出生国家，均不足以证明出生地。"
+  },
+  "dev_4298": {
+    "title": "退步：正确母亲生日已保留，仍提交儿子生日",
+    "finding": "Q1正确为Victoria Lockwood，记忆中已有Catherine Victoria Aitken (née Lockwood; 25 November 1965)。Q2却绑定14 March 1994，实际是Louis的生日。核验将Louis出生日期与其母亲身份合用；后续正确生日事实没有纠正该值，最终ANSWER也沿用错误绑定。问题涉及主语和别名对齐，以及晚到证据纠正。"
+  },
+  "dev_6782": {
+    "title": "退步：墓地事实遗漏，城市被当作完整墓地",
+    "finding": "上一轮保留Alekos Sakellarios传记末尾的First Cemetery of Athens，Q2未绑定但ANSWER答对。本次仅保存影片→导演事实，Q2却绑定Athens。核验备注承认没有墓地原文，仍声称可用外部知识；这不是实际来源证据。答案同时缺少gold要求的具体墓地。"
+  },
+  "dev_4961": {
+    "title": "退步：证据和绑定均不完整，最终答案从London变成Britain",
+    "finding": "两轮都正确绑定Alexander Korda，Q2都ACTIVE，保存同样的导演事实和截短传记。最终证据包中的Korda传记没有明确死亡地点，上一轮ANSWER为London，本次为Britain。不能把这次翻转全部归为事实遗漏增加；此题更多体现下游未完成时最终回答的不稳定与地点粒度差异。"
+  },
+  "dev_10191": {
+    "title": "退步：死亡地点未证明，最终ANSWER翻转",
+    "finding": "两轮Q1均为Robert Rossen、Q2均ACTIVE。保存的Rossen原文包含New York和Hollywood的工作经历及死亡日期，没有明确死亡地点。本次摘要更短，最终ANSWER由命中gold的Hollywood变为New York。这里只报告旧题集的EM翻转，不据此断言任何外部事实已得到验证。"
+  },
+  "dev_2261": {
+    "title": "退步：导演修正后，电影年份错误绑定为导演出生年份",
+    "finding": "Born To Speed的导演从上一轮错误的Paulo Figueiredo修正为Edward L. Cahn；但此前保留的Cahn出生于1899年的事实本次没有保存，Q4绑定1947，实际是影片年份。Q5按1933与1947比较得到错误影片。核验承认所引影片事实不含出生日期，却仍接受部分身份事实并沿用已绑定年份，出现循环认可。"
+  }
+}

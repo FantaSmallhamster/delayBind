@@ -43,6 +43,47 @@ class MemoryBudgetExceeded(RuntimeError):
     pass
 
 
+def normalize_binding_actions(
+    response: MemoryUpdate,
+    actions: dict[str, str],
+    log: Callable[[str, dict[str, Any]], None],
+) -> MemoryUpdate:
+    """Treat both model arrays as proposals; infer actions from a current scope.
+
+    This does not authorize a proposal: the caller must still apply source,
+    support, dependency, and immutable-snapshot checks before any state change.
+    Conflicting values for one query are rejected together, before filtering.
+    """
+    normalized = MemoryUpdate(ignored_lines=list(response.ignored_lines),
+                              rejected_lines=list(response.rejected_lines))
+    groups: dict[str, list[tuple[str, Any]]] = defaultdict(list)
+    for declared, proposals in (("BIND", response.bindings), ("REBIND", response.rebindings)):
+        for proposal in proposals:
+            groups[proposal.query_id].append((declared, proposal))
+    for query_id, items in groups.items():
+        values = {json.dumps(p.value, sort_keys=True, ensure_ascii=False) for _, p in items}
+        if len(values) != 1:
+            log("BINDING_CONFLICT", {"query_id": query_id, "reason": "MULTIPLE_PROPOSED_VALUES"})
+            continue
+        action = actions.get(query_id)
+        if action not in {"BIND", "REBIND"}:
+            # Preserve the original labels for the existing rejection path;
+            # unknown/dormant/pending queries get no inferred permission.
+            for declared, proposal in items:
+                (normalized.bindings if declared == "BIND" else normalized.rebindings).append(proposal)
+            continue
+        proposal = items[0][1].model_copy(update={"support_refs": list(dict.fromkeys(
+            ref for _, item in items for ref in item.support_refs))})
+        for declared, _ in items:
+            if declared != action:
+                log("MEMORY_ACTION_NORMALIZED", {
+                    "query_id": query_id, "declared_action": declared,
+                    "effective_action": action, "reason": "QUERY_EVIDENCE_CONTRACT",
+                })
+        (normalized.bindings if action == "BIND" else normalized.rebindings).append(proposal)
+    return normalized
+
+
 def parse_final_answer(raw: str, answer_format: str) -> AnswerResponse:
     if answer_format == "json":
         return AnswerResponse.model_validate_json(raw)
@@ -517,6 +558,9 @@ async def run_subqueries(
 
     def filter_evidence_response(response: MemoryUpdate, evidence: PreparedEvidence, *, eof: bool,
                                  checked_support: set[tuple[str, str]] | None = None) -> MemoryUpdate:
+        response = normalize_binding_actions(
+            response, {qid: scope.allowed_action for qid, scope in evidence.query_scopes.items()}, log,
+        )
         accepted = MemoryUpdate()
         for action, items, destination in (
             ("BIND", response.bindings, accepted.bindings),
