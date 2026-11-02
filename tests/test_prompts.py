@@ -1,9 +1,10 @@
-from delaybind_core.prompts import answer_prompt, plan_prompt, update_prompt, verify_prompt
-from delaybind_core.schema import QueryPlan, VerifyDecision
+# PR-00 migration: explicitly use the legacy graph API; assertions preserved.
+from delaybind_core.prompts import answer_prompt, graph_plan_prompt as plan_prompt, update_prompt, verify_prompt
+from delaybind_core.schema import GraphQueryPlan, VerifyDecision, AnswerResponse
 
 
 def test_prompt_builders_keep_protocol_markers_and_no_future_instruction():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="p",
         patterns=[{"id": "T1", "subject": "Film A", "relation": "DIRECTOR", "object": "?d"}],
     )
@@ -26,6 +27,6 @@ def test_prompt_builders_keep_protocol_markers_and_no_future_instruction():
     assert "B is A's father" in rendered_verify
     assert "queen by marriage" in rendered_verify
     assert "Claim" not in VerifyDecision.model_json_schema().get("$defs", {})
-    rendered_answer = answer_prompt("q", {}, schema={"type": "object"})
+    rendered_answer = answer_prompt("q", {}, schema=AnswerResponse.model_json_schema())
     assert "<ANSWER version=v2>" in rendered_answer
     assert "source_refs" in rendered_answer

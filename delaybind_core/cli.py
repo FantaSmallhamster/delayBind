@@ -170,6 +170,12 @@ def _run_from_config(config_path: str | Path) -> dict[str, Any]:
             memory_source_token_budget=int(config.get("memory_source_token_budget", 8192)),
         ),
     )
+    if (config.get("runner") or config).get("engine", "legacy_v08") != "legacy_v08":
+        from dataclasses import fields
+        from .mwr.config import MWRConfig
+        runner_raw = dict(config.get("runner") or {k:v for k,v in config.items() if k in {f.name for f in fields(RunnerConfig)}})
+        runner_raw["mwr"] = MWRConfig(**runner_raw.get("mwr", {}))
+        runner.config = RunnerConfig(**runner_raw)
     run_id = str(config.get("run_id") or f"{sample.sample_id}-{manifest.manifest_id if manifest else 'text'}")
     result = asyncio.run(
         runner.run(run_id=run_id, sample=sample, manifest=manifest, store=store, plan=plan)

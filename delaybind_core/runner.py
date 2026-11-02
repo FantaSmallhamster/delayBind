@@ -8,7 +8,8 @@ reuse the same prompt and response parsing functions later.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from .mwr.config import MWRConfig
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,11 @@ from .text_match import contains_normalized_span
 
 @dataclass(frozen=True)
 class RunnerConfig:
+    engine: str = "legacy_v08"
+    raw_search_enabled: bool = False
+    global_reread_enabled: bool = False
+    answer_gap_search_enabled: bool = False
+    mwr: MWRConfig = field(default_factory=MWRConfig)
     plan_format: str = "subqueries"
     chunk_size: int = 5000
     answer_mode: str = "runtime"
@@ -80,6 +86,12 @@ class RunnerConfig:
     memory_json_mode: str = "json_schema"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.mwr, MWRConfig):
+            raise TypeError("mwr must be an MWRConfig instance")
+        if self.engine not in {"legacy_v08", "flat_memory_mwr", "delaybind_mwr"}:
+            raise ValueError("unknown engine")
+        if self.engine != "legacy_v08" and any((self.raw_search_enabled, self.global_reread_enabled, self.answer_gap_search_enabled)):
+            raise ValueError("MWR forbids raw search, global reread and answer gap search")
         if self.candidate_batch_size <= 0 or self.chunk_size <= 0:
             raise ValueError("candidate_batch_size and chunk_size must be positive")
         if self.answer_format not in {"auto", "boxed", "text", "json"}:
@@ -143,6 +155,11 @@ class V5Runner:
                 raise ValueError("provide sample, a ReMemR1 item, or question and context")
         elif item is not None or question is not None or context is not None:
             raise ValueError("choose one input form")
+        if self.config.engine != "legacy_v08":
+            from .mwr.engine import run_mwr
+            return await run_mwr(client=self.client, config=self.config, run_id=run_id,
+                                 sample=sample, manifest=manifest, store=store, plan=plan,
+                                 reader_client=self.reader_client, tokenizer=self.tokenizer)
         if self.config.plan_format not in {"subqueries", "graph"}:
             raise ValueError("plan_format must be 'subqueries' or 'graph'")
         if isinstance(plan, QueryPlan) or (plan is None and self.config.plan_format == "subqueries"):

@@ -9,7 +9,7 @@ import json
 import re
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,7 +17,7 @@ from .api import APIConfig, OpenAICompatibleClient
 from .config_compat import without_removed_runner_options
 from .data import CanonicalSample, build_manifest, load_records
 from .cursor import TextTokenizer
-from .direct import run_direct_full_context
+from .direct import run_direct_full_context, run_direct_mwr
 from .metrics import gold_source_refs, plan_relation_recall, score_result, summarize_results
 from .oracle import compile_oracle_plans, load_oracle_plans, write_oracle_plans
 from .runner import RunnerConfig, V5Runner
@@ -26,6 +26,7 @@ from .storage import SQLiteEventStore
 
 
 SUPPORTED_METHODS = {
+    "legacy_v08", "flat_memory_mwr", "delaybind_mwr", "direct_mwr",
     "direct_full_context",
     "v5_predicted",
     "v5_oracle",
@@ -65,6 +66,25 @@ class ExperimentConfig:
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "ExperimentConfig":
+        new_engine = (value.get("runner") or value).get("engine", "legacy_v08") != "legacy_v08"
+        if new_engine or set(value.get("methods", [])) & {"flat_memory_mwr", "delaybind_mwr", "direct_mwr"}:
+            allowed = {f.name for f in fields(cls)} | {"api", "high_api", "low_api"}
+            unknown = set(value) - allowed
+            if unknown:
+                raise ValueError(f"unknown MWR experiment fields: {sorted(unknown)}")
+            api_allowed = {"base_url", "api_key", "model", "temperature", "top_p", "model_seed", "timeout_seconds", "api_max_retries", "max_output_tokens", "enable_thinking", "connect_ip", "rate_limit_backoff_seconds", "rate_limit_backoff_max_seconds"}
+            for name in ("api", "high_api", "low_api"):
+                extra = set(value.get(name, {})) - api_allowed
+                if extra:
+                    raise ValueError(f"unknown {name} fields: {sorted(extra)}")
+            runner_raw = dict(value.get("runner", {}))
+            from .mwr.config import MWRConfig
+            if "engine" not in runner_raw:
+                raise ValueError("MWR experiments require explicit runner.engine")
+            runner_raw["mwr"] = MWRConfig(**runner_raw.get("mwr", {}))
+            strict_runner = RunnerConfig(**runner_raw)
+        else:
+            strict_runner = None
         value = without_removed_runner_options(value)
         runner_raw = value.get("runner") or value
         runner = RunnerConfig(
@@ -100,8 +120,13 @@ class ExperimentConfig:
             memory_protocol=str(runner_raw.get("memory_protocol", "text")),
             memory_json_mode=str(runner_raw.get("memory_json_mode", "json_schema")),
         )
+        runner = strict_runner or runner
         methods = tuple(str(item) for item in value.get("methods", cls.methods))
         orders = tuple(str(item) for item in value.get("orders", cls.orders))
+        if runner.engine != "legacy_v08" and any(m.startswith("v5_") for m in methods):
+            raise ValueError("MWR engine requires explicit MWR method names, not v5 aliases")
+        if not methods or not orders:
+            raise ValueError("methods and orders must not be empty")
         unknown_methods = set(methods) - SUPPORTED_METHODS
         unknown_orders = set(orders) - SUPPORTED_ORDERS
         if unknown_methods:
@@ -111,6 +136,8 @@ class ExperimentConfig:
         concurrency = int(value.get("max_concurrency", 1))
         if concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
+        if value.get("sample_count") is not None and int(value["sample_count"]) <= 0:
+            raise ValueError("sample_count must be positive")
         return cls(
             input=str(value["input"]),
             output_dir=str(value.get("output_dir", "results/v5_experiment")),
@@ -231,6 +258,14 @@ class ExperimentHarness:
             {key: value for key, value in asdict(self.reader_api_config).items() if key != "api_key"}
             if self.reader_api_config else None
         )
+        if self.config.runner.engine != "legacy_v08" or any(m in {"direct_mwr", "delaybind_mwr", "flat_memory_mwr"} for m in self.config.methods):
+            from .mwr.common import digest, tokenizer_fingerprint
+            root = Path(__file__).parent
+            resolved["schema_version"] = "delaybind-mwr-v1"
+            resolved["source_hash"] = digest({str(p.relative_to(root)): digest(p.read_text()) for p in sorted(root.rglob("*.py"))})
+            resolved["data_hash"] = hashlib.sha256(Path(self.config.input).read_bytes()).hexdigest()
+            resolved["tokenizer_hash"] = tokenizer_fingerprint(self.tokenizer) if self.tokenizer else (
+                hashlib.sha256(Path(self.config.tokenizer_path).read_bytes()).hexdigest() if self.config.tokenizer_path else None)
         semantic = dict(resolved)
         for key in ("output_dir", "resume", "retry_errors", "fail_fast", "max_concurrency", "api_runtime"):
             semantic.pop(key, None)
@@ -313,14 +348,15 @@ class ExperimentHarness:
                 raise ValueError(
                     "resume configuration differs from config.resolved.json; use a new output_dir or resume=false"
                 )
+        resolved_path.write_text(json.dumps(resolved, ensure_ascii=False, indent=2), encoding="utf-8")
         samples = self._samples()
         oracle_plans = self._oracle_plans(samples)
         results_path = self.output_dir / "results.jsonl"
-        existing = _read_jsonl(results_path) if self.config.resume else []
+        existing = (_read_jsonl(results_path) + _read_jsonl(self.output_dir / "conditions.completed.jsonl")) if self.config.resume else []
         completed = {
             _condition_key(row)
             for row in existing
-            if row.get("status") == "OK" or not self.config.retry_errors
+            if row.get("status") in {"OK", "ANSWERED", "INSUFFICIENT", "RESOURCE_LIMIT"} or not self.config.retry_errors
         }
         semaphore = asyncio.Semaphore(self.config.max_concurrency)
         jobs = [
@@ -333,7 +369,10 @@ class ExperimentHarness:
 
         async def guarded(sample: CanonicalSample, method: str, order: str) -> dict[str, Any]:
             async with semaphore:
-                return await self._run_condition(sample, method, order, oracle_plans)
+                row = await self._run_condition(sample, method, order, oracle_plans)
+                with (self.output_dir / "conditions.completed.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                return row
 
         new_rows: list[dict[str, Any]] = []
         if self.config.fail_fast:
@@ -353,6 +392,9 @@ class ExperimentHarness:
             rows,
             [
                 "sample_id", "method", "order", "runtime_status", "prediction",
+                "engine", "schema_version", "metric_contract", "live_state_tokens", "bookkeeping_bytes",
+                "raw_archive_bytes", "reread_tokens", "unique_source_tokens", "logical_model_calls",
+                "physical_attempts", "cache_hits", "usage_unknown_attempts", "known_input_tokens", "known_output_tokens",
                 "gold_answers", "answer_exact", "answer_token_f1", "supporting_f1",
                 "triple_event_f1", "graph_triple_f1", "verifier_precision", "verifier_recall",
                 "verifier_f1", "verifier_micro_precision", "verifier_micro_recall", "verifier_micro_f1",
@@ -401,7 +443,10 @@ class ExperimentHarness:
         started = time.perf_counter()
         plan_valid: bool | None = None
         try:
-            if method == "direct_full_context":
+            if method == "direct_mwr":
+                result = await run_direct_mwr(run_id=run_id, question=sample.question, manifest=manifest,
+                    client=client, store=store, config=self.config.runner, tokenizer=self.tokenizer, sample=sample)
+            elif method == "direct_full_context":
                 result = await run_direct_full_context(
                     run_id=run_id,
                     question=sample.question,
@@ -418,6 +463,7 @@ class ExperimentHarness:
                     plan_valid = True
                 runner_config = replace(
                     self.config.runner,
+                    engine=method if method in {"legacy_v08", "flat_memory_mwr", "delaybind_mwr"} else self.config.runner.engine,
                     defer_unbound=not method.endswith("no_defer"),
                     query_graph_mode=("flat" if "_flat" in method else self.config.runner.query_graph_mode),
                 )
@@ -440,7 +486,7 @@ class ExperimentHarness:
                     "order": order,
                     "manifest_id": manifest.manifest_id,
                     "plan_valid": plan_valid,
-                    "status": "OK",
+                    "status": result.get("status", "OK"),
                 }
             )
         except Exception as exc:
@@ -456,7 +502,9 @@ class ExperimentHarness:
                 "order": order,
                 "manifest_id": manifest.manifest_id,
                 "plan_valid": False if method == "v5_predicted" else plan_valid,
-                "status": "ERROR",
+                "status": "RESOURCE_LIMIT" if type(exc).__name__ == "ResourceLimit" else "ERROR",
+                **({"schema_version":"delaybind-mwr-v1", "engine":method}
+                   if method in {"delaybind_mwr", "flat_memory_mwr", "direct_mwr"} else {}),
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "state": {},
@@ -496,9 +544,9 @@ class ExperimentHarness:
         )
         oracle = oracle_plans.get(sample.sample_id)
         predicted_plan = None
-        if (result.get("state") or {}).get("plan"):
+        if result.get("schema_version") != "delaybind-mwr-v1" and (result.get("state") or {}).get("plan"):
             predicted_plan = parse_query_plan(result["state"]["plan"])
-        elif event_counts.get("PLAN_CREATED"):
+        elif result.get("schema_version") != "delaybind-mwr-v1" and event_counts.get("PLAN_CREATED"):
             plan_event = next(
                 event for event in events if event["event_type"] == "PLAN_CREATED"
             )

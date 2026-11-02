@@ -1,0 +1,50 @@
+{
+  "input": "data/test/2wiki_512_complete_eval_bundle_20261026/test/eval_2wikimultihopqa_50.json",
+  "output_dir": "results/mwr/heldout_512_4k_candidate",
+  "experiment_id": "mwr-heldout_512_4k-candidate",
+  "dataset_id": "2wiki",
+  "methods": [
+    "delaybind_mwr",
+    "flat_memory_mwr",
+    "direct_mwr"
+  ],
+  "orders": [
+    "original"
+  ],
+  "sample_start": 0,
+  "sample_count": 512,
+  "sample_ids": [],
+  "seed": 4,
+  "max_concurrency": 1,
+  "resume": true,
+  "retry_errors": true,
+  "fail_fast": false,
+  "tokenizer_path": "models/Qwen3.5-9B-tokenizer/tokenizer.json",
+  "expected_data_sha256": "6b81dedd505983f39fb79aac59f7b2a2ff38916cddc4fe5f943acbc028ff1eee",
+  "expected_total_samples": 512,
+  "expected_documents": 50,
+  "runner": {
+    "engine": "delaybind_mwr",
+    "chunk_size": 5000,
+    "max_model_calls": 100,
+    "max_response_retries": 1,
+    "mwr": {
+      "max_live_state_tokens": 4096,
+      "max_prompt_tokens": 32000,
+      "max_staging_tokens": 4096,
+      "output_tokens": 4096
+    }
+  },
+  "api": {
+    "model": "Qwen/Qwen3.5-9B",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "temperature": 0.0,
+    "top_p": 0.95,
+    "enable_thinking": false,
+    "model_seed": 4,
+    "max_output_tokens": 4096,
+    "api_max_retries": 2,
+    "rate_limit_backoff_seconds": 15,
+    "rate_limit_backoff_max_seconds": 60
+  }
+}

@@ -1,11 +1,12 @@
+# PR-00 migration: explicitly use the legacy graph API; assertions preserved.
 import pytest
 
 from delaybind_core.plan_validation import PlanValidationError, ensure_valid_plan, validate_plan
-from delaybind_core.schema import QueryPlan
+from delaybind_core.schema import GraphQueryPlan
 
 
 def test_plan_validation_rejects_invented_placeholder_and_unknown_target():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="bad",
         patterns=[
             {"id": "p1", "subject": "unknown_person_1", "relation": "director", "object": "Film A"}
@@ -19,7 +20,7 @@ def test_plan_validation_rejects_invented_placeholder_and_unknown_target():
 
 
 def test_plan_validation_accepts_question_anchor_and_variables():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="good",
         patterns=[
             {"id": "p1", "subject": "Film A", "relation": "director", "object": "?director"}
@@ -30,7 +31,7 @@ def test_plan_validation_accepts_question_anchor_and_variables():
 
 
 def test_plan_validation_rejects_unanchored_component():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="disconnected",
         patterns=[
             {"id": "p1", "subject": "Film A", "relation": "director", "object": "?director"},
@@ -43,7 +44,7 @@ def test_plan_validation_rejects_unanchored_component():
 
 
 def test_plan_validation_rejects_non_reflexive_self_loop():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="self-loop",
         patterns=[{"id": "p1", "subject": "?person", "relation": "mother", "object": "?person"}],
         answer_contract={"target": "?person", "type": "ENTITY"},
@@ -53,7 +54,7 @@ def test_plan_validation_rejects_non_reflexive_self_loop():
 
 
 def test_plan_validation_requires_answer_contract_for_runner_plans():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="no-answer-contract",
         patterns=[{"id": "p1", "subject": "Film A", "relation": "director", "object": "?director"}],
     )
@@ -62,7 +63,7 @@ def test_plan_validation_requires_answer_contract_for_runner_plans():
 
 
 def test_plan_validation_allows_target_free_evidence_plan():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="target-free",
         patterns=[{"id": "p1", "subject": "Film A", "relation": "director", "object": "?director"}],
     )
@@ -75,7 +76,7 @@ def test_plan_validation_allows_target_free_evidence_plan():
 
 
 def test_plan_validation_checks_nested_operator_variables():
-    plan = QueryPlan(
+    plan = GraphQueryPlan(
         plan_id="nested-input",
         patterns=[{"id": "p1", "subject": "Film A", "relation": "director", "object": "?director"}],
         operators=[

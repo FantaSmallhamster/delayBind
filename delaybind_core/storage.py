@@ -56,6 +56,14 @@ class SQLiteEventStore:
                     PRIMARY KEY (run_id, call_id),
                     UNIQUE (run_id, request_hash, attempt)
                 );
+                CREATE TABLE IF NOT EXISTS model_call_observations (
+                    run_id TEXT NOT NULL, call_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL, PRIMARY KEY(run_id, call_id)
+                );
+                CREATE TABLE IF NOT EXISTS mwr_meters (
+                    run_id TEXT PRIMARY KEY, contract_hash TEXT NOT NULL,
+                    logical_calls INTEGER NOT NULL, reread_tokens INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS raw_archive (
                     run_id TEXT NOT NULL,
                     source_ref TEXT NOT NULL,
@@ -173,6 +181,11 @@ class SQLiteEventStore:
         )
 
     def append_model_call(self, call: ModelCall) -> None:
+        # Retain the legacy table for old tooling; this journal keeps repeated
+        # retries/cache hits which its UNIQUE(request_hash, attempt) suppresses.
+        self.connection.execute(
+            "INSERT OR IGNORE INTO model_call_observations VALUES (?,?,?,?)",
+            (call.run_id, call.call_id, call.request_hash, call.model_dump_json()))
         self.connection.execute(
             """INSERT OR IGNORE INTO model_calls
              (run_id,call_id,request_hash,interface,attempt,payload_json)
@@ -189,44 +202,52 @@ class SQLiteEventStore:
         self.connection.commit()
 
     def find_cached_model_call(self, run_id: str, request_hash: str) -> ModelCall | None:
-        row = self.connection.execute(
-            """SELECT payload_json FROM model_calls
-            WHERE run_id=? AND request_hash=? AND attempt>=0
-            ORDER BY CASE WHEN attempt=0 THEN 0 ELSE 1 END, attempt DESC
-            LIMIT 1""",
-            (run_id, request_hash),
-        ).fetchone()
-        if row is None:
-            return None
-        return ModelCall.model_validate_json(row[0])
+        calls = self.list_model_calls(run_id)
+        return next((c for c in reversed(calls) if c.request_hash == request_hash
+                     and c.error is None and c.parsed_output is not None), None)
 
     def list_model_calls(self, run_id: str) -> list[ModelCall]:
-        rows = self.connection.execute(
-            "SELECT payload_json FROM model_calls WHERE run_id=? ORDER BY rowid",
-            (run_id,),
-        ).fetchall()
-        return [ModelCall.model_validate_json(row[0]) for row in rows]
+        old = self.connection.execute(
+            "SELECT payload_json FROM model_calls WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall()
+        new = self.connection.execute(
+            "SELECT payload_json FROM model_call_observations WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall()
+        observed = [ModelCall.model_validate_json(r[0]) for r in new]
+        ids = {c.call_id for c in observed}
+        return [c for r in old if (c := ModelCall.model_validate_json(r[0])).call_id not in ids] + observed
 
     def model_call_summary(self, run_id: str) -> dict[str, Any]:
         calls = self.list_model_calls(run_id)
+        physical = [c for c in calls if not c.cache_hit]
         interfaces: dict[str, dict[str, Any]] = {}
         for call in calls:
             key = f"{call.agent_role or 'SHARED'}:{call.interface}"
-            row = interfaces.setdefault(key, {"records": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0.0})
+            row = interfaces.setdefault(key, {"records":0,"input_tokens":0,"output_tokens":0,"latency_ms":0.0,"usage_unknown":0})
             row["records"] += 1
-            row["input_tokens"] += call.input_tokens or 0
-            row["output_tokens"] += call.output_tokens or 0
-            row["latency_ms"] += call.latency_ms or 0.0
-        return {
-            "interface_usage": interfaces,
-            "model_call_records": len(calls),
-            "model_calls": len({call.request_hash for call in calls}),
-            "cache_hits": sum(call.cache_hit for call in calls),
-            "failed_attempts": sum(call.error is not None for call in calls),
-            "input_tokens": sum(call.input_tokens or 0 for call in calls),
-            "output_tokens": sum(call.output_tokens or 0 for call in calls),
-            "model_latency_ms": sum(call.latency_ms or 0.0 for call in calls),
-        }
+            if not call.cache_hit:
+                row["input_tokens"] += call.input_tokens or 0
+                row["output_tokens"] += call.output_tokens or 0
+                row["latency_ms"] += call.latency_ms or 0.0
+                row["usage_unknown"] += int(call.input_tokens is None or call.output_tokens is None)
+        unknown = sum(c.input_tokens is None or c.output_tokens is None for c in physical)
+        known_input = sum(c.input_tokens or 0 for c in physical)
+        known_output = sum(c.output_tokens or 0 for c in physical)
+        return {"interface_usage":interfaces,"model_call_records":len(calls),
+            "model_calls":len({c.request_hash for c in calls}), "physical_attempts":len(physical),
+            "cache_hits":sum(c.cache_hit for c in calls),"failed_attempts":sum(c.error is not None for c in calls),
+            "usage_unknown_attempts":unknown, "known_input_tokens":known_input,"known_output_tokens":known_output,
+            "input_tokens":None if unknown else known_input,"output_tokens":None if unknown else known_output,
+            "model_latency_ms":sum(c.latency_ms or 0.0 for c in physical)}
+
+    def mwr_meter(self, run_id: str, contract_hash: str) -> dict[str, int]:
+        row = self.connection.execute("SELECT * FROM mwr_meters WHERE run_id=?", (run_id,)).fetchone()
+        if row and row["contract_hash"] != contract_hash:
+            raise ValueError("run contract changed; use a new run_id")
+        return {"logical_calls":row["logical_calls"],"reread_tokens":row["reread_tokens"]} if row else {"logical_calls":0,"reread_tokens":0}
+
+    def save_mwr_meter(self, run_id: str, contract_hash: str, logical_calls: int, reread_tokens: int) -> None:
+        self.connection.execute("INSERT OR REPLACE INTO mwr_meters VALUES (?,?,?,?)",
+                                (run_id, contract_hash, logical_calls, reread_tokens))
+        self.connection.commit()
 
     def append_raw_span(self, run_id: str, entry: ManifestEntry) -> None:
         self.connection.execute(

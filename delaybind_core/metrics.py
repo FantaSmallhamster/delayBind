@@ -405,6 +405,9 @@ def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, A
     """Score one method result while preserving diagnostic fields."""
     method = str(result.get("method", "v5"))
     prediction = _direct_predicted_answer(result) if method.startswith("direct") else _v5_predicted_answer(result)
+    is_mwr = result.get("schema_version") == "delaybind-mwr-v1"
+    if is_mwr:
+        prediction = (result.get("answer") or {}).get("answer")
     gold = sample.answers or ([sample.answer] if sample.answer is not None else [])
     predicted_refs = (
         set((result.get("answer") or {}).get("source_refs", []))
@@ -541,6 +544,32 @@ def score_result(result: dict[str, Any], sample: CanonicalSample) -> dict[str, A
     if sample.context is not None and not sample.supporting_facts:
         for key in ("supporting_precision", "supporting_recall", "supporting_f1"):
             scored[key] = None
+    if is_mwr:
+        from .mwr.scoring import score
+        scored["run_success"] = result.get("status") in {"OK", "ANSWERED", "INSUFFICIENT"}
+        # These legacy graph measures have no alignment to MWR evidence. In
+        # particular, two empty sets on Direct/error rows must not become 1.0.
+        for key in (*verifier, "graph_triple_precision", "graph_triple_recall",
+                    "graph_triple_f1", "triple_event_precision", "triple_event_recall", "triple_event_f1"):
+            scored[key] = None
+        # New span IDs need the explicit offline annotation map. Never compare
+        # them to legacy sentence IDs and report a fabricated zero.
+        for key in ("supporting_precision", "supporting_recall", "supporting_f1"):
+            scored[key] = None
+        scored["recall_selected_count"] = sum(len(e["payload"].get("evidence_ids", [])) for e in _event_items(result, "RECALL_SELECTED"))
+        scored["retained_evidence_count"] = len(state.get("evidence", {}))
+        scored["legacy_answer_exact"] = scored["answer_exact"]
+        scored["legacy_answer_token_f1"] = scored["answer_token_f1"]
+        scored.update(score(prediction, gold))
+        if (result.get("answer") or {}).get("status") != "ANSWERED" or result.get("status") == "ERROR":
+            scored["answer_exact"] = False
+            scored["answer_token_f1"] = 0.0
+        if not gold:
+            # Blind test files carry no answer annotations. Unknown accuracy is
+            # not zero accuracy; a separate offline join supplies the labels.
+            for key in ("answer_exact", "answer_token_f1", "legacy_answer_exact", "legacy_answer_token_f1"):
+                scored[key] = None
+            scored["grading_status"] = "PENDING_EXTERNAL_GOLD"
     return scored
 
 
@@ -631,6 +660,11 @@ def summarize_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 ),
                 "callback_hit_rate": mean(items, "callback_hit_rate"),
                 "model_calls": mean(items, "model_calls"),
+                "logical_model_calls": mean(items, "logical_model_calls"),
+                "live_state_tokens": mean(items, "live_state_tokens"),
+                "reread_tokens": mean(items, "reread_tokens"),
+                "physical_attempts": mean(items, "physical_attempts"),
+                "usage_unknown_attempts": mean(items, "usage_unknown_attempts"),
                 "latency_ms": mean(items, "latency_ms"),
                 "error_rate": 1.0 - (mean(items, "run_success") or 0.0),
                 "insufficient_rate": status_counts.get("INSUFFICIENT", 0) / len(items),
